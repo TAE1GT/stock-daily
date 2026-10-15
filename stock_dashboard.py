@@ -124,6 +124,8 @@ def listing_mobile_api():
                     continue
                 if it.get("stockEndType", "stock") != "stock":
                     continue
+                eng = it.get("stockNameEng") or next((v for k, v in it.items() if "eng" in k.lower() and isinstance(v, str)), "")
+                ENG[code] = str(eng or "")
                 rows.append(dict(code=code, name=str(it.get("stockName", "")), market=mk,
                                  현재가=_num(it.get("closePrice", "")), 거래량=_num(it.get("accumulatedTradingVolume", "")),
                                  시가총액=_num(it.get("marketValue", ""))))
@@ -217,6 +219,9 @@ def names_of(lst, t):
         return f"{lst.at[t, 'name']}({t})"
     except Exception:
         return t
+
+
+ENG = {}   # 종목코드 → 영문명 (해외 뉴스 검색용)
 
 
 def load_naver(days):
@@ -632,6 +637,82 @@ def demo_extras(codes):
     return out, dict(flow=len(codes), eps=len(codes), total=len(codes))
 
 
+# ───────────────────────────── 뉴스 ─────────────────────────────
+def _rss(url, days=31):
+    import html as _h
+    from email.utils import parsedate_to_datetime
+    xml = http_get(url, retries=2)
+    out = []
+    now = datetime.now().astimezone()
+    for it in re.findall(r"<item>(.*?)</item>", xml, re.S):
+        g = lambda tag: (re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", it, re.S) or [None, ""])[1]
+        title = _h.unescape(re.sub(r"<!\[CDATA\[|\]\]>", "", g("title"))).strip()
+        link = _h.unescape(re.sub(r"<!\[CDATA\[|\]\]>", "", g("link"))).strip()
+        src = _h.unescape(_strip(g("source")))
+        try:
+            dt = parsedate_to_datetime(g("pubDate").strip()).astimezone()
+        except Exception:
+            continue
+        if not title or not link.startswith("http") or (now - dt).days > days:
+            continue
+        if src and title.endswith(" - " + src):
+            title = title[: -len(src) - 3]
+        out.append(dict(dt=dt, t=title, u=link, s=src))
+    return out
+
+
+def fetch_news(code, name, market):
+    from urllib.parse import quote
+    ko, en = [], []
+    try:
+        ko = [x for x in _rss(f"https://news.google.com/rss/search?q={quote(chr(34) + name + chr(34) + ' when:30d')}&hl=ko&gl=KR&ceid=KR:ko")
+              if name.replace(" ", "") in x["t"].replace(" ", "")]
+    except Exception:
+        pass
+    eng = ENG.get(code, "")
+    try:
+        if eng:
+            en = _rss(f"https://news.google.com/rss/search?q={quote(chr(34) + eng + chr(34) + ' when:30d')}&hl=en-US&gl=US&ceid=US:en")
+    except Exception:
+        pass
+    if not en:
+        try:
+            sfx = ".KQ" if market == "KOSDAQ" else ".KS"
+            en = _rss(f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={code}{sfx}&region=US&lang=en-US")
+        except Exception:
+            pass
+    seen, out = set(), []
+    for x, is_en in [(x, 0) for x in sorted(ko, key=lambda x: x["dt"], reverse=True)[:6]] + \
+                    [(x, 1) for x in sorted(en, key=lambda x: x["dt"], reverse=True)[:4]]:
+        k = x["t"][:30]
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(dict(d=x["dt"].strftime("%m/%d"), t=x["t"][:120], u=x["u"], s=x["s"][:30], en=is_en, ts=x["dt"].timestamp()))
+    out.sort(key=lambda x: x["ts"], reverse=True)
+    for x in out:
+        x.pop("ts")
+    return out
+
+
+def collect_news(stocks, demo):
+    if demo:
+        rng = np.random.default_rng(3)
+        heads = ["3분기 실적 시장 기대치 상회", "신규 공급 계약 체결 공시", "Global peers expand capacity amid demand recovery",
+                 "외국인 순매수 이어져", "대주주 지분 일부 매각", "Analysts raise price targets on AI demand"]
+        return {e["code"]: [dict(d=f"10/{int(d):02d}", t=heads[j % 6], u="https://example.com", s="예시", en=int("A" <= heads[j % 6][0] <= "Z"))
+                            for j, d in enumerate(sorted(rng.integers(1, 15, 4), reverse=True))] for e in stocks}
+    from concurrent.futures import ThreadPoolExecutor
+    print(f"뉴스 모으는 중… ({len(stocks)}종목)", flush=True)
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        res = list(ex.map(lambda e: fetch_news(e["code"], e["name"], e["market"]), stocks))
+    news = {e["code"]: r for e, r in zip(stocks, res) if r}
+    nk = sum(1 for r in res if any(not x["en"] for x in r))
+    ne = sum(1 for r in res if any(x["en"] for x in r))
+    print(f"  국내 뉴스 {nk}/{len(stocks)}, 해외 뉴스 {ne}/{len(stocks)} 종목 확인", flush=True)
+    return news
+
+
 # ───────────────────────────── AI 분석 ─────────────────────────────
 AI_MODEL = "claude-sonnet-5-5"
 
@@ -642,18 +723,15 @@ def _w(x):
 
 def ai_prompt(e, asof, as_json=False):
     tg = e["tg"]
-    checks = ", ".join(f"{k['label']}({k['v']})" for k in e["checks"])
-    aux = ", ".join(f"{a['label']}: {a['v']}" for a in e["aux"])
-    p = (f"한국 주식 {e['name']}({e['code']}, {e['market']})을 분석해줘.\n"
-         f"- 기준일 {asof} 종가 {_w(e['close'])}원 ({(e['chg'] or 0):+.2f}%)\n"
-         f"- 차트 분석 결과: '{STRATS[e['strat']]}' 전략 {e['score']}점. 조건: {checks}\n"
-         f"- 보조 지표: {aux}\n"
-         f"- 차트 기준 1차 목표 {_w(tg['t1'])}원, 2차 목표 {_w(tg['t2'])}원, 손절 {_w(tg['stop'])}원\n\n"
-         "최근 한 달 동안의 이슈를 웹에서 검색해줘. 국내 기사와 공시(유상증자·CB·대주주 매도 등)뿐 아니라 "
-         "Reuters, Bloomberg, CNBC, Nikkei 같은 해외 영문 기사도 꼭 함께 찾아서(회사 영문명과 업종 키워드로 검색), "
-         "해외 시각(수출·경쟁사·글로벌 업황·환율)까지 반영해줘. 영문 기사 내용은 한국어로 요약해줘.\n"
-         "그다음 차트 분석과 같은 방향인지 판단해서 의견을 매수 / 관망 / 주의 중 하나로 정하고, "
-         "최근 한 달 주요 이슈를 날짜순으로, 근거 3가지, 주요 리스크, 참고한 기사 링크(국내·해외 구분)를 알려줘.")
+    miss = [k["label"] for k in e["checks"] if (k["s"] or 0) < 0.99]
+    flow = next((x["v"] for x in e["aux"] if x["label"].startswith("수급")), "-")
+    p = (f"{e['name']}({e['code']}) 주식 분석해줘.\n"
+         f"- {asof} 종가 {_w(e['close'])}원 ({(e['chg'] or 0):+.2f}%)\n"
+         f"- 차트: {STRATS[e['strat']]} 전략 {e['score']}점"
+         + (f", 미충족: {', '.join(miss)}" if miss else ", 조건 모두 충족") + "\n"
+         f"- 목표 {_w(tg['t1'])} / {_w(tg['t2'])}원, 손절 {_w(tg['stop'])}원, 수급 {flow}\n"
+         "최근 한 달 국내 뉴스·공시와 해외 영문 기사(Reuters·Bloomberg 등, 한국어로 요약)를 검색해서 "
+         "주요 이슈를 날짜순으로 정리하고, 차트 결과와 같은 방향인지 판단해 매수/관망/주의 의견과 근거 3가지, 리스크, 기사 링크를 알려줘.")
     if as_json:
         p += ('\n\n답변은 다른 말 없이 아래 JSON 하나로만 출력해줘:\n'
               '{"verdict":"매수|관망|주의","summary":"한 문장 결론",'
@@ -816,6 +894,8 @@ def build(demo=False, mode="file"):
             picks_of.setdefault(t, f"{STRATS[k]} {rank}위")
         tabs.append(dict(k=k, name=STRATS[k], stocks=stocks, loss=loss))
 
+    uniq = list({e["code"]: e for tab in tabs for e in tab["stocks"]}.values())
+    news = collect_news(uniq, demo)
     ai_mode = "button" if demo else run_ai(tabs, asof)
 
     # 보유 종목 점검용 전 종목 요약
@@ -841,7 +921,7 @@ def build(demo=False, mode="file"):
         targets={k: list(TARGET_RULE[k]) + [STOP_LABEL[k]] for k in (1, 2, 3)},
         breadth=dict(above20=num(above20, 1), above60=num(above60, 1), rising=num(rising, 1)),
         default_tab=(3 if above20 < 45 else 1),
-        tabs=tabs, all=allstk,
+        tabs=tabs, all=allstk, news=news,
         names={t: str(n) for t, n in getattr(namefn, "__self__", {}).items()},
         worker=os.environ.get("AI_WORKER_URL", "").strip(),
     )
@@ -1058,6 +1138,16 @@ h3.sec{font-size:16px;font-weight:800;margin:26px 0 10px}
 .aibox p{margin:8px 0 0;font-size:13.5px}
 .aibox ul{margin:6px 0 0;padding-left:18px;font-size:13px;display:grid;gap:2px}
 .aibox .risk{color:var(--muted)}
+.news{border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-top:10px}
+.right .news{margin-top:0}
+.news ul{list-style:none;margin:0;padding:0;display:grid;gap:5px;font-size:13px}
+.news li{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.news a{color:var(--ink);text-decoration:none;flex:1 1 200px}
+.news a:hover{text-decoration:underline}
+.news .dt{color:var(--muted);font-size:12px;min-width:38px}
+.acts2{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+a.btn{text-decoration:none;display:inline-block}
+.linkbtn{background:none;border:0;color:var(--muted);text-decoration:underline;cursor:pointer;font-size:12.5px;padding:4px}
 .aibox ul.issues{list-style:none;padding:0}
 .aibox ul.issues li{display:flex;gap:8px;align-items:baseline}
 .aibox .dt{color:var(--muted);font-size:12px;min-width:38px}
@@ -1352,14 +1442,30 @@ function parseAI(text){
     sources:arr(d.sources).filter(x=>x&&/^https?:/.test(x.url||'')).slice(0,5).map(x=>({title:String(x.title||'기사'),url:x.url,lang:x.lang==='en'?'en':'ko'})),
     at:new Date().toLocaleString('ko-KR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})};
 }
+const NEWS=D.news||{};
+function newsHTML(code,max=6){
+  const n=(NEWS[code]||[]).slice(0,max);
+  if(!n.length)return '';
+  return `<div class="news"><div class="lbl" style="margin:0 0 4px">📰 최근 한 달 뉴스 <span class="vl">(제목만 모은 것 · AI 판단 아님)</span></div><ul>${n.map(x=>
+    `<li><span class="dt tn">${esc(x.d)}</span>${x.en?'<span class="en">해외</span>':''}<a href="${esc(x.u)}" target="_blank" rel="noopener">${esc(x.t)}</a>${x.s?` <span class="vl">${esc(x.s)}</span>`:''}</li>`).join('')}</ul></div>`;
+}
+// 요청 문장을 Claude 주소에 실어 보냄 (주소가 너무 길면 뉴스·근거를 줄임)
+function claudeURL(prompt,code){
+  const lines=(NEWS[code]||[]).slice(0,6).map(x=>`- ${x.d} ${x.en?'[해외] ':''}${x.t.slice(0,70)}`);
+  const build=()=>prompt+(lines.length?`\n\n[참고: 오늘 아침 모은 뉴스 제목]\n${lines.join('\n')}`:'');
+  let p=build();
+  while(encodeURIComponent(p).length>7000&&lines.length){lines.pop();p=build();}
+  while(encodeURIComponent(p).length>7000)p=p.slice(0,Math.floor(p.length*.9));
+  return 'https://claude.ai/new?q='+encodeURIComponent(p);
+}
 const SLOTS=[];
 function aiSlot(o){SLOTS.push(o);const i=SLOTS.length-1;return `<div class="aislot" data-slot="${i}">${slotInner(i)}</div>`;}
 function slotInner(i){
   const s=SLOTS[i],a=s.pre||loadAI(s.key);
   if(a)return aiResultHTML(a,s,i);
-  const desc=AI_URL?'버튼을 누르면 Claude가 최근 한 달의 국내·해외(영문) 기사와 공시를 검색해서 이 자리에 바로 분석 결과를 보여드립니다. 30초~1분 정도 걸립니다.'
-    :'버튼을 누르면 이 종목의 차트 결과가 담긴 요청 문장이 나옵니다. Claude에 붙여넣으면 최근 한 달의 국내·해외(영문) 기사와 공시를 검색해서 분석해 드립니다.';
-  return `<div class="aibox aibtn"><p><b style="color:var(--ink)">🤖 AI 분석</b><br>${desc}</p><button class="btn ai" ${AI_URL?`data-run="${i}"`:`data-p="${i}"`}>🤖 AI 분석 요청</button></div>`;
+  if(AI_URL)return `<div class="aibox aibtn"><p><b style="color:var(--ink)">🤖 AI 분석</b><br>버튼을 누르면 Claude가 최근 한 달의 국내·해외(영문) 기사와 공시를 검색해서 이 자리에 바로 분석 결과를 보여드립니다. 30초~1분 정도 걸립니다.</p><button class="btn ai" data-run="${i}">🤖 AI 분석 요청</button></div>`;
+  return `<div class="aibox aibtn"><p><b style="color:var(--ink)">🤖 AI 분석</b><br>누르면 Claude가 <b>분석 요청이 입력된 채로</b> 열립니다. <b>전송(Enter)만</b> 누르세요. 최근 한 달 국내·해외 기사를 검색해서 분석해 드립니다.</p>
+    <span class="acts2"><a class="btn ai" href="${claudeURL(s.prompt,s.code)}" target="_blank" rel="noopener">🤖 Claude에서 분석하기</a><button class="linkbtn" data-p="${i}">요청 문장 복사</button></span></div>`;
 }
 function aiResultHTML(a,s,i){
   const tone=TONE[a.verdict]||'mid';
@@ -1375,7 +1481,7 @@ function aiResultHTML(a,s,i){
     <div class="src">${(a.sources||[]).map(x=>`<a href="${esc(x.url)}" target="_blank" rel="noopener">${x.lang==='en'?'<span class="en">EN</span>':''}${esc(x.title)}</a>`).join('')}</div>
     <div class="agree">${agree}</div>
     <div class="hd" style="margin-top:8px"><small>${esc(a.at)} 분석 · 뉴스 검색 기반 의견</small>
-      <span style="display:flex;gap:6px">${AI_URL?`<button class="btn ghost" data-run="${i}" data-force="1">다시 분석</button>`:''}<button class="btn ghost" data-p="${i}">Claude에서 더 묻기</button></span></div></div>`;
+      <span style="display:flex;gap:6px">${AI_URL?`<button class="btn ghost" data-run="${i}" data-force="1">다시 분석</button>`:''}<a class="btn ghost" href="${claudeURL(s.prompt,s.code)}" target="_blank" rel="noopener">Claude에서 더 묻기</a></span></div></div>`;
 }
 async function runAI(i,force){
   const s=SLOTS[i],slot=document.querySelector(`[data-slot="${i}"]`);if(!slot)return;
@@ -1402,7 +1508,7 @@ function renderHow(){
   document.getElementById('howbody').innerHTML=`
     <div class="kinds">
       <div class="kind"><b>📊 차트 분석 결론</b>정해진 공식으로 계산한 결과입니다. 사람의 판단이나 AI의 해석은 들어가지 않습니다. 전략·점수·목표가·손절가가 여기에 해당합니다.</div>
-      <div class="kind ai"><b>🤖 AI 분석 결론</b>Claude가 최근 한 달의 국내 뉴스·공시와 해외 영문 기사, 업황을 검색해서 내린 의견(매수 / 관망 / 주의)입니다. 파란 테두리 상자에만 표시되며, 차트 결론과 엇갈리면 따로 알려드립니다.</div>
+      <div class="kind ai"><b>🤖 AI 분석 결론</b>🤖 버튼을 누르면 Claude가 요청이 입력된 채로 열리고, 전송만 누르면 최근 한 달 국내 뉴스·공시와 해외 영문 기사를 검색해 의견(매수 / 관망 / 주의)을 냅니다. 카드의 📰 뉴스 목록은 매일 아침 제목만 모은 것으로 AI 판단이 아닙니다.</div>
     </div>
     <div><h4>1단계 · 기본 필터</h4><p>코스피·코스닥 중 거래대금 ${f0(c.min_amount/1e8)}억 원 이상, 시가총액 ${f0(c.min_mcap/1e8)}억 원 이상, 주가 ${f0(c.min_price)}원 이상, 상장 6개월 이상인 종목만 봅니다. 우선주·ETF·ETN·스팩은 빼고, 실적을 확인한 결과 적자(EPS 마이너스)인 기업도 추천에서 뺍니다.</p></div>
     <div><h4>2단계 · 전략별 기본 점수 (100점 만점)</h4><p style="margin-bottom:8px">세 전략마다 조건 5개를 얼마나 충족하는지로 점수를 매깁니다. 조건을 완전히 채우면 만점, 근접하면 부분 점수입니다.</p>
@@ -1445,7 +1551,7 @@ function tgHTML(x){const t=x.tg;return `<dl class="tgbox tn">
   <div><dt>손절 · ${esc(t.stop_label)}</dt><dd class="downc">${f0(t.stop)}<small>${pctS(t.sp)}</small></dd></div>
   <div class="rr"><span>손익비 <b>1 : ${t.rr==null?'-':t.rr.toFixed(1)}</b></span><span class="vl">${esc(t.note||'')}</span></div></dl>`;}
 function aiHTML(x){
-  return aiSlot({prompt:x.prompt,kind:'pick',key:`ai:${D.asof}:${x.code}:p${x.strat}`,score:x.score,pre:x.ai||null});
+  return aiSlot({prompt:x.prompt,code:x.code,kind:'pick',key:`ai:${D.asof}:${x.code}:p${x.strat}`,score:x.score,pre:x.ai||null});
 }
 function renderPanel(){
   const tab=D.tabs.find(t=>t.k===current),st=tab.stocks;
@@ -1471,7 +1577,7 @@ function renderPanel(){
           <div><dt>거래량</dt><dd>${x.vr==null?'-':x.vr.toFixed(1)+'배'}</dd></div>
         </dl>
       </div>
-      <div class="right"><div class="chartbox" data-i="${i}"></div>${aiHTML(x)}</div>
+      <div class="right"><div class="chartbox" data-i="${i}"></div>${newsHTML(x.code)}${aiHTML(x)}</div>
     </article>`).join(''):'<div class="empty">오늘은 이 전략에 맞는 종목이 없습니다.</div>';
   if(watch.length){
     h+='<h3 class="sec">지켜볼 종목 4–6위</h3><div class="watch">'+watch.map((x,i)=>`
@@ -1483,6 +1589,7 @@ function renderPanel(){
         ${tgHTML(x)}
         <div class="lbl">빠진 조건</div>
         ${checksHTML(x.checks.filter(k=>k.s<.99).length?x.checks.filter(k=>k.s<.99):x.checks.slice(0,2))}
+        ${newsHTML(x.code,3)}
         <div style="margin-top:12px">${aiHTML(x)}</div>
       </article>`).join('')+'</div>';
   }
@@ -1584,7 +1691,7 @@ function holdPrompt(r){
   return `한국 주식 ${r.name}(${r.code}, ${r.mk})을 ${f0(r.qty)}주, 평균 ${f0(r.avg)}원에 보유하고 있어.\n`+
     `- 기준일 ${D.asof} 종가 ${f0(r.c)}원, 평가손익 ${pctS(r.pl)} (${f0(r.plAmt)}원)\n`+
     `- 차트 점검 결과: ${r.v}. 손절 참고 ${f0(r.stop)}원, 1차 목표 ${f0(r.t1)}원, 2차 목표 ${f0(r.t2)}원\n`+
-    `- 차트 근거: ${r.why.join(' ')}\n\n`+
+    `- 차트 근거: ${r.why.slice(0,3).join(' ')}\n\n`+
     `최근 한 달 동안의 국내 뉴스·공시와 Reuters, Bloomberg, CNBC 같은 해외 영문 기사(영문은 한국어로 요약), 업황, 외국인·기관 수급을 웹에서 검색해서 `+
     `최근 한 달 주요 이슈를 날짜순으로 정리하고, 차트 점검 결과와 같은 방향인지 확인해줘. `+
     `보유 / 일부 매도 / 전량 매도 중 어떤 전략이 좋을지 근거 3가지, 주요 리스크, 참고 기사 링크와 함께 알려줘.`;
@@ -1602,7 +1709,7 @@ function renderHolds(){
         `현재 주가와 최근 차트 흐름(20일선·60일선, RSI, 거래량), 최근 한 달 국내 뉴스·공시와 Reuters·Bloomberg 같은 해외 영문 기사(영문은 한국어로 요약)를 웹에서 검색해서 `+
         `최근 한 달 주요 이슈를 날짜순으로 정리하고, 보유 / 일부 매도 / 전량 매도 중 어떤 전략이 좋을지 손절가·목표가, 근거 3가지, 리스크, 참고 기사 링크와 함께 알려줘.`;
       return `<div class="hold"><div><div class="hdr"><div><b>${nm}</b> <span class="code">${esc(h.code)}</span> · ${f0(h.qty)}주 · 평단 ${f0(h.avg)}</div><button class="rm" data-rm="${idx}">삭제</button></div>
-        <p class="vl" style="text-align:left;margin:8px 0 0">${msg}</p></div><div>${aiSlot({prompt:bp,kind:'hold',key:`ai:${D.asof}:${h.code}:hx`,tone:'mid'})}</div></div>`;
+        <p class="vl" style="text-align:left;margin:8px 0 0">${msg}</p></div><div>${aiSlot({prompt:bp,code:h.code,kind:'hold',key:`ai:${D.asof}:${h.code}:hx`,tone:'mid'})}</div></div>`;
     }
     const r=analyzeHolding(h.code,h.qty,h.avg);
     const row=(l,p,why)=>`<tr><td>${l}<br><small class="vl" style="text-align:left">${why}</small></td><td>${f0(p)}</td><td>${pctS((p/r.c-1)*100)}</td><td class="${p>=r.avg?'upc':'downc'}">${(p-r.avg)*r.qty>=0?'+':''}${f0((p-r.avg)*r.qty)}원</td></tr>`;
@@ -1618,13 +1725,14 @@ function renderHolds(){
         </dl>
         <div class="hv"><div class="lab">📊 차트 기준 전략</div><div class="val ${r.tone}">${r.v}</div></div>
         <div class="plan"><b>실행 계획 (예시)</b>${r.plan}${r.tips.map(t=>`<br>· ${t}`).join('')}</div>
-        <div style="margin-top:12px">${aiSlot({prompt:holdPrompt(r),kind:'hold',key:`ai:${D.asof}:${r.code}:h${r.qty}:${r.avg}`,tone:r.tone==='no'?'bad':r.tone})}</div>
+        <div style="margin-top:12px">${aiSlot({prompt:holdPrompt(r),code:r.code,kind:'hold',key:`ai:${D.asof}:${r.code}:h${r.qty}:${r.avg}`,tone:r.tone==='no'?'bad':r.tone})}</div>
       </div>
       <div>
         ${lvBar(r)}
         <table class="lvtable tn"><thead><tr><th>가격</th><th>원</th><th>현재가 대비</th><th>그때 손익</th></tr></thead><tbody>
           ${row('2차 목표',r.t2,'')}${row('1차 목표',r.t1,'')}${row('손절 참고',r.stop,r.stopWhy)}</tbody></table>
         <div class="lbl">판단 근거</div><ul class="why">${r.why.map(w=>`<li>${esc(w)}</li>`).join('')}</ul>
+        ${newsHTML(r.code,4)}
       </div></article>`;
   }).join('');
   box.querySelectorAll('[data-rm]').forEach(b=>b.onclick=()=>{const l=loadH();l.splice(+b.dataset.rm,1);saveH(l);renderHolds();});
