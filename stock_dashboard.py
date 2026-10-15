@@ -1596,9 +1596,13 @@ function renderHolds(){
     if(!snapOf(h.code)){
       const nm=esc(NAMES[h.code]||h.code),st=PENDING[h.code];
       if(AI_URL&&!st)setTimeout(()=>fetchSnap(h.code),0);
-      const msg=!AI_URL?'오늘 데이터에 없는 종목입니다. (AI 중계 서버를 연결하면 바로 조회할 수 있습니다.)':
+      const msg=!AI_URL?'오늘 아침 시세 수집에서 빠진 종목이라 차트 점검을 할 수 없습니다. 내일 아침 갱신 때 다시 나타나는지 확인해 주세요. 아래 AI 분석은 지금도 쓸 수 있습니다.':
         (typeof st==='string'&&st.startsWith('err:'))?'시세를 불러오지 못했습니다: '+esc(st.slice(4)):'시세를 불러오는 중입니다…';
-      return `<div class="hold"><div><b>${nm}</b> <span class="code">${esc(h.code)}</span><br><span class="vl" style="text-align:left">${msg}</span> <button class="rm" data-rm="${idx}">삭제</button></div></div>`;
+      const bp=`한국 주식 ${NAMES[h.code]||h.code}(${h.code})을 ${f0(h.qty)}주, 평균 ${f0(h.avg)}원에 보유하고 있어. `+
+        `현재 주가와 최근 차트 흐름(20일선·60일선, RSI, 거래량), 최근 한 달 국내 뉴스·공시와 Reuters·Bloomberg 같은 해외 영문 기사(영문은 한국어로 요약)를 웹에서 검색해서 `+
+        `최근 한 달 주요 이슈를 날짜순으로 정리하고, 보유 / 일부 매도 / 전량 매도 중 어떤 전략이 좋을지 손절가·목표가, 근거 3가지, 리스크, 참고 기사 링크와 함께 알려줘.`;
+      return `<div class="hold"><div><div class="hdr"><div><b>${nm}</b> <span class="code">${esc(h.code)}</span> · ${f0(h.qty)}주 · 평단 ${f0(h.avg)}</div><button class="rm" data-rm="${idx}">삭제</button></div>
+        <p class="vl" style="text-align:left;margin:8px 0 0">${msg}</p></div><div>${aiSlot({prompt:bp,kind:'hold',key:`ai:${D.asof}:${h.code}:hx`,tone:'mid'})}</div></div>`;
     }
     const r=analyzeHolding(h.code,h.qty,h.avg);
     const row=(l,p,why)=>`<tr><td>${l}<br><small class="vl" style="text-align:left">${why}</small></td><td>${f0(p)}</td><td>${pctS((p/r.c-1)*100)}</td><td class="${p>=r.avg?'upc':'downc'}">${(p-r.avg)*r.qty>=0?'+':''}${f0((p-r.avg)*r.qty)}원</td></tr>`;
