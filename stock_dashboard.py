@@ -61,7 +61,11 @@ def http_get(url, retries=3):
         try:
             req = urllib.request.Request(url, headers=UA)
             with urllib.request.urlopen(req, timeout=20) as r:
-                return r.read().decode("cp949", errors="replace")
+                raw = r.read()
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return raw.decode("cp949", errors="replace")
         except Exception:
             if k == retries - 1:
                 raise
@@ -69,7 +73,7 @@ def http_get(url, retries=3):
 
 
 def _strip(s):
-    return re.sub(r"<[^>]+>", "", s).replace("&nbsp;", " ").strip()
+    return re.sub(r"<[^>]+>", "", str(s)).replace("&nbsp;", " ").strip()
 
 
 def _num(s):
@@ -84,8 +88,53 @@ def is_excluded_name(name):
     return first in ETF_BRANDS or "ETN" in name or "스팩" in name
 
 
-def naver_listing():
-    """네이버 금융 시가총액 페이지에서 코스피·코스닥 종목 목록"""
+def _diag(src, text):
+    snippet = re.sub(r"\s+", " ", text[:300])
+    print(f"  [{src}] 읽기 실패. 응답 앞부분: {snippet}", flush=True)
+
+
+def listing_mobile_api():
+    """네이버 증권 모바일 API (JSON)"""
+    rows = []
+    for mk in ("KOSPI", "KOSDAQ"):
+        n0 = len(rows)
+        for page in range(1, 60):
+            text = http_get(f"https://m.stock.naver.com/api/stocks/marketValue/{mk}?page={page}&pageSize=100")
+            try:
+                data = json.loads(text)
+            except ValueError:
+                _diag("모바일 API", text)
+                return []
+            items = data.get("stocks") if isinstance(data, dict) else None
+            if not items:
+                if page == 1:
+                    _diag("모바일 API", text)
+                break
+            for it in items:
+                code = str(it.get("itemCode", ""))
+                if not re.fullmatch(r"[0-9A-Z]{6}", code):
+                    continue
+                if it.get("stockEndType", "stock") != "stock":
+                    continue
+                rows.append(dict(code=code, name=str(it.get("stockName", "")), market=mk,
+                                 현재가=_num(it.get("closePrice", "")), 거래량=_num(it.get("accumulatedTradingVolume", "")),
+                                 시가총액=_num(it.get("marketValue", ""))))
+        print(f"  {mk} 종목 목록 {len(rows) - n0}개 (모바일 API)", flush=True)
+    if rows:
+        df = pd.DataFrame(rows).drop_duplicates("code").set_index("code")
+        # 시가총액 단위 자동 판별: 삼성전자가 수백조 원이 되도록 맞춤 (억 단위 기준)
+        ref = df["시가총액"].get("005930", np.nan)
+        if ref == ref:
+            if ref > 1e8:
+                df["시가총액"] = df["시가총액"] / 100      # 백만원 → 억
+            elif not (1e5 < ref < 1e8):
+                df["시가총액"] = np.nan
+        return df
+    return []
+
+
+def listing_pc_page():
+    """네이버 금융 PC 시가총액 페이지 (HTML)"""
     rows = []
     for sosok, mk in ((0, "KOSPI"), (1, "KOSDAQ")):
         seen = set()
@@ -94,7 +143,7 @@ def naver_listing():
             heads = [_strip(h) for h in re.findall(r'<th[^>]*scope="col"[^>]*>(.*?)</th>', html, re.S)]
             new = 0
             for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S):
-                mm = re.search(r'<a[^>]*code=(\d{6})[^>]*>(.*?)</a>', tr, re.S)
+                mm = re.search(r'<a[^>]*code=([0-9A-Z]{6})[^>]*>(.*?)</a>', tr, re.S)
                 if not mm or not _strip(mm.group(2)):
                     continue
                 code, name = mm.group(1), _strip(mm.group(2))
@@ -109,11 +158,40 @@ def naver_listing():
                     rec[key] = _num(cells[i]) if 0 <= i < len(cells) else np.nan
                 rows.append(rec)
             if new == 0:
+                if page == 1:
+                    _diag("PC 페이지", html)
                 break
-        print(f"  {mk} 종목 목록 {len(seen)}개", flush=True)
-    if not rows:
-        raise RuntimeError("네이버 종목 목록을 읽지 못했습니다 (페이지 형식 변경 가능성)")
-    return pd.DataFrame(rows).set_index("code")
+        print(f"  {mk} 종목 목록 {len(seen)}개 (PC 페이지)", flush=True)
+    return pd.DataFrame(rows).set_index("code") if rows else []
+
+
+def listing_kind():
+    """한국거래소 KIND 상장법인 목록 (ETF 제외 원본)"""
+    rows = []
+    for mt, mk in (("stockMkt", "KOSPI"), ("kosdaqMkt", "KOSDAQ")):
+        html = http_get(f"https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&marketType={mt}")
+        n0 = len(rows)
+        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S):
+            cells = [_strip(c) for c in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+            code = next((c for c in cells if re.fullmatch(r"[0-9A-Z]{6}", c)), None)
+            if code and cells[0]:
+                rows.append(dict(code=code, name=cells[0], market=mk, 현재가=np.nan, 거래량=np.nan, 시가총액=np.nan))
+        if len(rows) == n0:
+            _diag("KIND", html)
+        print(f"  {mk} 종목 목록 {len(rows) - n0}개 (KIND)", flush=True)
+    return pd.DataFrame(rows).drop_duplicates("code").set_index("code") if rows else []
+
+
+def naver_listing():
+    for fn in (listing_mobile_api, listing_pc_page, listing_kind):
+        try:
+            df = fn()
+        except Exception as ex:
+            print(f"  {fn.__doc__.strip()}: 접속 오류 {ex}", flush=True)
+            continue
+        if len(df) > 500:
+            return df
+    raise RuntimeError("종목 목록을 어느 곳에서도 받지 못했습니다. 위 로그의 '응답 앞부분'을 확인하세요.")
 
 
 def naver_ohlcv(code, count):
@@ -139,7 +217,7 @@ def load_naver(days):
     print(f"시세 받는 중… ({len(lst)}종목)", flush=True)
 
     data = {}
-    with ThreadPoolExecutor(max_workers=12) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         futs = {ex.submit(naver_ohlcv, code, days + 5): code for code in lst.index}
         for i, f in enumerate(as_completed(futs), 1):
             try:
@@ -151,6 +229,10 @@ def load_naver(days):
             if i % 200 == 0:
                 print(f"  {i}/{len(futs)}", flush=True)
     if not data:
+        try:
+            _diag("시세 차트", http_get("https://fchart.stock.naver.com/sise.nhn?symbol=005930&timeframe=day&count=5&requestType=0"))
+        except Exception as ex:
+            print(f"  시세 차트 접속 오류: {ex}", flush=True)
         raise RuntimeError("네이버 시세를 하나도 받지 못했습니다")
 
     P = {k: pd.DataFrame({code: df[k] for code, df in data.items()}).sort_index() for k in "ohlcv"}
