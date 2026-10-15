@@ -447,16 +447,42 @@ def evaluate(P, I, market):
     rs_txt = lambda t: f"시장 대비 {rs[t]:+.1f}%p" if rs[t] == rs[t] else "-"
     rs_trend = W(rs > 5, 4, W(rs > 0, 2, W(rs < -10, -4, 0)))
 
+    # 피보나치: 최근 120일 고점·저점 사이 되돌림 위치
+    hw = P["h"].iloc[-120:].to_numpy(float)
+    lw = P["l"].iloc[-120:].to_numpy(float)
+    ihi = np.where(np.isnan(hw), -np.inf, hw).argmax(0)
+    ilo = np.where(np.isnan(lw), np.inf, lw).argmin(0)
+    fhi, flo = S(np.nanmax(hw, 0)), S(np.nanmin(lw, 0))
+    fup = S(ihi > ilo) > 0                                   # 저점 → 고점 순서면 상승 파동
+    rng_ = fhi - flo
+    big = (rng_ / flo) >= 0.15                                # 변동폭 15% 이상일 때만 의미 있음
+    depth = (fhi - c) / rng_                                  # 상승 파동에서 되돌린 비율
+    bounce = (c - flo) / rng_                                 # 하락 파동에서 반등한 비율
+
+    def fib_txt(t):
+        if not big[t]:
+            return "변동폭 작음"
+        return f"상승폭의 {depth[t] * 100:.0f}% 되돌림" if fup[t] else f"하락폭의 {bounce[t] * 100:.0f}% 반등"
+
+    fib1 = W(~big, 0, W(~fup, -2, W((depth >= 0.5) & (depth <= 0.65), 5,
+             W((depth >= 0.33) & (depth < 0.5), 3, W(depth > 0.8, -3, 0)))))
+    fib2 = W(big & fup & (depth <= 0.05), 2, 0)
+    fib3 = W(big & fup & (depth >= 0.58) & (depth <= 0.82), 5,
+             W(big & ~fup & (bounce >= 0.1) & (bounce <= 0.382), 2, 0))
+
     aux = {
         1: [("MACD 히스토그램", W(rising, 3, -2), macd_txt),
             ("OBV", W(div, 3, 0) + W(obv_up, 2, -2), obv_txt),
-            ("상대강도 (20일)", rs_trend, rs_txt)],
+            ("상대강도 (20일)", rs_trend, rs_txt),
+            ("피보나치", fib1, fib_txt)],
         2: [("MACD 히스토그램", W(rising & (h0 > 0), 3, W(h0 < 0, -3, 0)), macd_txt),
             ("OBV", W(obv_up, 2, -2), obv_txt),
-            ("상대강도 (20일)", rs_trend, rs_txt)],
+            ("상대강도 (20일)", rs_trend, rs_txt),
+            ("피보나치", fib2, fib_txt)],
         3: [("MACD 히스토그램", W(cross, 5, W((h0 < 0) & rising2, 5, W(rising, 2, -3))), macd_txt),
             ("OBV", W(div, 6, W(obv_up, 2, 0)), obv_txt),
-            ("상대강도 (20일)", W(rs > -5, 3, W(rs < -15, -3, 0)), rs_txt)],
+            ("상대강도 (20일)", W(rs > -5, 3, W(rs < -15, -3, 0)), rs_txt),
+            ("피보나치", fib3, fib_txt)],
     }
 
     # ── 목표가 · 손절가 원안 ──
@@ -470,7 +496,8 @@ def evaluate(P, I, market):
     }
     metrics = dict(c=c, chg=chg, vr=vr, rsi=rsi, pb=pb, a=P["a"].iloc[-1], atr=atr, rs=rs,
                    h0=h0, h1=h1, ma20=ma20, ma60=ma60, ma60_5=ma60_5, bbu=bbu, bbl=bbl,
-                   hi20=hi20, lo20=P["l"].iloc[-20:].min(), hi60=hi60)
+                   hi20=hi20, lo20=P["l"].iloc[-20:].min(), hi60=hi60,
+                   fhi=fhi, flo=flo, fup=fup, fbig=big)
     return dict(scores=scores, checks=checks, aux=aux, tg=tg, m=metrics)
 
 
@@ -498,6 +525,14 @@ def vp_levels(h, l, v, c0, bins=28):
         if heavy[j] and e_hi < c0 * 0.995:
             sup = e_hi
     return res, sup
+
+
+def fib_levels(t, m):
+    """차트에 그릴 피보나치 되돌림 가격 (38.2 / 50 / 61.8%)"""
+    if not bool(m["fbig"][t]):
+        return None
+    hi, lo, up = float(m["fhi"][t]), float(m["flo"][t]), bool(m["fup"][t])
+    return [[f"{r * 100:g}%", num(hi - (hi - lo) * r if up else lo + (hi - lo) * r)] for r in (0.382, 0.5, 0.618)]
 
 
 def target_for(k, t, ev, res):
@@ -849,6 +884,7 @@ def build(demo=False, mode="file"):
             bbu=arr(I["bbu"], 1), bbm=arr(I["ma20"], 1), bbl=arr(I["bbl"], 1),
             ma60=arr(I["ma60"], 1), vma=arr(I["vma20"]), rsi=arr(I["rsi"], 1), hist=arr(I["hist"], 2),
             t1=num(tg["t1"]), t2=num(tg["t2"]), stop=num(tg["stop"]),
+            fib=fib_levels(t, m),
         )
 
     tabs, picks_of = [], {}
@@ -908,7 +944,8 @@ def build(demo=False, mode="file"):
                      (1 if m["ma60"][t] > m["ma60_5"][t] else -1), num(m["bbu"][t]), num(m["bbl"][t]),
                      num(m["rsi"][t], 1), num(m["atr"][t]), num(m["h0"][t], 2), num(m["h1"][t], 2),
                      num(m["hi20"][t]), num(m["lo20"][t]), num(m["hi60"][t]), num(res), num(sup),
-                     picks_of.get(t, ""), num(m["rs"][t], 1)]
+                     picks_of.get(t, ""), num(m["rs"][t], 1),
+                     num(m["fhi"][t]), num(m["flo"][t]), (1 if m["fup"][t] else 0) if bool(m["fbig"][t]) else None]
 
     above20 = (c[uni] > m["ma20"][uni]).mean() * 100
     above60 = (c[uni] > m["ma60"][uni]).mean() * 100
@@ -1235,6 +1272,10 @@ svg text{font-family:inherit}
 .chart .tagbg{fill:var(--ink)} .chart .tagtx{fill:var(--surface);font-size:11px;font-weight:700}
 .chart .poctx{fill:var(--ma);font-size:10.5px;font-weight:700}
 .chart .cl{fill:none;stroke:var(--ink);stroke-width:1.5}
+.chart .fib{stroke:#a16207;stroke-width:1;stroke-dasharray:1 3;opacity:.9}
+.chart .fibx{fill:#a16207;font-size:10.5px;font-weight:700}
+@media (prefers-color-scheme: dark){.chart .fib{stroke:#facc15}.chart .fibx{fill:#facc15}}
+.chart .fibx,.chart .tlx,.chart .slx,.chart .poctx{paint-order:stroke;stroke:var(--surface);stroke-width:3.5px;stroke-linejoin:round}
 .chart .tl{stroke:var(--up);stroke-width:1.2;stroke-dasharray:6 4}
 .chart .sl{stroke:var(--down);stroke-width:1.2;stroke-dasharray:6 4}
 .chart .tlx{fill:var(--up);font-size:11px;font-weight:700}
@@ -1337,12 +1378,15 @@ function drawChart(box,s){
   for(let i=0;i<n;i++){const a=Math.max(0,Math.floor((s.l[i]-lo)/bh)),b=Math.min(bins-1,Math.floor((s.h[i]-lo)/bh)),k=b-a+1;for(let j=a;j<=b;j++)vp[j]+=s.v[i]/k;}
   const vmx=Math.max(...vp),poc=vp.indexOf(vmx),vpw=pw*.24;
   vp.forEach((x,j)=>{const w=x/vmx*vpw,y1=YP(lo+(j+1)*bh),y2=YP(lo+j*bh);el('rect',{x:m.l+pw-w,y:y1+.5,width:w,height:Math.max(.5,y2-y1-1),class:j===poc?'poc':'vp'},svg);});
-  if(!small)tx(svg,m.l+pw-vpw-4,YP(lo+(poc+.5)*bh)+4,'매물대 최대','poctx','end');
+  if(!small&&!(s.fib||[]).length)tx(svg,m.l+pw-vpw-4,YP(lo+(poc+.5)*bh)+4,'매물대 최대','poctx','end');
   // 볼린저 · 60일선
   const up=[],dn=[];
   s.bbu.forEach((v,i)=>{if(v!=null&&s.bbl[i]!=null){up.push(X(i).toFixed(1)+','+YP(v).toFixed(1));dn.unshift(X(i).toFixed(1)+','+YP(s.bbl[i]).toFixed(1));}});
   if(up.length)el('path',{d:'M'+up.join('L')+'L'+dn.join('L')+'Z',class:'band'},svg);
   path(svg,s.bbu,X,YP,'bb');path(svg,s.bbl,X,YP,'bb');path(svg,s.bbm,X,YP,'bbm');path(svg,s.ma60,X,YP,'ma');
+  // 피보나치 되돌림
+  (s.fib||[]).forEach(([lab,v])=>{ if(v==null||v<lo||v>hi)return; const y=YP(v);
+    el('line',{x1:m.l,x2:m.l+pw,y1:y,y2:y,class:'fib'},svg); tx(svg,m.l+pw-vpw-6,y-3,'Fib '+lab+' '+f0(v),'fibx','end'); });
   // 목표가 · 손절가
   let prevY=null;
   [['t2','목표2','tl'],['t1','목표1','tl'],['stop','손절','sl']].forEach(([k,lab,cls])=>{
@@ -1521,6 +1565,7 @@ function renderHow(){
         <div><b>OBV</b>: 가격은 저점을 낮추는데 거래량 누적은 올라가는 강세 다이버전스 +3~6</div>
         <div><b>상대강도</b>: 최근 20일 수익률이 시장 평균보다 좋으면 +2~4, 크게 나쁘면 −3~4</div>
         <div><b>매물대</b>: 목표가 아래에 거래가 많이 쌓인 가격대가 있으면 목표가를 그 아래로 낮춥니다</div>
+        <div><b>피보나치</b> (최근 120일 고점·저점): 눌림목은 상승폭의 50~61.8% 되돌림 +5, 38.2~50% +3, 78.6% 넘게 빠지면 −3 · 반등은 61.8~78.6% 깊은 지지 +5 · 차트에 노란 점선으로 표시</div>
       </div></div>
     <div><h4>4단계 · 순위</h4><p>최종 점수 = 기본 점수 + 가감점 (0~100점). 전략별로 1~3위는 매수 후보, 4~6위는 지켜볼 종목, 7~16위는 목록으로 보여줍니다. 데이터는 네이버 금융 기준이며 평일 아침마다 전 거래일 종가로 다시 계산합니다.</p></div>`;
 }
@@ -1650,7 +1695,7 @@ function findCode(q){q=q.trim();if(!q)return null;if(NAMES[q])return q;const m=q
   if(byName[q])return byName[q];const k=Object.keys(byName).find(n=>n.replace(/\s/g,'')===q.replace(/\s/g,''));return k?byName[k]:null;}
 
 function analyzeHolding(code,qty,avg){
-  const [name,mk,c,chg,ma20,ma60,slope,bbu,bbl,rsi,atr0,h0,h1,hi20,lo20,hi60,res,sup,pick,rs]=snapOf(code);
+  const [name,mk,c,chg,ma20,ma60,slope,bbu,bbl,rsi,atr0,h0,h1,hi20,lo20,hi60,res,sup,pick,rs,fhi,flo,fup]=snapOf(code);
   const atr=atr0||c*.03,pl=(c/avg-1)*100,plAmt=(c-avg)*qty;
   const pb=(bbu&&bbl&&bbu>bbl)?(c-bbl)/(bbu-bbl):null;
   const up=ma20&&ma60&&c>ma20&&ma20>ma60&&slope>0, down=ma60&&c<ma60&&slope<0;
@@ -1666,6 +1711,11 @@ function analyzeHolding(code,qty,avg){
   if(h0!=null)why.push(`MACD 히스토그램 ${h0>=0?(macdUp?'상승 확대':'상승 둔화'):(macdUp?'하락 둔화 (반등 준비)':'하락 확대')}입니다.`);
   if(rs!=null)why.push(`최근 20일 시장 대비 ${rs>=0?'강했습니다':'약했습니다'} (${rs>0?'+':''}${rs.toFixed(1)}%p).`);
   if(res)why.push(`${f0(res)}원 부근에 위쪽 매물대(저항)가 있습니다.`);
+  if(fup!=null&&fhi&&flo&&fhi>flo){
+    const rr=[.382,.5,.618],lv=rr.map(r=>[r,fup?fhi-(fhi-flo)*r:flo+(fhi-flo)*r]);
+    const below=lv.filter(x=>x[1]<c).sort((a,b)=>b[1]-a[1])[0],above=lv.filter(x=>x[1]>c).sort((a,b)=>a[1]-b[1])[0];
+    why.push(`피보나치(최근 120일 ${fup?'상승':'하락'} 파동): `+[below?`아래 지지 ${f0(below[1])}원(${(below[0]*100).toFixed(1)}%)`:'',above?`위 저항 ${f0(above[1])}원(${(above[0]*100).toFixed(1)}%)`:''].filter(Boolean).join(', ')+'.');
+  }
   if(pick)why.push(`오늘 매수 후보 목록에 있습니다: ${pick}.`);
   let v,tone,plan;
   if(down&&h0!=null&&h0<0&&!macdUp){v=pl<0?'손절 검토':'이익 보호 매도';tone='no';plan=pl<0?`하락 추세가 이어지고 있습니다. 반등 시 ${f0(Math.min(ma20||t1,t1))}원 부근에서 비중을 줄이고, ${f0(stop)}원을 깨면 정리하는 것을 검토하세요.`:'수익이 남아 있을 때 일부(1/2)를 정리하고, 나머지는 손절가 이탈 시 정리하는 방법을 검토하세요.';}
