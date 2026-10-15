@@ -33,7 +33,7 @@ import pandas as pd
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 CFG = dict(
-    days=160,              # 수집 거래일 수
+    days=260,              # 수집 거래일 수 (약 1년: 52주 지표 · 과거 성적 검증용)
     min_amount=30e8,       # 최소 거래대금 30억
     min_mcap=1000e8,       # 최소 시가총액 1,000억
     min_price=2000,        # 최소 주가
@@ -42,6 +42,13 @@ CFG = dict(
     top_n=16,              # 1~3 / 4~6 / 7~16
     cand_n=25,             # 전략별 2차 검토(수급·실적 조회) 후보 수
 )
+
+STATUS = {}   # 데이터 출처별 수집 결과 (상세 설명 페이지에 표시)
+
+
+def stat(key, ok, detail=""):
+    STATUS[key] = dict(ok=(None if ok is None else bool(ok)), detail=str(detail))
+
 
 STRATS = {1: "추세 눌림목", 2: "거래량 돌파", 3: "과매도 반등"}
 STOP_LABEL = {1: "20일선 -3%", 2: "돌파 기준가", 3: "최근 5일 저점"}
@@ -200,7 +207,9 @@ def naver_listing():
             print(f"  {fn.__doc__.strip()}: 접속 오류 {ex}", flush=True)
             continue
         if len(df) > 500:
+            stat("종목 목록 (네이버)", True, f"{fn.__doc__.strip()} · {len(df)}종목")
             return df
+    stat("종목 목록 (네이버)", False, "모든 경로 실패")
     raise RuntimeError("종목 목록을 어느 곳에서도 받지 못했습니다. 위 로그의 '응답 앞부분'을 확인하세요.")
 
 
@@ -250,6 +259,7 @@ def load_naver(days):
                 if rnd == 1 and i % 300 == 0:
                     print(f"  {i}/{len(futs)}", flush=True)
         print(f"  {rnd}차 수집 후 실패 {len(failed)}종목", flush=True)
+        stat("종목 시세 (네이버 차트)", len(data) > 0, f"{len(data)}종목 성공 · {len(failed)}종목 실패")
         if not failed:
             break
         todo = failed
@@ -361,7 +371,7 @@ def near(x, lo, hi, tol):
     return (1 - dist / tol).clip(0, 1).fillna(0)
 
 
-def evaluate(P, I, market):
+def evaluate(P, I, market, light=False):
     idx = P["c"].columns
     S = lambda arr: pd.Series(arr, index=idx, dtype=float)
     W = lambda cond, a, b: S(np.where(cond, a, b))
@@ -470,19 +480,65 @@ def evaluate(P, I, market):
     fib3 = W(big & fup & (depth >= 0.58) & (depth <= 0.82), 5,
              W(big & ~fup & (bounce >= 0.1) & (bounce <= 0.382), 2, 0))
 
+    # 세력 패턴 (최근 20일): 큰손의 매집·이탈 흔적으로 자주 쓰이는 캔들·거래량 모양
+    C_, O_, H_, L_, V_ = (P[k].iloc[-20:].to_numpy(float) for k in "cohlv")
+    VM = I["vma20"].iloc[-20:].to_numpy(float)
+    CH = I["chg"].iloc[-20:].to_numpy(float)
+    cols_ = np.arange(C_.shape[1])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        VR = V_ / VM
+        bigb = (CH >= 8) & (VR >= 3)
+        bigb[-2:] = False
+        lastb = np.where(bigb.any(0), 19 - np.argmax(bigb[::-1], 0), -1)
+        jj = np.clip(lastb, 0, 19)
+        midb = (O_[jj, cols_] + C_[jj, cols_]) / 2
+        v3 = np.nanmean(V_[-3:], 0)
+        pa = (lastb >= 0) & (C_[-1] >= midb) & (v3 < V_[jj, cols_] * 0.4)          # 장대양봉 후 거래량 줄며 눌림
+        pa_break = (lastb >= 0) & (C_[-1] < midb * 0.97)                             # 장대양봉 중간값 이탈
+        lo60_ = P["l"].iloc[-60:].min().to_numpy(float)
+        hi60_ = P["h"].iloc[-60:].max().to_numpy(float)
+        lowzone = C_[-5:] <= lo60_ + (hi60_ - lo60_) * 0.4
+        pc = ((VR[-5:] >= 3) & (np.abs(C_[-5:] - O_[-5:]) <= (H_[-5:] - L_[-5:]) * 0.35) & lowzone).any(0)   # 저점권 매집봉
+        prng = np.nanmax(H_, 0) / np.nanmin(L_, 0) - 1
+        obv20 = (I["obv"].iloc[-1] - I["obv"].iloc[-20]).to_numpy(float)
+        pb_ = (prng <= 0.12) & (obv20 > 0) & (np.nanmean(V_[-10:], 0) > np.nanmean(V_[:10], 0) * 1.2)   # 조용한 매집
+        pd_ = ((VR[-5:] >= 3) & (CH[-5:] <= -7)).any(0) | pa_break                  # 이탈 의심
+    PA, PB, PC, PD = (S(x) > 0 for x in (pa, pb_, pc, pd_))
+    pat = S(np.clip(np.where(pa, 5, 0) + np.where(pb_, 4, 0) + np.where(pc, 4, 0) + np.where(pd_, -6, 0), -6, 9))
+
+    hi250 = P["h"].iloc[-250:].max()
+    near52 = c / hi250
+    atrp = I["atr"].iloc[-1] / c * 100
+    w52 = W(near52 >= 0.9, 3, 0)
+    w52_txt = lambda t: f"52주 고가의 {near52[t] * 100:.0f}%"
+    volp = W(atrp > 7, -3, 0)
+    volp_txt = lambda t: f"하루 평균 변동 {atrp[t]:.1f}%"
+
+    def pat_txt(t):
+        names = [n for n, f in (("장대양봉 후 눌림", PA), ("조용한 매집", PB), ("저점 매집봉", PC), ("이탈 의심", PD)) if f[t]]
+        return ", ".join(names) if names else "없음"
+
     aux = {
         1: [("MACD 히스토그램", W(rising, 3, -2), macd_txt),
             ("OBV", W(div, 3, 0) + W(obv_up, 2, -2), obv_txt),
             ("상대강도 (20일)", rs_trend, rs_txt),
-            ("피보나치", fib1, fib_txt)],
+            ("피보나치", fib1, fib_txt),
+            ("세력 패턴", pat, pat_txt),
+            ("52주 고가 근접", w52, w52_txt),
+            ("변동성", volp, volp_txt)],
         2: [("MACD 히스토그램", W(rising & (h0 > 0), 3, W(h0 < 0, -3, 0)), macd_txt),
             ("OBV", W(obv_up, 2, -2), obv_txt),
             ("상대강도 (20일)", rs_trend, rs_txt),
-            ("피보나치", fib2, fib_txt)],
+            ("피보나치", fib2, fib_txt),
+            ("세력 패턴", pat, pat_txt),
+            ("52주 고가 근접", w52, w52_txt),
+            ("변동성", volp, volp_txt)],
         3: [("MACD 히스토그램", W(cross, 5, W((h0 < 0) & rising2, 5, W(rising, 2, -3))), macd_txt),
             ("OBV", W(div, 6, W(obv_up, 2, 0)), obv_txt),
             ("상대강도 (20일)", W(rs > -5, 3, W(rs < -15, -3, 0)), rs_txt),
-            ("피보나치", fib3, fib_txt)],
+            ("피보나치", fib3, fib_txt),
+            ("세력 패턴", pat, pat_txt),
+            ("변동성", volp, volp_txt)],
     }
 
     # ── 목표가 · 손절가 원안 ──
@@ -497,7 +553,8 @@ def evaluate(P, I, market):
     metrics = dict(c=c, chg=chg, vr=vr, rsi=rsi, pb=pb, a=P["a"].iloc[-1], atr=atr, rs=rs,
                    h0=h0, h1=h1, ma20=ma20, ma60=ma60, ma60_5=ma60_5, bbu=bbu, bbl=bbl,
                    hi20=hi20, lo20=P["l"].iloc[-20:].min(), hi60=hi60,
-                   fhi=fhi, flo=flo, fup=fup, fbig=big)
+                   fhi=fhi, flo=flo, fup=fup, fbig=big,
+                   pat=(None if light else pd.Series([pat_txt(t) for t in idx], index=idx)))
     return dict(scores=scores, checks=checks, aux=aux, tg=tg, m=metrics)
 
 
@@ -579,38 +636,45 @@ def man(x):
 
 
 # ───────────────────────────── 수급 · 실적 ─────────────────────────────
+def flow_sum(days):
+    """최근 5일 외국인·기관 순매수 합계 + 둘 다 순매수한 연속 일수 (최근일부터)"""
+    f = sum(d[0] for d in days[:5])
+    i = sum(d[1] for d in days[:5])
+    st = 0
+    for a, b in days:
+        if a > 0 and b > 0:
+            st += 1
+        else:
+            break
+    return f, i, st
+
+
 def fetch_flow(code):
     try:
         data = json.loads(http_get(f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=10", retries=2))
         items = data if isinstance(data, list) else next((x for x in data.values() if isinstance(x, list)), [])
-        f = i = 0.0
-        n = 0
-        for it in items[:5]:
+        days = []
+        for it in items[:10]:
             fk = next((k for k in it if re.search(r"foreign.*pure", k, re.I)), None)
             ok = next((k for k in it if re.search(r"organ.*pure", k, re.I)), None)
             if fk is None or ok is None:
                 break
-            f += np.nan_to_num(_num(it[fk]))
-            i += np.nan_to_num(_num(it[ok]))
-            n += 1
-        if n:
-            return f, i
+            days.append((np.nan_to_num(_num(it[fk])), np.nan_to_num(_num(it[ok]))))
+        if days:
+            return flow_sum(days)
     except Exception:
         pass
     try:
         html = http_get(f"https://finance.naver.com/item/frgn.naver?code={code}", retries=2)
-        f = i = 0.0
-        n = 0
+        days = []
         for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S):
             cells = [_strip(x) for x in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
             if len(cells) >= 7 and re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", cells[0]):
-                i += np.nan_to_num(_num(cells[5]))
-                f += np.nan_to_num(_num(cells[6]))
-                n += 1
-                if n == 5:
+                days.append((np.nan_to_num(_num(cells[6])), np.nan_to_num(_num(cells[5]))))
+                if len(days) == 10:
                     break
-        if n:
-            return f, i
+        if days:
+            return flow_sum(days)
     except Exception:
         pass
     return None
@@ -652,13 +716,15 @@ def fetch_extras(codes):
     for t in codes:
         e = {}
         if flows[t]:
-            e["f"], e["i"] = flows[t]
+            e["f"], e["i"], e["st"] = flows[t]
         if epss[t]:
             e["eps"], e["per"] = epss[t]
         out[t] = e
     nf = sum(1 for t in codes if flows[t])
     ne = sum(1 for t in codes if epss[t])
     print(f"  수급 {nf}/{len(codes)}, 실적 {ne}/{len(codes)} 확인", flush=True)
+    stat("외국인·기관 수급 (네이버)", nf > 0, f"{nf}/{len(codes)}종목")
+    stat("실적 EPS·PER (네이버)", ne > 0, f"{ne}/{len(codes)}종목")
     return out, dict(flow=nf, eps=ne, total=len(codes))
 
 
@@ -667,9 +733,583 @@ def demo_extras(codes):
     out = {}
     for t in codes:
         eps = rng.normal(1500, 2000)
-        out[t] = dict(f=rng.normal(0, 2e5), i=rng.normal(0, 1.5e5), eps=eps,
+        out[t] = dict(f=rng.normal(0, 2e5), i=rng.normal(0, 1.5e5), st=int(rng.integers(0, 5)), eps=eps,
                       per=(rng.uniform(5, 40) if eps > 0 else None))
     return out, dict(flow=len(codes), eps=len(codes), total=len(codes))
+
+
+# ───────────────────────────── 시장 위험 신호 ─────────────────────────────
+def fetch_index_naver(sym, count):
+    xml = http_get(f"https://fchart.stock.naver.com/sise.nhn?symbol={sym}&timeframe=day&count={count}&requestType=0", retries=2)
+    recs = re.findall(r'data="(\d{8})\|([\d.]+)\|([\d.]+)\|([\d.]+)\|([\d.]+)\|([\d.]+)"', xml)
+    if len(recs) < 70:
+        return None
+    df = pd.DataFrame(recs, columns=["d", "o", "h", "l", "c", "v"])
+    df.index = pd.to_datetime(df.pop("d"), format="%Y%m%d")
+    return df.astype(float)[["c", "v"]]
+
+
+def fetch_yahoo(sym):
+    from urllib.parse import quote
+    j = json.loads(http_get(f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(sym)}?range=6y&interval=1d", retries=2))
+    r = j["chart"]["result"][0]
+    s = pd.Series(r["indicators"]["quote"][0]["close"],
+                  index=pd.to_datetime([datetime.utcfromtimestamp(t).date() for t in r["timestamp"]]), dtype=float).dropna()
+    return s[~s.index.duplicated(keep="last")] if len(s) > 40 else None
+
+
+def market_risk(P, I, uni, demo):
+    """시장 방향 신호: 하락 위험 점수 + 상승 신호 점수 (0~100). 선행 = 미리 켜지는 신호, 진행/확인 = 이미 움직이는 중"""
+    dates = P["c"].index
+    c = P["c"][uni]
+    idx, src = {}, "지수"
+    if not demo:
+        for name in ("KOSPI", "KOSDAQ"):
+            try:
+                df = fetch_index_naver(name, len(dates) + 10)
+                if df is not None:
+                    idx[name] = df.reindex(dates).ffill()
+            except Exception:
+                pass
+    if not idx:
+        r = c.pct_change(fill_method=None).median(axis=1).fillna(0)
+        idx["시장 평균"] = pd.DataFrame({"c": 1000 * (1 + r).cumprod(), "v": P["v"][uni].sum(axis=1)})
+        src = "전 종목 평균(지수 대체)"
+
+    def isig(df):
+        cc, vv = df["c"], df["v"]
+        ma20, ma60 = cc.rolling(20).mean(), cc.rolling(60).mean()
+        ret = cc.pct_change() * 100
+        dist = ((ret <= -0.2) & (vv > vv.shift(1))).astype(int).rolling(25).sum()
+        volr = ret.rolling(10).std() / ret.rolling(60).std()
+        hi60 = cc.rolling(60).max()
+        # 바닥 확인일(Follow-through day): 최근 저점 이후 4일째 이후에 거래량 늘며 +1.5% 이상 상승
+        ftd = pd.Series(False, index=cc.index)
+        vals, rets, vols = cc.to_numpy(), ret.to_numpy(), vv.to_numpy()
+        for i in range(25, len(cc)):
+            w = vals[i - 15:i + 1]
+            if np.isnan(w).any():
+                continue
+            lo = i - 15 + int(np.argmin(w))
+            for j in range(lo + 4, i + 1):
+                if rets[j] >= 1.5 and vols[j] > vols[j - 1] and vals[i] > vals[lo]:
+                    ftd.iloc[i] = True
+                    break
+        return pd.DataFrame(dict(c=cc, ret=ret, below20=cc < ma20, below60=cc < ma60, dead=ma20 < ma60,
+                                 cross_up=(cc > ma20) & (cc.shift(5) < ma20.shift(5)), golden=(ma20 > ma60) & (ma20.shift(5) <= ma60.shift(5)),
+                                 dist=dist, volr=volr, dd=(cc / hi60 - 1) * 100, ftd=ftd))
+
+    sig = {k: isig(v) for k, v in idx.items()}
+    above20 = (c > I["ma20"][uni]).mean(axis=1) * 100
+    newlow = (c <= c.rolling(60).min()).mean(axis=1) * 100
+    newhigh = (c >= c.rolling(60).max()).mean(axis=1) * 100
+
+    ext = load_external(demo, dates)
+    E = {}
+    for key, sr in ext.items():
+        al = sr.reindex(sr.index.union(dates)).ffill().reindex(dates)
+        E[key] = dict(v=al, chg5=(al / al.shift(5) - 1) * 100, chg20=(al / al.shift(20) - 1) * 100,
+                      below20=al < al.rolling(20).mean())
+
+    def at(i):
+        val = lambda s_, col: float(s_[col].iloc[i]) if s_[col].iloc[i] == s_[col].iloc[i] else 0.0
+        worst = lambda col, agg=max: agg(val(s_, col) for s_ in sig.values())
+        anyb = lambda col: any(bool(s_[col].iloc[i]) for s_ in sig.values())
+        a20 = float(above20.iloc[i])
+        a20_5 = float(above20.iloc[i - 5]) if i >= 5 else a20
+        a20_min10 = float(above20.iloc[max(0, i - 10):i + 1].min())
+        near_high = any(val(s_, "dd") > -3 for s_ in sig.values())
+        dist, volr, dd = worst("dist"), worst("volr"), worst("dd", min)
+        nl, nh = float(newlow.iloc[i]), float(newhigh.iloc[i])
+        dn, up = [], []
+
+        def add(lst, kind, label, on, pts, v=""):
+            lst.append(dict(kind=kind, label=label, on=bool(on), pts=int(pts if on else 0), val=v))
+
+        # ── 하락 쪽 ──
+        add(dn, "선행", "분산일 누적 (25일 중 지수가 거래량 늘며 하락한 날)", dist >= 4, 15 if dist >= 5 else 8, f"{dist:.0f}일")
+        add(dn, "선행", "지수는 고점 근처인데 오르는 종목은 줄어듦", near_high and a20 < 50, 10, f"20일선 위 종목 {a20:.0f}%")
+        add(dn, "선행", "변동성 확대 (최근 10일 흔들림이 평소보다 큼)", volr >= 1.2, 10 if volr >= 1.5 else 5, f"평소의 {volr:.1f}배")
+        if "vix" in E:
+            v, v5 = float(E["vix"]["v"].iloc[i]), float(np.nan_to_num(E["vix"]["chg5"].iloc[i]))
+            add(dn, "선행", "미국 공포지수(VIX) 상승", v >= 20 or v5 >= 25, 10 if v >= 25 else 5, f"{v:.1f} (5일 {v5:+.0f}%)")
+        if "krw" in E:
+            k20 = float(np.nan_to_num(E["krw"]["chg20"].iloc[i]))
+            add(dn, "선행", "원·달러 환율 급등 (외국인 매도 압력)", k20 >= 2.5, 5, f"20일 {k20:+.1f}%")
+        sb = bool(E["sox"]["below20"].iloc[i]) if "sox" in E else False
+        nb = bool(E["nasdaq"]["below20"].iloc[i]) if "nasdaq" in E else False
+        if E.get("sox") or E.get("nasdaq"):
+            add(dn, "선행", "미국 기술주·반도체 지수 20일선 아래", sb or nb, 5 if sb and nb else 3,
+                ", ".join(x for x, f in (("반도체", sb), ("나스닥", nb)) if f) or "모두 위")
+        mk_ = [k for k in E if k not in ("vix", "krw", "nasdaq", "sox")]
+        effs = [macro_effect(k, float(E[k]["v"].iloc[i]), float(np.nan_to_num(E[k]["chg5"].iloc[i])),
+                             float(np.nan_to_num(E[k]["chg20"].iloc[i]))) for k in mk_]
+        nbad, ngood = sum(e < 0 for e in effs), sum(e > 0 for e in effs)
+        if mk_:
+            add(dn, "선행", "글로벌 지표 다수가 주식에 불리 (달러·금리·유가·금·신용·해외 증시 등)", nbad >= 4, 10 if nbad >= 6 else 5, f"{nbad}/{len(mk_)}개")
+        if "oil" in E:
+            o20 = float(np.nan_to_num(E["oil"]["chg20"].iloc[i]))
+            add(dn, "선행", "국제유가 급등 (물가·금리 부담)", o20 >= 15, 5, f"20일 {o20:+.1f}%")
+        if "hyg" in E:
+            h20 = float(np.nan_to_num(E["hyg"]["chg20"].iloc[i]))
+            add(dn, "선행", "신용위험 확대 (하이일드 채권 약세)", h20 <= -2 and bool(E["hyg"]["below20"].iloc[i]), 5, f"20일 {h20:+.1f}%")
+        add(dn, "진행", "지수 20일선 아래", anyb("below20"), 10)
+        add(dn, "진행", "지수 60일선 아래", anyb("below60"), 10)
+        add(dn, "진행", "20일선이 60일선 아래 (데드크로스)", anyb("dead"), 5)
+        add(dn, "진행", "오르는 종목이 빠르게 줄어듦 (5일간 20%p 이상)", a20_5 - a20 >= 20, 10, f"{a20_5:.0f}% → {a20:.0f}%")
+        add(dn, "진행", "20일선 위 종목 30% 미만", a20 < 30, 10, f"{a20:.0f}%")
+        add(dn, "진행", "60일 신저가 종목 급증", nl >= 8, 10 if nl >= 15 else 5, f"{nl:.1f}%")
+        add(dn, "진행", "지수 60일 고점 대비 큰 하락", dd <= -5, 10 if dd <= -10 else 5, f"{dd:.1f}%")
+        # ── 상승 쪽 ──
+        add(up, "선행", "오르는 종목 급증 (10일 내 30% 미만 → 60% 이상)", a20_min10 < 30 and a20 >= 60, 20, f"{a20_min10:.0f}% → {a20:.0f}%")
+        add(up, "선행", "바닥 확인일 (저점 후 거래량 늘며 +1.5% 이상 상승)", anyb("ftd"), 15)
+        add(up, "선행", "신고가 종목이 신저가 종목보다 많음", nh > nl and nh >= 3, 10, f"신고가 {nh:.1f}% · 신저가 {nl:.1f}%")
+        if "vix" in E:
+            v, v5 = float(E["vix"]["v"].iloc[i]), float(np.nan_to_num(E["vix"]["chg5"].iloc[i]))
+            add(up, "선행", "공포지수(VIX) 진정", v5 <= -15 or v < 16, 10, f"{v:.1f} (5일 {v5:+.0f}%)")
+        if "krw" in E:
+            k20 = float(np.nan_to_num(E["krw"]["chg20"].iloc[i]))
+            add(up, "선행", "원·달러 환율 안정 (외국인 매수 우호)", k20 <= -2, 5, f"20일 {k20:+.1f}%")
+        if E.get("sox") or E.get("nasdaq"):
+            add(up, "선행", "미국 기술주·반도체 지수 20일선 위", not sb and not nb, 5)
+        if mk_:
+            add(up, "선행", "글로벌 지표 다수가 주식에 유리", ngood >= 4, 10 if ngood >= 6 else 5, f"{ngood}/{len(mk_)}개")
+        if "copper" in E:
+            cu = float(np.nan_to_num(E["copper"]["chg20"].iloc[i]))
+            add(up, "선행", "구리 가격 상승 (경기 회복 기대)", cu >= 5, 5, f"20일 {cu:+.1f}%")
+        add(up, "확인", "지수가 20일선 위 (최근 회복이면 가점)", not anyb("below20"), 10 if anyb("cross_up") else 5)
+        add(up, "확인", "20일선이 60일선 위 (최근 골든크로스면 가점)", not anyb("dead"), 10 if anyb("golden") else 5)
+        add(up, "확인", "분산일 적음 (25일 중 2일 이하)", dist <= 2, 5, f"{dist:.0f}일")
+        add(up, "확인", "20일선 위 종목 60% 이상", a20 >= 60, 10, f"{a20:.0f}%")
+        return min(100, sum(x["pts"] for x in dn)), min(100, sum(x["pts"] for x in up)), dn, up
+
+    n = len(dates)
+    hist = []
+    for i in range(max(65, n - 30), n):
+        a, b_, _, _ = at(i)
+        hist.append(dict(d=dates[i].strftime("%m/%d"), s=a, u=b_))
+    # 과거 검증: 각 날짜의 하락 위험 단계별로 이후 코스피 5·20일 등락
+    first = next(iter(sig.values()))["c"]
+    lv_rows = []
+    for i in range(65, n - 5):
+        a_, u_, _, _ = at(i)
+        f5 = (first.iloc[i + 5] / first.iloc[i] - 1) * 100
+        f20 = (first.iloc[i + 20] / first.iloc[i] - 1) * 100 if i + 20 < n else np.nan
+        lv_rows.append(dict(lv=("경계 이상" if a_ >= 50 else "주의" if a_ >= 25 else "안정"), up=("개선 이상" if u_ >= 35 else "약함 이하"), f5=f5, f20=f20))
+    valid = []
+    if lv_rows:
+        vdf = pd.DataFrame(lv_rows)
+        for col, labs in (("lv", ("안정", "주의", "경계 이상")), ("up", ("개선 이상", "약함 이하"))):
+            for lab in labs:
+                g = vdf[vdf[col] == lab]
+                if len(g) >= 5:
+                    valid.append(dict(kind=("하락 위험" if col == "lv" else "상승 신호"), lab=lab, n=len(g), f5=round(g.f5.mean(), 2),
+                                      up5=round((g.f5 > 0).mean() * 100), f20=(round(g.f20.mean(), 2) if g.f20.notna().sum() >= 5 else None)))
+    score, upscore, dn, up = at(n - 1)
+    level = "위험" if score >= 75 else "경계" if score >= 50 else "주의" if score >= 25 else "안정"
+    ulevel = "강함" if upscore >= 60 else "개선" if upscore >= 35 else "약함" if upscore >= 15 else "없음"
+    idxinfo = {k: dict(c=num(s_["c"].iloc[-1], 2), chg=num(s_["ret"].iloc[-1], 2), dd=num(s_["dd"].iloc[-1], 1)) for k, s_ in sig.items()}
+    stat("코스피·코스닥 지수 (네이버)", src == "지수", ", ".join(sig) if src == "지수" else "실패 → 전 종목 평균으로 대체")
+    print(f"시장 신호: 하락 위험 {score}({level}) · 상승 신호 {upscore}({ulevel}) · 해외 지표 {', '.join(E) or '없음'}", flush=True)
+    return dict(score=score, level=level, up=upscore, ulevel=ulevel,
+                prev5=hist[-6]["s"] if len(hist) >= 6 else None, uprev5=hist[-6]["u"] if len(hist) >= 6 else None,
+                hist=hist, dn=dn, upl=up, idx=idxinfo, src=src, ext=sorted(E), valid=valid,
+                vperiod=f"{dates[65]:%Y-%m-%d}~{dates[n - 6]:%Y-%m-%d}" if n > 71 else "")
+
+
+# ───────────────────────────── 5일 전망 (확률 모델) ─────────────────────────────
+SECTOR_ETF = [("반도체", "091160"), ("2차전지", "305720"), ("자동차", "091180"), ("바이오", "244580"),
+              ("헬스케어", "266420"), ("IT", "266370"), ("소프트웨어", "157490"), ("은행", "091170"),
+              ("증권", "102970"), ("보험", "140700"), ("건설", "117700"), ("철강", "117680"),
+              ("에너지화학", "117460"), ("조선·중공업", "139230"), ("운송", "140710"), ("화장품", "228790"),
+              ("미디어·엔터", "228810"), ("방산", "449450"), ("필수소비재", "266410"), ("경기소비재", "266390")]
+EXT_CACHE = {}
+
+
+# 키: (이름, 야후 기호, 오르면 주식에 좋은가, 20일 변화 기준%)
+MACRO = {
+    "vix": ("미국 공포지수(VIX)", "^VIX", False, None),
+    "krw": ("원·달러 환율", "KRW=X", False, 2.0),
+    "dxy": ("달러인덱스", "DX-Y.NYB", False, 2.0),
+    "us10y": ("미국 10년 국채금리", "^TNX", False, 7.0),
+    "oil": ("국제유가(WTI)", "CL=F", False, 12.0),
+    "gold": ("금", "GC=F", False, 5.0),
+    "copper": ("구리 (경기 선행)", "HG=F", True, 5.0),
+    "hyg": ("하이일드 채권 (신용위험)", "HYG", True, 2.0),
+    "spx": ("미국 S&P 500", "^GSPC", True, 4.0),
+    "nasdaq": ("미국 나스닥", "^IXIC", True, 5.0),
+    "sox": ("필라델피아 반도체", "^SOX", True, 7.0),
+    "nikkei": ("일본 닛케이", "^N225", True, 5.0),
+    "china": ("중국 상해종합", "000001.SS", True, 5.0),
+    "taiwan": ("대만 가권", "^TWII", True, 5.0),
+    "btc": ("비트코인 (위험 선호)", "BTC-USD", True, 15.0),
+    "irx": ("미국 3개월 금리", "^IRX", False, 10.0),
+}
+
+
+def macro_effect(key, v, chg5, chg20):
+    """+1 주식에 유리, -1 불리, 0 중립"""
+    if key == "vix":
+        return -1 if (v >= 25 or chg5 >= 20) else 1 if (v < 16 or chg5 <= -15) else 0
+    name, sym, good_up, thr = MACRO[key]
+    if chg20 != chg20 or abs(chg20) < thr:
+        return 0
+    return (1 if chg20 > 0 else -1) * (1 if good_up else -1)
+
+
+def load_external(demo, dates):
+    """해외 지표 (야후 파이낸스, 약 6년치): VIX·환율·달러·금리·유가·금·구리·신용·해외 증시·비트코인"""
+    if "data" in EXT_CACHE:
+        return EXT_CACHE["data"]
+    ext = {}
+    if not demo:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def get(k):
+            try:
+                return k, fetch_yahoo(MACRO[k][1])
+            except Exception:
+                return k, None
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            for k, sr in ex.map(get, list(MACRO)):
+                if sr is not None:
+                    ext[k] = sr
+    else:
+        rng = np.random.default_rng(5)
+        dd = pd.bdate_range(end=dates[-1], periods=1500)
+        base = dict(vix=18, krw=1300, dxy=100, us10y=4, oil=75, gold=2000, copper=4, hyg=77, spx=4500, nasdaq=14000,
+                    sox=4000, nikkei=33000, china=3100, taiwan=17000, btc=40000, irx=4.5)
+        for k in MACRO:
+            vol = 0.03 if k in ("vix", "btc") else 0.012
+            ext[k] = pd.Series(base[k] * np.exp(np.cumsum(rng.normal(0.0002, vol, len(dd)))), index=dd)
+    EXT_CACHE["data"] = ext
+    stat("해외 지표 (야후 파이낸스)", len(ext) > 0, f"{len(ext)}/{len(MACRO)}개" + (f" · 실패: {', '.join(MACRO[k][0] for k in MACRO if k not in ext)}" if len(ext) < len(MACRO) else ""))
+    return ext
+
+
+def macro_panel(ext):
+    out = []
+    for k, (name, sym, good_up, thr) in MACRO.items():
+        sr = ext.get(k)
+        if sr is None or len(sr) < 25:
+            continue
+        v = float(sr.iloc[-1])
+        c5 = (v / float(sr.iloc[-6]) - 1) * 100
+        c20 = (v / float(sr.iloc[-21]) - 1) * 100
+        eff = macro_effect(k, v, c5, c20)
+        out.append(dict(key=k, name=name, v=num(v, 2), c5=num(c5, 1), c20=num(c20, 1), eff=eff,
+                        d=sr.index[-1].strftime("%m/%d"), spark=[num(x, 3) for x in sr.iloc[-60:]]))
+    return out
+
+
+def fetch_series(code, count):
+    xml = http_get(f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count={count}&requestType=0", retries=2)
+    recs = re.findall(r'data="(\d{8})\|([\d.]+)\|([\d.]+)\|([\d.]+)\|([\d.]+)\|([\d.]+)"', xml)
+    nm = re.search(r'name="([^"]*)"', xml)
+    if len(recs) < 200:
+        return None, None
+    df = pd.DataFrame(recs, columns=["d", "o", "h", "l", "c", "v"])
+    df.index = pd.to_datetime(df.pop("d"), format="%Y%m%d")
+    return (nm.group(1) if nm else code), df.astype(float)["c"]
+
+
+# ───────────────────────────── 일정 (이벤트 달력) ─────────────────────────────
+# 날짜 확인: 2026-10 검색 기준. '예상'은 주최 측 공식 발표 전 관례 날짜.
+# 새 일정은 저장소의 events.json 에 [{"date":"2027-05-20","name":"행사명","sectors":["반도체"]}] 형식으로 추가하면 함께 반영됩니다.
+BIO = ["바이오", "헬스케어"]
+TECH = ["반도체", "IT", "소프트웨어"]
+EVENT_SERIES = {
+    "ASCO (미국임상종양학회)": (BIO, ["2021-06-04", "2022-06-03", "2023-06-02", "2024-05-31", "2025-05-30", "2026-05-29", "2027-06-04"]),
+    "AACR (미국암연구학회)": (BIO, ["2021-04-10", "2022-04-08", "2023-04-14", "2024-04-05", "2025-04-25", "2026-04-17", "2027-04-02"]),
+    "ESMO (유럽종양학회)": (BIO, ["2021-09-16", "2022-09-09", "2023-10-20", "2024-09-13", "2025-10-17", "2026-10-23"]),
+    "ASH (미국혈액학회)": (BIO, ["2021-12-11", "2022-12-10", "2023-12-09", "2024-12-07", "2025-12-06", "2026-12-12"]),
+    "JP모건 헬스케어 콘퍼런스": (BIO, ["2021-01-11", "2022-01-10", "2023-01-09", "2024-01-08", "2025-01-13", "2026-01-12", "2027-01-11"]),
+    "CES": (TECH + ["자동차"], ["2022-01-05", "2023-01-05", "2024-01-09", "2025-01-07", "2026-01-06", "2027-01-06"]),
+    "엔비디아 GTC": (TECH, ["2022-03-21", "2023-03-20", "2024-03-18", "2025-03-17", "2026-03-16", "2027-03-15~"]),
+    "컴퓨텍스": (TECH, ["2022-05-24", "2023-05-30", "2024-06-04", "2025-05-20", "2026-06-02"]),
+    "삼성 갤럭시 언팩": (["반도체", "IT"], ["2021-01-14", "2021-08-11", "2022-02-09", "2022-08-10", "2023-02-01", "2023-07-26",
+                                      "2024-01-17", "2024-07-10", "2025-01-22", "2025-07-09"]),
+    "애플 신제품 발표": (["IT", "반도체"], ["2021-09-14", "2022-09-07", "2023-09-12", "2024-09-09", "2025-09-09"]),
+    "미국 FOMC 금리 결정": (["*"], ["2021-01-27", "2021-03-17", "2021-04-28", "2021-06-16", "2021-07-28", "2021-09-22", "2021-11-03", "2021-12-15",
+                                "2022-01-26", "2022-03-16", "2022-05-04", "2022-06-15", "2022-07-27", "2022-09-21", "2022-11-02", "2022-12-14",
+                                "2023-02-01", "2023-03-22", "2023-05-03", "2023-06-14", "2023-07-26", "2023-09-20", "2023-11-01", "2023-12-13",
+                                "2024-01-31", "2024-03-20", "2024-05-01", "2024-06-12", "2024-07-31", "2024-09-18", "2024-11-07", "2024-12-18",
+                                "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18", "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
+                                "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+                                "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09", "2027-07-28", "2027-09-15", "2027-10-27", "2027-12-08"]),
+    "한국은행 금통위": (["*", "은행", "증권", "보험"], ["2026-01-15", "2026-02-26", "2026-04-10", "2026-05-28", "2026-07-16", "2026-08-27",
+                                                "2026-10-22", "2026-11-26"]),
+}
+EVENT_NOTE = {"엔비디아 GTC": "2027년은 예상 날짜", "한국은행 금통위": "2027년 일정은 발표되면 추가"}
+
+
+def _bday_on_or_after(d):
+    d = pd.Timestamp(d)
+    while d.weekday() >= 5:
+        d += pd.Timedelta(days=1)
+    return d
+
+
+def _second_thursday(y, m):
+    d = pd.Timestamp(y, m, 1)
+    first_thu = d + pd.Timedelta(days=(3 - d.weekday()) % 7)
+    return first_thu + pd.Timedelta(days=7)
+
+
+def build_events(start_year=2021, end_year=2027):
+    """[(날짜, 이름, [섹터], 예상여부)] — 검색한 일정 + 규칙으로 계산한 반복 일정 + events.json"""
+    ev = []
+    for name, (secs, ds) in EVENT_SERIES.items():
+        for d in ds:
+            ev.append((pd.Timestamp(d.rstrip("~")), name, secs, d.endswith("~")))
+    for y in range(start_year, end_year + 1):
+        for m in (3, 6, 9, 12):
+            ev.append((_second_thursday(y, m), "선물옵션 동시만기·지수 정기변경" if m in (6, 12) else "선물옵션 동시만기", ["*"], False))
+        for m in (1, 4, 7, 10):
+            ev.append((_bday_on_or_after(pd.Timestamp(y, m, 7)), "실적 시즌 시작 (삼성전자 잠정실적 전후)", ["*"], False))
+        for m in range(1, 13):
+            ev.append((_bday_on_or_after(pd.Timestamp(y, m, 1)), "월간 수출입 동향 (반도체 수출)", ["반도체", "자동차"], False))
+        last = pd.Timestamp(y, 12, 30)
+        while last.weekday() >= 5:
+            last -= pd.Timedelta(days=1)
+        exd = last - pd.Timedelta(days=1)
+        while exd.weekday() >= 5:
+            exd -= pd.Timedelta(days=1)
+        ev.append((exd, "연말 배당락", ["*", "은행", "보험", "증권"], False))
+    path = os.path.join(BASE, "events.json")
+    if os.path.exists(path):
+        try:
+            for x in json.load(open(path, encoding="utf-8")):
+                ev.append((pd.Timestamp(x["date"]), str(x["name"]), list(x.get("sectors", ["*"])), bool(x.get("tentative", False))))
+        except Exception as ex:
+            print(f"  events.json 읽기 실패: {ex}", flush=True)
+    return sorted(ev, key=lambda e: e[0])
+
+
+def event_flags(index, events, sector):
+    """각 날짜마다: 앞으로 5거래일 안에 섹터 일정 / 시장 전체 일정이 있는지, 최근 5거래일 안에 섹터 일정이 있었는지, 실적 시즌인지"""
+    idx = pd.DatetimeIndex(index)
+    pos = {d: i for i, d in enumerate(idx)}
+    n = len(idx)
+    sec_next, mkt_next, sec_prev = np.zeros(n), np.zeros(n), np.zeros(n)
+    for d, name, secs, _ in events:
+        if sector in secs:
+            arr_n, arr_p = sec_next, sec_prev
+        elif "*" in secs:
+            arr_n, arr_p = mkt_next, None
+        else:
+            continue
+        j = idx.searchsorted(d)
+        if j >= n:
+            continue
+        arr_n[max(0, j - 5):j] = 1
+        if arr_p is not None:
+            arr_p[j:min(n, j + 5)] = 1
+    earn = np.array([(d.month in (1, 4, 7, 10)) and 7 <= d.day <= 31 for d in idx], dtype=float)
+    return pd.DataFrame(dict(ev_sec_next=sec_next, ev_mkt_next=mkt_next, ev_sec_prev=sec_prev, earn_season=earn), index=idx)
+
+
+def event_study(series_map, events):
+    """일정 종류 × 관련 섹터마다 과거 '일정 전 5일', '일정 후 5일' 평균 등락과 상승 비율"""
+    out = {}
+    for name in sorted({e[1] for e in events}):
+        occ = [e for e in events if e[1] == name]
+        secs = occ[0][2]
+        target = next((s for s in secs if s != "*" and s in series_map), "KOSPI" if "*" in secs else None)
+        c = series_map.get(target)
+        if c is None:
+            continue
+        pre, post = [], []
+        for d, _, _, _ in occ:
+            j = c.index.searchsorted(d)
+            if j < 6 or j + 4 >= len(c):
+                continue
+            pre.append((c.iloc[j - 1] / c.iloc[j - 6] - 1) * 100)
+            post.append((c.iloc[j + 4] / c.iloc[j - 1] - 1) * 100)
+        if len(pre) >= 3:
+            out[name] = dict(target=target, n=len(pre), pre=round(float(np.mean(pre)), 2), pre_up=round(float(np.mean(np.array(pre) > 0)) * 100),
+                             post=round(float(np.mean(post)), 2), post_up=round(float(np.mean(np.array(post) > 0)) * 100))
+    return out
+
+
+def outlook_features(c, ext):
+    ma20, ma60 = c.rolling(20).mean(), c.rolling(60).mean()
+    r = c.pct_change()
+    d = c.diff()
+    au = d.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    ad = (-d.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    X = pd.DataFrame(dict(
+        r1=r * 100, r5=(c / c.shift(5) - 1) * 100, r20=(c / c.shift(20) - 1) * 100,
+        dist20=(c / ma20 - 1) * 100, dist60=(c / ma60 - 1) * 100, slope20=(ma20 / ma20.shift(5) - 1) * 100,
+        rsi=100 - 100 / (1 + au / ad), volr=r.rolling(10).std() / r.rolling(60).std(),
+        dd60=(c / c.rolling(60).max() - 1) * 100), index=c.index)
+    for key, sr in ext.items():
+        al = sr.reindex(sr.index.union(c.index)).ffill().reindex(c.index)
+        if key == "vix":
+            X["vix"] = al
+        X[key + "5"] = (al / al.shift(5) - 1) * 100
+        X[key + "20"] = (al / al.shift(20) - 1) * 100
+    if "us10y" in ext and "irx" in ext:
+        al = lambda sr: sr.reindex(sr.index.union(c.index)).ffill().reindex(c.index)
+        X["curve"] = al(ext["us10y"]) - al(ext["irx"])                 # 장단기 금리차 (마이너스면 경기 둔화 경고)
+    pos = pd.Series(np.arange(len(c)), index=c.index)
+    ym = c.index.to_period("M")
+    X["tom"] = (((pos - pos.groupby(ym).transform("min")) <= 2) | ((pos.groupby(ym).transform("max") - pos) <= 1)).astype(float)
+    fwd = (c.shift(-5) / c - 1) * 100
+    return X, fwd
+
+
+def fit_logit(X, y, l2=2.0, iters=1500, lr=0.5):
+    mu, sd = X.mean(0), X.std(0) + 1e-9
+    Z = np.c_[np.ones(len(X)), (X - mu) / sd]
+    w = np.zeros(Z.shape[1])
+    for _ in range(iters):
+        p = 1 / (1 + np.exp(-np.clip(Z @ w, -30, 30)))
+        g = Z.T @ (p - y) / len(y)
+        g[1:] += l2 * w[1:] / len(y)
+        w -= lr * g
+    return mu, sd, w
+
+
+def logit_pred(model, X):
+    mu, sd, w = model
+    Z = np.c_[np.ones(len(X)), (X - mu) / sd]
+    return 1 / (1 + np.exp(-np.clip(Z @ w, -30, 30)))
+
+
+def market_outlook(demo, dates):
+    """지수·섹터 ETF의 과거 데이터로 '5일 뒤 오를 확률'을 추정 (로지스틱 회귀, 시점 분리 검증)"""
+    ext = load_external(demo, dates)
+    series = []
+    if demo:
+        rng = np.random.default_rng(11)
+        dd = pd.bdate_range(end=dates[-1], periods=1300)
+        for nm, code in [("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")] + SECTOR_ETF:
+            series.append((nm, code, f"{nm} (예시)", pd.Series(1000 * np.exp(np.cumsum(rng.normal(0.0003, 0.013, len(dd)))), index=dd)))
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        jobs = [("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")] + SECTOR_ETF
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            res = list(ex.map(lambda j: (j, *safe_fetch(j[1], 1300)), jobs))
+        for (nm, code), etfname, c in res:
+            if c is not None:
+                series.append((nm, code, etfname, c))
+    if len(series) < 2:
+        print("  5일 전망: 지수·섹터 데이터를 받지 못해 건너뜀", flush=True)
+        return None
+
+    events = build_events(2021, 2027)
+    rows = []
+    for nm, code, etfname, c in series:
+        X, fwd = outlook_features(c, ext)
+        X = X.join(event_flags(c.index, events, nm))
+        rows.append((nm, code, etfname, c, X, fwd))
+    kos = next((r for r in rows if r[0] == "KOSPI"), None)
+    if kos is not None:
+        for r in rows:
+            r[4]["rs20"] = r[4]["r20"] - kos[4]["r20"].reindex(r[4].index)   # 코스피 대비 20일 강도
+    cols = sorted(set.intersection(*[set(r[4].columns) for r in rows]))
+    train = pd.concat([r[4][cols].assign(fwd=r[5]) for r in rows])
+    train = train.replace([np.inf, -np.inf], np.nan).dropna()
+    train = train.sort_index()
+    Xa, ya, fa = train[cols].to_numpy(float), (train["fwd"] > 0).to_numpy(float), train["fwd"].to_numpy(float)
+    # 모델 고르기: 앞 60% 학습 → 다음 20%로 두 모델 비교 → 마지막 20%로 최종 성적 (시간 순서 유지, 사이에 10일 간격)
+    ix = train.index
+    c1, c2, gap = ix[int(len(ix) * 0.6)], ix[int(len(ix) * 0.8)], pd.Timedelta(days=10)
+    tr, va, te = ix < c1, (ix >= c1 + gap) & (ix < c2), ix >= c2 + gap
+    cands = {"로지스틱 회귀": (fit_logit, logit_pred)}
+    try:
+        from sklearn.ensemble import HistGradientBoostingClassifier
+
+        def fit_hgb(X_, y_):
+            return HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, max_iter=200, l2_regularization=1.0,
+                                                  min_samples_leaf=200, random_state=0).fit(X_, y_)
+        cands["그래디언트 부스팅"] = (fit_hgb, lambda m_, X_: m_.predict_proba(X_)[:, 1])
+    except Exception:
+        pass
+    acc = lambda p_, y_: float(((p_ > 0.5) == (y_ > 0.5)).mean())
+    va_score = {k_: acc(pr_(ft_(Xa[tr], ya[tr]), Xa[va]), ya[va]) for k_, (ft_, pr_) in cands.items()}
+    best = max(va_score, key=va_score.get)
+    fit_, pred_ = cands[best]
+    p_te = pred_(fit_(Xa[tr | va], ya[tr | va]), Xa[te])
+    hit = acc(p_te, ya[te])
+    base = float(max(ya[te].mean(), 1 - ya[te].mean()))
+    conf = (p_te > 0.6) | (p_te < 0.4)
+    hit_conf = float(((p_te[conf] > 0.5) == (ya[te][conf] > 0.5)).mean()) if conf.sum() >= 30 else None
+    calib = []
+    for lo_, hi_, lab in ((0, .45, "45% 미만"), (.45, .55, "45~55%"), (.55, 1.01, "55% 이상")):
+        mk_ = (p_te >= lo_) & (p_te < hi_)
+        if mk_.sum() >= 20:
+            calib.append(dict(lab=lab, n=int(mk_.sum()), up=round(float(ya[te][mk_].mean()) * 100, 1), ret=round(float(fa[te][mk_].mean()), 2)))
+    model_final = fit_(Xa, ya)
+    model = fit_logit(Xa, ya)                       # 해석용 (어떤 지표를 무겁게 봤는지)
+    predict = lambda X_: pred_(model_final, X_)
+    FK = dict(r1="전일 등락", r5="5일 등락", r20="20일 등락", dist20="20일선과의 거리", dist60="60일선과의 거리",
+              slope20="20일선 기울기", rsi="RSI", volr="변동성 확대", dd60="고점 대비 하락폭",
+              rs20="코스피 대비 20일 강도", curve="미국 장단기 금리차", tom="월말·월초",
+              ev_sec_next="섹터 일정 5일 이내", ev_mkt_next="시장 일정(FOMC·만기 등) 5일 이내", ev_sec_prev="섹터 일정 직후", earn_season="실적 시즌")
+    def fk(c_):
+        if c_ in FK:
+            return FK[c_]
+        for k_ in sorted(MACRO, key=len, reverse=True):
+            if c_.startswith(k_):
+                rest = c_[len(k_):]
+                return MACRO[k_][0] + (" 수준" if rest == "" else f" {rest}일 변화")
+        return c_
+    wts = model[2][1:]
+    top = [dict(name=fk(cols[j]), dir=("높을수록 상승 쪽" if wts[j] > 0 else "높을수록 하락 쪽")) for j in np.argsort(-np.abs(wts))[:5]]
+    p_all = predict(Xa)
+    bins = np.clip((p_all * 10).astype(int), 0, 9)
+    exp_ret = {b: float(np.mean(fa[bins == b])) for b in range(10) if (bins == b).sum() >= 30}
+
+    out = []
+    for nm, code, etfname, c, X, fwd in rows:
+        x = X[cols].replace([np.inf, -np.inf], np.nan).iloc[[-1]]
+        if x.isna().any(axis=None):
+            continue
+        p = float(predict(x.to_numpy(float))[0])
+        b = min(9, int(p * 10))
+        er = exp_ret.get(b, 0.0)
+        sig5 = float(c.pct_change().iloc[-20:].std() * np.sqrt(5) * 100)
+        ma20, ma60 = c.rolling(20).mean(), c.rolling(60).mean()
+        last, m20, m60, m20_5 = c.iloc[-1], ma20.iloc[-1], ma60.iloc[-1], ma20.iloc[-6]
+        trend = "상승" if last > m20 > m60 and m20 > m20_5 else "하락" if last < m20 < m60 and m20 < m20_5 else "횡보"
+        out.append(dict(name=nm, code=code, etf=etfname, p=round(p * 100), er=round(er, 2), band=round(sig5, 2),
+                        trend=trend, r5=num((last / c.iloc[-6] - 1) * 100, 1), r20=num((last / c.iloc[-21] - 1) * 100, 1),
+                        last=num(last, 2), spark=[num(x_, 2) for x_ in c.iloc[-60:]]))
+    smap = {nm: c for nm, code, etfname, c, X, fwd in rows}
+    SERIES.update(smap)
+    study = event_study(smap, events)
+    today = pd.Timestamp(datetime.now().date())
+    upcoming = []
+    for d, name, secs, tent in events:
+        dd_ = (d - today).days
+        if 0 <= dd_ <= 45:
+            st = study.get(name)
+            upcoming.append(dict(date=d.strftime("%m/%d"), dow="월화수목금토일"[d.weekday()], dday=dd_, name=name,
+                                 secs=(["시장 전체"] if "*" in secs else []) + [x for x in secs if x != "*"], tent=tent, note=EVENT_NOTE.get(name, ""), st=st))
+    for o in out:
+        nxt = next((u for u in upcoming if o["name"] in u["secs"] and u["dday"] <= 20), None)
+        o["next_ev"] = f"{nxt['name']} D-{nxt['dday']}" if nxt else ""
+    kospi_r20 = next((o["r20"] for o in out if o["name"] == "KOSPI"), None)
+    for o in out:
+        o["rs"] = num(o["r20"] - kospi_r20, 1) if (kospi_r20 is not None and o["r20"] is not None) else None
+    idxs = [o for o in out if o["name"] in ("KOSPI", "KOSDAQ")]
+    secs = sorted([o for o in out if o["name"] not in ("KOSPI", "KOSDAQ")], key=lambda o: -o["p"])
+    stat("섹터 대표 ETF·지수 장기 시세 (네이버)", len(series) > 2, f"{len(series)}개")
+    print(f"  5일 전망: {best} · 섹터 {len(secs)}개 · 검증 적중률 {hit * 100:.1f}% (기본 {base * 100:.1f}%)", flush=True)
+    return dict(idx=idxs, sec=secs, hit=round(hit * 100, 1), base=round(base * 100, 1),
+                hit_conf=(round(hit_conf * 100, 1) if hit_conf is not None else None), n=int(len(train)),
+                since=train.index[0].strftime("%Y-%m"), feats=len(cols), top=top, events=upcoming,
+                model=best, va={k_: round(v_ * 100, 1) for k_, v_ in va_score.items()}, calib=calib,
+                test_from=ix[te][0].strftime("%Y-%m") if te.any() else "")
+
+
+def safe_fetch(code, count):
+    try:
+        return fetch_series(code, count)
+    except Exception:
+        return None, None
 
 
 # ───────────────────────────── 뉴스 ─────────────────────────────
@@ -730,6 +1370,119 @@ def fetch_news(code, name, market):
     return out
 
 
+# ───────────────────────────── 오늘의 브리핑 ─────────────────────────────
+def gnews(query, lang="ko", days=1, n=6, must=None):
+    from urllib.parse import quote
+    hl = "hl=ko&gl=KR&ceid=KR:ko" if lang == "ko" else "hl=en-US&gl=US&ceid=US:en"
+    try:
+        items = _rss(f"https://news.google.com/rss/search?q={quote(query + f' when:{days}d')}&{hl}", days=days + 1)
+    except Exception:
+        return []
+    if must:
+        items = [x for x in items if any(k in x["t"] for k in must)]
+    items.sort(key=lambda x: x["dt"], reverse=True)
+    out, seen = [], set()
+    for x in items:
+        k = re.sub(r"\W", "", x["t"])[:18]
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(dict(t=x["t"][:110], u=x["u"], s=x["s"][:24], d=x["dt"].strftime("%m/%d %H:%M"), en=int(lang != "ko")))
+        if len(out) >= n:
+            break
+    return out
+
+
+def dart_list(key, days, match, pages=5):
+    """OpenDART 공시 목록 (거래소 공시) 중 제목에 match 가 들어간 것"""
+    now = datetime.now()
+    out = []
+    for page in range(1, pages + 1):
+        url = (f"https://opendart.fss.or.kr/api/list.json?crtfc_key={key}&bgn_de={(now - timedelta(days=days)):%Y%m%d}"
+               f"&end_de={now:%Y%m%d}&pblntf_ty=I&page_no={page}&page_count=100")
+        try:
+            j = json.loads(http_get(url, retries=2))
+        except Exception:
+            break
+        for x in j.get("list", []):
+            nm = re.sub(r"\s+", " ", x.get("report_nm", "")).strip()
+            if all(m in nm for m in match):
+                out.append(dict(t=f"{x['corp_name']} · {nm}", u=f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={x['rcept_no']}",
+                                s="DART 공시", d=f"{x['rcept_dt'][4:6]}/{x['rcept_dt'][6:]}", en=0))
+        if page >= int(j.get("total_page", 1) or 1):
+            break
+    return out
+
+
+def build_briefing(risk, outlook, macro, tabs, demo):
+    now = datetime.now()
+    ext = EXT_CACHE.get("data", {})
+
+    def d1(k):
+        sr = ext.get(k)
+        if sr is None or len(sr) < 2:
+            return None, None, None
+        return float(sr.iloc[-1]), (float(sr.iloc[-1]) / float(sr.iloc[-2]) - 1) * 100, sr.index[-1].strftime("%m/%d")
+
+    lines = []
+    us = [(nm, d1(k)) for nm, k in (("S&P500", "spx"), ("나스닥", "nasdaq"), ("반도체", "sox"))]
+    us = [(nm, v) for nm, v in us if v[1] is not None]
+    if us:
+        lines.append(dict(k="밤사이 미국", t=" · ".join(f"{nm} {v[1]:+.2f}%" for nm, v in us), tone=1 if sum(v[1] for _, v in us) > 0 else -1))
+    fx = [(nm, d1(k)) for nm, k in (("원·달러", "krw"), ("WTI", "oil"), ("금", "gold"), ("VIX", "vix"))]
+    fx = [(nm, v) for nm, v in fx if v[1] is not None]
+    if fx:
+        lines.append(dict(k="환율·원자재", t=" · ".join(f"{nm} {v[0]:,.2f} ({v[1]:+.1f}%)" if nm != "원·달러" else f"{nm} {v[0]:,.1f}원 ({v[1]:+.2f}%)" for nm, v in fx), tone=0))
+    if risk:
+        lines.append(dict(k="시장 신호등", t=f"하락 위험 {risk['score']}점({risk['level']}) · 상승 신호 {risk['up']}점({risk['ulevel']})",
+                          tone=-1 if risk["score"] >= 50 else 1 if risk["up"] >= 35 else 0))
+    if outlook and outlook.get("sec"):
+        sec = outlook["sec"]
+        lines.append(dict(k="5일 전망", t=f"오를 확률 높은 섹터 {', '.join(o['name'] for o in sec[:2])} · 낮은 섹터 {', '.join(o['name'] for o in sec[-2:])}", tone=0))
+    evs = (outlook or {}).get("events", [])
+    today_ev = [e for e in evs if e["dday"] == 0]
+    week_ev = [e for e in evs if 0 <= e["dday"] <= 7]
+    lines.append(dict(k="오늘 일정", t=(", ".join(e["name"] for e in today_ev) if today_ev else "큰 일정 없음")
+                      + (f" · 이번 주 {len(week_ev)}건" if week_ev else ""), tone=0))
+    if macro:
+        g = sum(1 for x in macro if x["eff"] > 0)
+        b = sum(1 for x in macro if x["eff"] < 0)
+        lines.append(dict(k="글로벌 지표", t=f"주식에 유리 {g}개 · 불리 {b}개", tone=1 if g > b else -1 if b > g else 0))
+
+    if demo:
+        fake = lambda pre, n: [dict(t=f"{pre} 예시 기사 제목 {i + 1}", u="https://example.com", s="예시", d=now.strftime("%m/%d 07:0") + str(i), en=0) for i in range(n)]
+        earnings, kr_news, gl_news = fake("실적 발표", 4), fake("국내 증시", 5), [dict(t=f"Wall Street example headline {i + 1}", u="https://example.com", s="Example", d=now.strftime("%m/%d"), en=1) for i in range(4)]
+        sector_issues = [dict(sector="반도체", items=fake("반도체", 2)), dict(sector="바이오", items=fake("바이오", 2))]
+        dart_used = False
+    else:
+        print("브리핑 뉴스 모으는 중…", flush=True)
+        key = os.environ.get("DART_API_KEY", "").strip()
+        dart_used = bool(key)
+        earnings = []
+        if key:
+            earnings = dart_list(key, 1, ["잠정", "실적"])[:12] + dart_list(key, 10, ["기업설명회"])[:8]
+        earnings += gnews("실적 발표 OR 잠정실적 OR 어닝", "ko", 1, 8, must=["실적", "어닝", "영업이익"])
+        kr_news = gnews("코스피 OR 코스닥 증시 전망", "ko", 1, 6)
+        gl_news = gnews("stock market Wall Street", "en", 1, 5)
+        sector_issues = []
+        if outlook and outlook.get("sec"):
+            hot = sorted(outlook["sec"], key=lambda o: -abs(o.get("r5") or 0))
+            pick = [o for o in hot if abs(o.get("r5") or 0) >= 3][:4]
+            pick += [o for o in outlook["sec"] if o.get("next_ev") and o not in pick and "D-" in o["next_ev"]
+                     and int(o["next_ev"].split("D-")[-1]) <= 3][:2]
+            for o in pick:
+                its = gnews(f"{o['name']} 관련주 주가", "ko", 2, 2)
+                if its:
+                    sector_issues.append(dict(sector=o["name"], r5=o.get("r5"), ev=o.get("next_ev", ""), items=its))
+        print(f"  실적 {len(earnings)} · 국내 {len(kr_news)} · 해외 {len(gl_news)} · 섹터 {len(sector_issues)}", flush=True)
+        stat("브리핑 뉴스 (구글 뉴스)", len(kr_news) + len(gl_news) > 0, f"실적 {len(earnings)} · 국내 {len(kr_news)} · 해외 {len(gl_news)}")
+        stat("DART 공시 (선택)", True if key else None, "키 등록됨" if key else "키 미등록 (선택 사항)")
+    top_picks = [dict(tab=t["name"], name=t["stocks"][0]["name"], code=t["stocks"][0]["code"], score=t["stocks"][0]["score"])
+                 for t in tabs if t["stocks"]]
+    return dict(date=now.strftime("%m월 %d일"), dow="월화수목금토일"[now.weekday()], lines=lines, week=week_ev,
+                earnings=earnings, kr=kr_news, gl=gl_news, sectors=sector_issues, picks=top_picks, dart=dart_used)
+
+
 def collect_news(stocks, demo):
     if demo:
         rng = np.random.default_rng(3)
@@ -745,6 +1498,7 @@ def collect_news(stocks, demo):
     nk = sum(1 for r in res if any(not x["en"] for x in r))
     ne = sum(1 for r in res if any(x["en"] for x in r))
     print(f"  국내 뉴스 {nk}/{len(stocks)}, 해외 뉴스 {ne}/{len(stocks)} 종목 확인", flush=True)
+    stat("종목 뉴스 (구글 뉴스·야후)", nk + ne > 0, f"국내 {nk} · 해외 {ne} / {len(stocks)}종목")
     return news
 
 
@@ -827,6 +1581,291 @@ def run_ai(tabs, asof):
     return "auto"
 
 
+# ───────────────────────────── 과거 성적 검증 (백테스트) ─────────────────────────────
+def backtest(P, I, market, mcap, names, offsets=range(12, 132, 5)):
+    """최근 약 6개월 동안 5거래일마다 '그날 이 프로그램이 골랐을 1~3위'를 다시 계산해서 이후 성적을 확인.
+    진입 = 다음 날 시가, 5일 수익 = 5거래일 뒤 종가, 목표·손절 = 그날 기준 1차 목표/손절가를 10거래일 안에 먼저 닿은 쪽
+    (수급·실적·매물대 조정은 과거 자료가 없어 제외한 단순화 버전)"""
+    n = len(P["c"].index)
+    res, bench, days_ = {1: [], 2: [], 3: []}, [], []
+    for off in offsets:
+        t = n - 1 - off
+        if t < CFG["min_history"] + 5 or t + 10 > n - 1:
+            continue
+        Pt = {k: v.iloc[:t + 1] for k, v in P.items()}
+        It = {k: v.iloc[:t + 1] for k, v in I.items()}
+        try:
+            ev = evaluate(Pt, It, market, light=True)
+        except Exception:
+            continue
+        c = Pt["c"].iloc[-1]
+        ok = (Pt["c"].iloc[-CFG["min_history"]:].notna().sum() >= CFG["min_history"]) & (Pt["a"].iloc[-1] >= CFG["min_amount"]) \
+            & (c >= CFG["min_price"]) & (Pt["v"].iloc[-1] > 0) & (mcap.reindex(c.index).fillna(np.inf) >= CFG["min_mcap"])
+        ok &= pd.Series([(x in market) and x.endswith("0") and "스팩" not in str(names.get(x, "")) for x in c.index], index=c.index)
+        uni = c.index[ok]
+        if len(uni) < 30:
+            continue
+        o1, c5, c10 = P["o"].iloc[t + 1], P["c"].iloc[t + 5], P["c"].iloc[t + 10]
+        H, L = P["h"].iloc[t + 1:t + 11], P["l"].iloc[t + 1:t + 11]
+        b5 = float(((c5[uni] / o1[uni]) - 1).median() * 100)
+        bench.append(b5)
+        days_.append(P["c"].index[t])
+        for k in (1, 2, 3):
+            sc = ev["scores"][f"s{k}"][uni] + sum(d[uni] for _, d, _ in ev["aux"][k])
+            t1s, _, sts = ev["tg"][k]
+            for rank, tk in enumerate(sc.sort_values(ascending=False).head(3).index, 1):
+                e = float(o1[tk])
+                if not (e > 0) or not (c5[tk] > 0):
+                    continue
+                c0, atr = float(c[tk]), float(ev["m"]["atr"][tk])
+                atr = atr if np.isfinite(atr) and atr > 0 else c0 * 0.03
+                tgt, stp = float(t1s[tk]), float(sts[tk])
+                if not (np.isfinite(stp) and stp < c0 * 0.995):
+                    stp = c0 - 1.5 * atr
+                if not (np.isfinite(tgt) and tgt > c0 * 1.01):
+                    tgt = c0 + 1.5 * atr
+                out = "none"
+                for hh, ll in zip(H[tk].to_numpy(float), L[tk].to_numpy(float)):
+                    if ll <= stp:
+                        out = "stop"
+                        break
+                    if hh >= tgt:
+                        out = "target"
+                        break
+                r5 = (float(c5[tk]) / e - 1) * 100
+                res[k].append(dict(rank=rank, r5=r5, r10=(float(c10[tk]) / e - 1) * 100, ex5=r5 - b5, out=out))
+    if not days_:
+        stat("과거 성적 검증", False, "기간 부족")
+        return None
+    summ = {}
+    for k, rows in res.items():
+        if not rows:
+            continue
+        a = pd.DataFrame(rows)
+        one = a[a["rank"] == 1]
+        summ[k] = dict(n=len(a), avg5=round(a.r5.mean(), 2), win5=round((a.r5 > 0).mean() * 100), ex5=round(a.ex5.mean(), 2),
+                       beat=round((a.ex5 > 0).mean() * 100), avg10=round(a.r10.mean(), 2),
+                       tgt=round((a.out == "target").mean() * 100), stp=round((a.out == "stop").mean() * 100),
+                       top1_avg5=(round(one.r5.mean(), 2) if len(one) else None))
+    days_.sort()
+    stat("과거 성적 검증", True, f"{len(days_)}개 시점 · {days_[0]:%Y-%m-%d}~{days_[-1]:%Y-%m-%d}")
+    print(f"  과거 성적: {len(days_)}개 시점 " + " · ".join(f"{STRATS[k]} 5일 {v['avg5']:+.2f}% (시장 대비 {v['ex5']:+.2f}%)" for k, v in summ.items()), flush=True)
+    return dict(strat={str(k): v for k, v in summ.items()}, bench=round(float(np.mean(bench)), 2), n_days=len(days_),
+                start=days_[0].strftime("%Y-%m-%d"), end=days_[-1].strftime("%Y-%m-%d"))
+
+
+# ───────────────────────────── 예측 기록 · 다음 날 비교 (프로그램 점검) ─────────────────────────────
+HIST_DIR = os.path.join(BASE, "history")
+SERIES = {}     # 5일 전망에 쓴 지수·섹터 시세 (점검 때 실제 결과 확인용)
+
+
+def make_snapshot(asof, tabs, outlook, risk):
+    picks = [dict(k=tab["k"], rank=e["rank"], code=e["code"], name=e["name"], close=e["close"], score=e["score"],
+                  t1=e["tg"]["t1"], stop=e["tg"]["stop"]) for tab in tabs for e in tab["stocks"][:6]]
+    ol = (outlook or {})
+    outs = [dict(name=o["name"], p=o["p"], er=o["er"], band=o["band"]) for o in ol.get("idx", []) + ol.get("sec", [])]
+    return dict(asof=asof, made=datetime.now().strftime("%Y-%m-%d %H:%M"), picks=picks, outlook=outs,
+                risk=(dict(score=risk["score"], up=risk["up"], level=risk["level"]) if risk else None))
+
+
+def save_snapshot(snap):
+    """그날 데이터 기준일 파일 하나 (같은 날 여러 번 돌면 마지막 장전 갱신으로 덮어씀). 150개 넘으면 오래된 것 삭제"""
+    os.makedirs(HIST_DIR, exist_ok=True)
+    with open(os.path.join(HIST_DIR, f"{snap['asof']}.json"), "w", encoding="utf-8") as f:
+        json.dump(snap, f, ensure_ascii=False)
+    files = sorted(x for x in os.listdir(HIST_DIR) if x.endswith(".json"))
+    for x in files[:-150]:
+        os.remove(os.path.join(HIST_DIR, x))
+
+
+def load_history(exclude_asof):
+    if not os.path.isdir(HIST_DIR):
+        return []
+    out = []
+    for x in sorted(x for x in os.listdir(HIST_DIR) if x.endswith(".json"))[-60:]:
+        try:
+            s = json.load(open(os.path.join(HIST_DIR, x), encoding="utf-8"))
+            if s.get("asof") != exclude_asof:
+                out.append(s)
+        except Exception:
+            pass
+    return out
+
+
+def demo_history(P, I, market, k_days=12):
+    """미리보기용: 과거 시점의 추천을 다시 계산해 가상의 기록을 만듦"""
+    n, rng, out = len(P["c"].index), np.random.default_rng(9), []
+    for off in range(k_days, 0, -1):
+        t = n - 1 - off
+        Pt = {k: v.iloc[:t + 1] for k, v in P.items()}
+        It = {k: v.iloc[:t + 1] for k, v in I.items()}
+        ev = evaluate(Pt, It, market, light=True)
+        c = Pt["c"].iloc[-1]
+        liq = c.index[(Pt["a"].iloc[-1] >= CFG["min_amount"]) & c.notna()]
+        picks = []
+        for k in (1, 2, 3):
+            sc = ev["scores"][f"s{k}"][liq] + sum(d[liq] for _, d, _ in ev["aux"][k])
+            t1s, _, sts = ev["tg"][k]
+            for r, tk in enumerate(sc.sort_values(ascending=False).head(6).index, 1):
+                c0, atr = float(c[tk]), float(ev["m"]["atr"][tk])
+                t1 = float(t1s[tk]) if float(t1s[tk]) > c0 * 1.01 else c0 + 1.5 * atr
+                st = float(sts[tk]) if float(sts[tk]) < c0 * 0.995 else c0 - 1.5 * atr
+                picks.append(dict(k=k, rank=r, code=tk, name=f"종목{tk}", close=num(c0), score=num(sc[tk]), t1=num(t1), stop=num(st)))
+        outs = [dict(name=nm, p=int(rng.integers(38, 66)), er=round(float(rng.normal(0, 0.5)), 2), band=round(float(rng.uniform(2, 4)), 2)) for nm in SERIES]
+        out.append(dict(asof=P["c"].index[t].strftime("%Y-%m-%d"), made="(미리보기)", picks=picks, outlook=outs,
+                        risk=dict(score=int(rng.integers(20, 70)), up=int(rng.integers(5, 40)), level="주의")))
+    return out
+
+
+def review(hist, P):
+    dates = P["c"].index
+    pos = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(dates)}
+    n = len(dates)
+    o, c, h, l, a = P["o"], P["c"], P["h"], P["l"], P["a"]
+    recs, daylog, oev, rev = [], [], [], []
+    for s in hist:
+        i = pos.get(s["asof"])
+        if i is None or i + 1 >= n:
+            continue
+        liq = (a.iloc[i] >= CFG["min_amount"]) & (o.iloc[i + 1] > 0)
+        b1 = float(((c.iloc[i + 1][liq] / o.iloc[i + 1][liq]) - 1).median() * 100)
+        mat = i + 5 < n
+        b5 = float(((c.iloc[i + 5][liq] / o.iloc[i + 1][liq]) - 1).median() * 100) if mat else None
+        day = []
+        for pk in s.get("picks", []):
+            t = pk["code"]
+            if t not in c.columns:
+                continue
+            e = float(o.iloc[i + 1][t])
+            if not (e > 0) or not (c.iloc[i + 1][t] > 0):
+                continue
+            j_now = min(i + 5, n - 1)
+            r1 = (float(c.iloc[i + 1][t]) / e - 1) * 100
+            rn = (float(c.iloc[j_now][t]) / e - 1) * 100
+            res = "진행 중"
+            for j in range(i + 1, min(i + 11, n)):
+                if pk.get("stop") and l.iloc[j][t] <= pk["stop"]:
+                    res = "손절"
+                    break
+                if pk.get("t1") and h.iloc[j][t] >= pk["t1"]:
+                    res = "목표"
+                    break
+            day.append(dict(asof=s["asof"], k=pk["k"], rank=pk["rank"], code=t, name=pk["name"], entry=num(e),
+                            r1=round(r1, 2), ex1=round(r1 - b1, 2), r5=(round(rn, 2) if mat else None),
+                            ex5=(round(rn - b5, 2) if mat else None), now=round(rn, 2), held=j_now - i, out=res,
+                            t1=pk.get("t1"), stop=pk.get("stop")))
+        recs += day
+        top = [x for x in day if x["rank"] <= 3]
+        daylog.append(dict(asof=s["asof"], day=dates[i + 1].strftime("%m/%d"), n=len(top),
+                           avg1=(round(float(np.mean([x["r1"] for x in top])), 2) if top else None),
+                           win1=(round(float(np.mean([x["r1"] > 0 for x in top])) * 100) if top else None), b1=round(b1, 2)))
+        for ob in s.get("outlook", []):
+            sr = SERIES.get(ob["name"])
+            if sr is None:
+                continue
+            k0 = sr.index.searchsorted(pd.Timestamp(s["asof"]), side="right") - 1
+            if k0 < 0 or k0 + 5 >= len(sr):
+                continue
+            act = (float(sr.iloc[k0 + 5]) / float(sr.iloc[k0]) - 1) * 100
+            oev.append(dict(asof=s["asof"], name=ob["name"], p=ob["p"], er=ob["er"], band=ob["band"], act=round(act, 2),
+                            hit=bool((ob["p"] >= 50) == (act > 0)), inband=bool(abs(act - ob["er"]) <= ob["band"])))
+        if s.get("risk") and "KOSPI" in SERIES:
+            sr = SERIES["KOSPI"]
+            k0 = sr.index.searchsorted(pd.Timestamp(s["asof"]), side="right") - 1
+            if 0 <= k0 and k0 + 5 < len(sr):
+                rev.append(dict(score=s["risk"]["score"], act=(float(sr.iloc[k0 + 5]) / float(sr.iloc[k0]) - 1) * 100))
+
+    strat = {}
+    for k in (1, 2, 3):
+        r = [x for x in recs if x["k"] == k and x["rank"] <= 3]
+        m5 = [x for x in r if x["r5"] is not None]
+        if not r:
+            continue
+        strat[str(k)] = dict(n1=len(r), avg1=round(float(np.mean([x["r1"] for x in r])), 2), win1=round(float(np.mean([x["r1"] > 0 for x in r])) * 100),
+                             ex1=round(float(np.mean([x["ex1"] for x in r])), 2), n5=len(m5),
+                             avg5=(round(float(np.mean([x["r5"] for x in m5])), 2) if m5 else None),
+                             ex5=(round(float(np.mean([x["ex5"] for x in m5])), 2) if m5 else None),
+                             tgt=(round(float(np.mean([x["out"] == "목표" for x in m5])) * 100) if m5 else None),
+                             stp=(round(float(np.mean([x["out"] == "손절" for x in m5])) * 100) if m5 else None))
+    ol = None
+    if oev:
+        hi = [x for x in oev if x["p"] >= 55]
+        lo = [x for x in oev if x["p"] < 45]
+        ol = dict(n=len(oev), hit=round(float(np.mean([x["hit"] for x in oev])) * 100, 1), inband=round(float(np.mean([x["inband"] for x in oev])) * 100),
+                  up_hi=(round(float(np.mean([x["act"] > 0 for x in hi])) * 100) if len(hi) >= 5 else None), n_hi=len(hi),
+                  up_lo=(round(float(np.mean([x["act"] > 0 for x in lo])) * 100) if len(lo) >= 5 else None), n_lo=len(lo))
+    rk = None
+    if rev:
+        hiR = [x["act"] for x in rev if x["score"] >= 50]
+        loR = [x["act"] for x in rev if x["score"] < 25]
+        rk = dict(n=len(rev), hi=(round(float(np.mean(hiR)), 2) if len(hiR) >= 3 else None), n_hi=len(hiR),
+                  lo=(round(float(np.mean(loR)), 2) if len(loR) >= 3 else None), n_lo=len(loR))
+    last = hist[-1]["asof"] if hist else None
+    latest = [x for x in recs if x["asof"] == (daylog[-1]["asof"] if daylog else None)]
+    latest_ol = [x for x in oev if x["asof"] == (oev[-1]["asof"] if oev else None)]
+    return dict(n_snap=len(hist), first=(hist[0]["asof"] if hist else None), last=last, daylog=daylog[-20:], strat=strat,
+                ol=ol, rk=rk, latest=latest, latest_ol=latest_ol, recent=recs[-60:])
+
+
+FIX = {
+    3: "과매도 반등: 기본 조건에 '시장 신호등 경계 미만' 또는 '지수 20일선 위'를 필수로 넣고, 거래량 기준을 2배→3배로 올리는 수정",
+    1: "추세 눌림목: '60일선 우상향'을 필수 조건으로 바꾸고, 조정 중 거래량 기준을 평균의 1.0배→0.8배로 강화하는 수정",
+    2: "거래량 돌파: 거래량 기준 2.5배→3배, 윗꼬리 기준 −3%→−2%로 강화하고 신호등 '경계' 이상일 땐 돌파 전략을 쉬는 수정",
+}
+
+
+def diagnose(rv, status):
+    tips = []
+    add = lambda sev, title, detail, fix="": tips.append(dict(sev=sev, title=title, detail=detail, fix=fix))
+    for k_, v in status.items():
+        if v["ok"] is False:
+            add("bad", f"데이터 수집 실패: {k_}", v["detail"], "이 출처를 다른 무료 출처로 바꾸거나 재시도 횟수를 늘리는 수정")
+    if not rv or rv["n_snap"] == 0:
+        add("info", "기록 시작", "오늘부터 아침 예측을 저장합니다. 내일 아침부터 하루 결과, 5거래일 뒤부터 5일 결과를 비교합니다.")
+        return tips
+    for k_, v in rv["strat"].items():
+        k = int(k_)
+        nm = STRATS[k]
+        if v["n1"] >= 15 and v["ex1"] <= -0.5 and v["win1"] < 45:
+            add("bad", f"{nm} 다음 날 성적 부진", f"{v['n1']}건 평균 {v['avg1']:+.2f}% · 시장 대비 {v['ex1']:+.2f}%p · 승률 {v['win1']}%", FIX[k])
+        elif v["n1"] >= 15 and v["ex1"] >= 0.3 and v["win1"] >= 55:
+            add("ok", f"{nm} 잘 맞고 있음", f"{v['n1']}건 평균 {v['avg1']:+.2f}% · 시장 대비 {v['ex1']:+.2f}%p · 승률 {v['win1']}%", "현재 설정 유지")
+        if v["n5"] >= 10 and v["ex5"] is not None and v["ex5"] <= -1:
+            add("bad", f"{nm} 5일 성적이 시장보다 낮음", f"{v['n5']}건 5일 평균 {v['avg5']:+.2f}% · 시장 대비 {v['ex5']:+.2f}%p", FIX[k])
+        if v["n5"] >= 10 and v["stp"] is not None and v["stp"] >= 50 and v["stp"] > (v["tgt"] or 0):
+            add("warn", f"{nm} 손절 도달이 너무 많음", f"10일 안에 손절 {v['stp']}% · 목표 {v['tgt']}%",
+                "손절 폭이 좁습니다: 손절가를 ATR 1.5배→2배로 넓히거나, 손익비 2 이상인 종목만 추천하는 수정")
+        if v["n5"] >= 10 and v["tgt"] is not None and v["tgt"] >= 60 and (v["avg5"] or 0) > 0:
+            add("info", f"{nm} 1차 목표 도달이 잦음", f"목표 도달 {v['tgt']}%", "1차 목표가 낮을 수 있습니다: 2차 목표까지 일부 보유하도록 안내를 바꾸는 수정")
+    ol = rv.get("ol")
+    if ol and ol["n"] >= 30:
+        if ol["hit"] < 50:
+            add("bad", "5일 전망 방향이 자주 틀림", f"{ol['n']}건 중 적중 {ol['hit']}%",
+                "입력 지표가 너무 많아 과거에 끼워 맞춰졌을 수 있습니다: 지표를 중요도 상위 15개로 줄이고 학습 기간을 최근 3년으로 줄이는 수정")
+        elif ol["hit"] >= 55:
+            add("ok", "5일 전망 방향 적중 양호", f"{ol['n']}건 중 적중 {ol['hit']}%", "현재 설정 유지")
+        if ol["inband"] < 55:
+            add("warn", "실제 움직임이 예상 흔들림 폭을 자주 벗어남", f"범위 안 {ol['inband']}% (기대치 약 68%)",
+                "흔들림 폭을 과소평가했습니다: 최근 20일→10일 변동성으로 계산하거나 1.2배로 넓히는 수정")
+        elif ol["inband"] > 85:
+            add("info", "예상 흔들림 폭이 넉넉함", f"범위 안 {ol['inband']}% (기대치 약 68%)", "흔들림 폭을 0.9배로 좁혀도 되는지 검토")
+        if ol["up_hi"] is not None and ol["up_lo"] is not None and ol["up_hi"] <= ol["up_lo"]:
+            add("warn", "확률이 거꾸로 작동", f"'55% 이상' 실제 상승 {ol['up_hi']}% ≤ '45% 미만' {ol['up_lo']}%",
+                "확률 숫자를 숨기고 '방향 불분명'으로만 표시하거나, 모델을 로지스틱 회귀로 고정하는 수정")
+    rk = rv.get("rk")
+    if rk and rk["hi"] is not None and rk["lo"] is not None:
+        if rk["hi"] > rk["lo"]:
+            add("warn", "시장 신호등이 반대로 작동", f"위험 50점 이상 다음 5일 {rk['hi']:+.2f}% > 25점 미만 {rk['lo']:+.2f}%",
+                "분산일·VIX 점수를 줄이고 지수 이동평균·신저가 비율 점수를 늘리는 수정")
+        else:
+            add("ok", "시장 신호등이 방향대로 작동", f"위험 50점 이상 다음 5일 {rk['hi']:+.2f}% < 25점 미만 {rk['lo']:+.2f}%", "현재 설정 유지")
+    n1 = sum(v["n1"] for v in rv["strat"].values())
+    if n1 < 45:
+        add("info", "아직 기록이 적음", f"추천 결과 {n1}건 · 예측 기록 {rv['n_snap']}일치", "2~3주 이상 쌓이면 진단이 훨씬 정확해집니다")
+    order = {"bad": 0, "warn": 1, "info": 2, "ok": 3}
+    return sorted(tips, key=lambda x: order[x["sev"]])
+
+
 # ───────────────────────────── 결과 조립 ─────────────────────────────
 def num(x, nd=0):
     try:
@@ -899,11 +1938,13 @@ def build(demo=False, mode="file"):
             aux = [dict(label=lb, v=safe(fn, t), d=int(d[t])) for lb, d, fn in ev["aux"][k]]
             aux.append(dict(label="손익비", v=f"1 : {tg['rr']:.1f}" if np.isfinite(tg["rr"]) else "-", d=rr_delta(tg["rr"])))
             f, i = x.get("f"), x.get("i")
-            aux.append(dict(label="수급 (5일)", v=(f"외국인 {man(f)} · 기관 {man(i)}" if f is not None else "정보 없음"),
-                            d=flow_delta(f, i)))
+            st = x.get("st") or 0
+            aux.append(dict(label="수급 (5일)", v=(f"외국인 {man(f)} · 기관 {man(i)}" + (f" · {st}일 연속 동반 매수" if st >= 2 else "")
+                                                  if f is not None else "정보 없음"),
+                            d=flow_delta(f, i) + (3 if st >= 3 else 0)))
             per = x.get("per")
             aux.append(dict(label="실적", v=(f"흑자 · PER {per:.1f}" if per and per == per else "흑자")
-                            if x.get("eps") is not None else "확인 불가", d=0))
+                            if x.get("eps") is not None else "확인 불가", d=(-2 if per and per == per and per > 80 else 0)))
             base = float(ev["scores"].loc[t, f"s{k}"])
             adj = sum(a["d"] for a in aux)
             rows.append(dict(t=t, base=base, adj=adj, final=max(0.0, min(100.0, base + adj)), aux=aux, tg=tg, x=x))
@@ -945,8 +1986,38 @@ def build(demo=False, mode="file"):
                      num(m["rsi"][t], 1), num(m["atr"][t]), num(m["h0"][t], 2), num(m["h1"][t], 2),
                      num(m["hi20"][t]), num(m["lo20"][t]), num(m["hi60"][t]), num(res), num(sup),
                      picks_of.get(t, ""), num(m["rs"][t], 1),
-                     num(m["fhi"][t]), num(m["flo"][t]), (1 if m["fup"][t] else 0) if bool(m["fbig"][t]) else None]
+                     num(m["fhi"][t]), num(m["flo"][t]), (1 if m["fup"][t] else 0) if bool(m["fbig"][t]) else None,
+                     m["pat"][t]]
 
+    print("과거 성적 검증 중…", flush=True)
+    try:
+        bt = backtest(P, I, market, mcap, names)
+    except Exception as ex:
+        print(f"  과거 성적 검증 실패: {ex}", flush=True)
+        bt = None
+    risk = market_risk(P, I, uni, demo)
+    try:
+        outlook = market_outlook(demo, P["c"].index)
+    except Exception as ex:
+        print(f"  5일 전망 계산 실패: {ex}", flush=True)
+        outlook = None
+    macro = macro_panel(load_external(demo, P["c"].index))
+    # 예측 기록 저장 + 지난 기록과 실제 결과 비교
+    try:
+        past = demo_history(P, I, market) if demo else load_history(asof)
+        if not demo:
+            save_snapshot(make_snapshot(asof, tabs, outlook, risk))
+        rv = review(past, P)
+    except Exception as ex:
+        print(f"  예측 기록 점검 실패: {ex}", flush=True)
+        rv = None
+    stat("예측 기록 (저장소 history 폴더)", rv is not None, f"{rv['n_snap']}일치 기록" if rv else "실패")
+    tips = diagnose(rv, STATUS)
+    try:
+        brief = build_briefing(risk, outlook, macro, tabs, demo)
+    except Exception as ex:
+        print(f"  브리핑 생성 실패: {ex}", flush=True)
+        brief = None
     above20 = (c[uni] > m["ma20"][uni]).mean() * 100
     above60 = (c[uni] > m["ma60"][uni]).mean() * 100
     rising = (m["chg"][uni] > 0).mean() * 100
@@ -957,7 +2028,9 @@ def build(demo=False, mode="file"):
         rules={k: [[lb, w] for lb, w, _, _ in ev["checks"][k]] for k in (1, 2, 3)},
         targets={k: list(TARGET_RULE[k]) + [STOP_LABEL[k]] for k in (1, 2, 3)},
         breadth=dict(above20=num(above20, 1), above60=num(above60, 1), rising=num(rising, 1)),
-        default_tab=(3 if above20 < 45 else 1),
+        default_tab=(3 if above20 < 45 or risk["score"] >= 50 else 1),
+        risk=risk, outlook=outlook, macro=macro,
+        bt=bt, status=STATUS, review=rv, tips=tips, brief=brief, gen_iso=datetime.now().strftime("%Y-%m-%dT%H:%M"),
         tabs=tabs, all=allstk, news=news,
         names={t: str(n) for t, n in getattr(namefn, "__self__", {}).items()},
         worker=os.environ.get("AI_WORKER_URL", "").strip(),
@@ -970,6 +2043,8 @@ def write_html(data, path):
     html = TEMPLATE.replace("__DATA__", payload)
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
+    with open(os.path.join(os.path.dirname(os.path.abspath(path)), "version.json"), "w", encoding="utf-8") as f:
+        json.dump(dict(generated=data.get("gen_iso"), asof=data.get("asof")), f)
     return path
 
 
@@ -1144,7 +2219,8 @@ h3.sec{font-size:16px;font-weight:800;margin:26px 0 10px}
 .scorebrk{font-size:12px;color:var(--muted)}
 .checks,.aux{list-style:none;padding:0;margin:0;display:grid;gap:5px}
 .checks li,.aux li{display:grid;grid-template-columns:14px 1fr auto;gap:8px;align-items:baseline;font-size:13px}
-.aux li{grid-template-columns:1fr auto 34px}
+.aux li{grid-template-columns:auto minmax(0,1fr) 34px}
+.aux li>span:first-child{white-space:nowrap}
 .checks .ic{font-size:11px}
 .checks .ok .ic{color:var(--ok)} .checks .mid .ic{color:var(--mid)} .checks .no .ic{color:var(--no)}
 .checks .no .lb{color:var(--muted)}
@@ -1219,12 +2295,160 @@ td.rk{color:var(--muted);font-weight:700;width:44px}
 
 /* 내 종목 점검 */
 .mine{margin-top:8px}
+.risk{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:18px 20px;margin-top:4px}
+.rtop{display:grid;grid-template-columns:auto minmax(0,1fr) minmax(0,1fr);gap:20px;align-items:center}
+@media(max-width:880px){.rtop{grid-template-columns:1fr}.rbadges .rbadge{flex:1}}
+.rbadge{display:grid;justify-items:center;padding:12px 18px;border-radius:14px;color:#fff;min-width:110px}
+.rbadge.ok{background:var(--ok)} .rbadge.mid{background:var(--mid)} .rbadge.bad{background:var(--bad)}
+.rbadge span{font-weight:800;font-size:15px} .rbadge b{font-size:34px;font-weight:900;line-height:1.1} .rbadge small{opacity:.85}
+.ract{margin:0 0 6px;font-weight:700;font-size:14.5px}
+.rmain p{margin:0 0 4px}
+.rspark .rg{stroke:var(--line);stroke-dasharray:3 3} .rspark .rl{fill:none;stroke:var(--ink);stroke-width:2}
+.rspark .rd.ok{fill:var(--ok)} .rspark .rd.mid{fill:var(--mid)} .rspark .rd.bad{fill:var(--bad)} .rspark .rx{fill:var(--faint);font-size:11px}
+.rcols{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:14px;padding-top:14px;border-top:1px dashed var(--line)}
+@media(max-width:880px){.rcols{grid-template-columns:1fr}}
+.rcols h4{margin:0 0 6px;font-size:14px}
+.rcols ul{list-style:none;margin:0;padding:0;display:grid;gap:4px;font-size:13px}
+.rcols li{display:grid;grid-template-columns:14px 1fr auto;gap:8px;align-items:baseline;color:var(--muted)}
+.rcols li.on{color:var(--ink)} .rcols li.on .ic{color:var(--bad)} .rcols .ic{font-size:11px;color:var(--no)}
+.rcols li b{color:var(--bad);font-size:12px}
+.rwarn{color:var(--bad);font-weight:700}
+.scoreboard{margin-top:16px;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:16px 20px}
+.scgrid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px;margin-top:12px}
+@media(max-width:980px){.scgrid{grid-template-columns:1fr 1fr}.sc.wide{grid-column:1/-1}}
+@media(max-width:620px){.scgrid{grid-template-columns:1fr}}
+.sc{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--sunk)}
+.sc h4{margin:0 0 8px;font-size:14px}
+.sctbl{min-width:520px;font-size:13px} .tablewrap.flat{border:0;background:transparent}
+.sctbl td,.sctbl th{padding:6px 8px}
+.big2{font-size:30px;font-weight:900;letter-spacing:-.02em}
+.verdict2{margin:6px 0 0;font-weight:800;font-size:13px}
+.scl{list-style:none;margin:0;padding:0;display:grid;gap:4px;font-size:13px}
+.scl li{display:grid;grid-template-columns:64px auto 1fr;gap:8px;align-items:baseline}
+.scl li b{font-size:15px}
+a.q{text-decoration:none}
+.hmore{display:block;margin-top:10px;padding-top:10px;border-top:1px solid var(--line);font-weight:700;color:var(--ai);text-decoration:none;font-size:13.5px}
+#guideview{font-size:14px;line-height:1.7}
+.gtoc{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 18px}
+.gtoc a{font-size:12.5px;font-weight:700;padding:4px 10px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--ink);text-decoration:none}
+.gsec{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px 20px;margin-bottom:14px;scroll-margin-top:12px}
+.gsec h3{margin:0 0 10px;font-size:17px}
+.gsec h5{margin:14px 0 6px;font-size:14px}
+.gsec p{margin:0 0 10px}
+.gsec .ht{width:100%;border-collapse:collapse;font-size:12.5px;margin:0 0 10px}
+.gsec .ht th,.gsec .ht td{text-align:left;white-space:normal;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+.gsec .kinds,.gsec .rules,.gsec .auxrules{margin-bottom:10px}
+.revlink{margin-top:44px;background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--ink);border-radius:16px;padding:16px 20px}
+.rlrow{display:grid;grid-template-columns:auto 1fr;gap:20px;align-items:center;margin-top:10px}
+@media(max-width:760px){.rlrow{grid-template-columns:1fr}}
+.rlrow>div{display:grid;gap:2px}.rlrow>div b{font-size:24px;font-weight:900}
+.tips{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+.tips li{border:1px solid var(--line);border-left:4px solid var(--no);border-radius:10px;padding:10px 12px;background:var(--surface)}
+.tips li.bad{border-left-color:var(--bad)} .tips li.warn{border-left-color:var(--mid)} .tips li.ok{border-left-color:var(--ok)} .tips li.info{border-left-color:var(--down)}
+.tips .th{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap} .tips .th span{font-size:12px;font-weight:800;color:var(--muted)}
+.tips .fix{margin-top:4px;font-size:13px;font-weight:600}
+.tips.mini li{padding:6px 10px;display:flex;gap:8px;font-size:13.5px}
+#reviewview{font-size:14px;line-height:1.6}
+.revtbl{min-width:640px;font-size:13px} .revtbl td,.revtbl th{padding:7px 10px}
+.revkpi{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:12px}
+@media(max-width:820px){.revkpi{grid-template-columns:1fr 1fr}}
+.revkpi>div{border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:var(--sunk);display:grid}
+.revkpi b{font-size:20px}
+.stale{margin:14px 0 0;padding:10px 14px;border-radius:10px;background:rgba(194,65,12,.1);color:var(--bad);font-weight:700;font-size:13.5px}
+.brief{margin-top:18px;background:var(--surface);border:1px solid var(--line);border-top:4px solid var(--ink);border-radius:16px;padding:18px 20px}
+.bhead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap}
+.blines{list-style:none;margin:12px 0 14px;padding:0;display:grid;grid-template-columns:1fr 1fr;gap:6px 24px;font-size:14px}
+@media(max-width:820px){.blines{grid-template-columns:1fr}}
+.blines li{display:grid;grid-template-columns:90px 1fr;gap:10px;align-items:baseline}
+.blines li>b{font-size:12.5px;color:var(--muted)}
+.bgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:820px){.bgrid{grid-template-columns:1fr}}
+.bbox{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--sunk)}
+.bbox.wide{grid-column:1/-1}
+.bbox h4{margin:0 0 8px;font-size:14px}
+.bl{list-style:none;margin:0;padding:0;display:grid;gap:6px;font-size:13px}
+.bl li{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.bl li.today{font-weight:700}
+.bl a{color:var(--ink);text-decoration:none;flex:1 1 220px} .bl a:hover{text-decoration:underline}
+.bl .dt{color:var(--muted);font-size:12px;min-width:68px}
+.bsec{margin-bottom:8px}
+.hbtns{display:flex;gap:8px}
+.q{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:50%;border:1.5px solid var(--faint);background:var(--surface);color:var(--muted);font-size:12px;font-weight:800;cursor:pointer;vertical-align:middle;padding:0;line-height:1}
+.q:hover{border-color:var(--ink);color:var(--ink)}
+h2 .q{width:22px;height:22px;margin-left:4px}
+.chip{font-size:12px;font-weight:700;padding:2px 8px;border-radius:999px;background:var(--surface);border:1px solid var(--line);color:var(--muted);margin-left:6px}
+.helpdlg{max-width:720px}
+.helpdlg .hhead{display:flex;justify-content:space-between;align-items:center;gap:10px;position:sticky;top:0;background:var(--surface);padding-bottom:8px;border-bottom:1px solid var(--line)}
+.helpdlg h4{margin:0;font-size:17px}
+.helpdlg .x{background:none;border:0;font-size:18px;cursor:pointer;color:var(--muted);padding:4px 8px}
+.hbody{font-size:13.5px;line-height:1.65;max-height:70vh;overflow:auto;padding-top:10px}
+.hbody p{margin:0 0 10px} .hbody h5{margin:12px 0 4px;font-size:14px} .hbody ol{padding-left:20px;margin:0 0 10px}
+.hbody .ht{width:100%;min-width:0;border-collapse:collapse;font-size:12.5px;margin:0 0 10px}
+.hbody .ht th,.hbody .ht td{text-align:left;white-space:normal;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+.hbody .kinds,.hbody .rules,.hbody .auxrules{margin-bottom:10px}
+.hbody .ht th,.hbody .ht td:first-child{white-space:nowrap}
+.rbadges{display:flex;gap:10px}
+.rbadge small{font-size:11px;opacity:.9}
+.rbadge.okl{background:#0d9488} .rbadge.mute{background:var(--faint)}
+.rspark .rl.dn{stroke:var(--bad)} .rspark .rl.up{stroke:var(--ok)}
+.lgd{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:4px}
+.lgd.dn{background:var(--bad)} .lgd.up{background:var(--ok)}
+.rcols .upl li.on .ic,.rcols .upl li b{color:var(--ok)}
+.kd{font-style:normal;font-size:10.5px;font-weight:800;color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-right:6px}
+.h2s{font-size:12px;font-weight:700;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 8px;vertical-align:middle;margin-left:6px}
+#macro{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:16px 20px}
+.mx-sum{margin:0 0 10px;font-size:14px}
+.mxtbl{min-width:620px}
+.tr.tg{background:rgba(15,118,110,.12);color:var(--ok)} .tr.tb{background:rgba(194,65,12,.12);color:var(--bad)}
+#outlook{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:18px 20px}
+.olk-note{font-size:13.5px;padding:8px 12px;border-radius:10px;background:var(--sunk);margin-bottom:14px}
+.olk-note.weak{border-left:4px solid var(--mid)}
+.olk-idx{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:820px){.olk-idx{grid-template-columns:1fr}}
+.oi{border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.oh{display:flex;gap:10px;align-items:baseline}
+.oh b{font-size:16px}
+.op{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;font-size:13px}
+.op span{display:block;font-size:11.5px;text-align:left} .op b{font-size:17px}
+.cone .cband{fill:var(--band);stroke:var(--bb);stroke-dasharray:3 3}
+.cone .cl2{fill:none;stroke:var(--ink);stroke-width:1.6}
+.cone .cmid{stroke-width:2;stroke-dasharray:5 3} .cone .cmid.u{stroke:var(--up)} .cone .cmid.d{stroke:var(--down)}
+.cone .cnow{stroke:var(--line)}
+.tr{font-size:12px;font-weight:800;padding:1px 8px;border-radius:999px;white-space:nowrap}
+.tr.tu{background:rgba(212,42,60,.12);color:var(--up)} .tr.td{background:rgba(29,91,216,.12);color:var(--down)} .tr.tf{background:var(--sunk);color:var(--muted)}
+.sectbl{min-width:880px}
+#events .evtbl{min-width:640px}
+.evtbl td{vertical-align:top;white-space:normal}
+.evtbl tr.soon td{background:var(--sunk)}
+.evtbl .dd{font-weight:800;color:var(--bad);font-size:12.5px}
+.evtbl td,.evtbl th{text-align:left!important}
+.sb{display:inline-block;font-size:11.5px;font-weight:700;padding:1px 7px;border-radius:999px;background:var(--sunk);border:1px solid var(--line);margin:1px 0}
+.evp{white-space:nowrap}
+.pcell{display:flex;align-items:center;gap:8px;justify-content:flex-end}
+.pbar{position:relative;width:90px;height:8px;background:var(--sunk);border-radius:4px}
+.pbar i{position:absolute;top:0;bottom:0;border-radius:4px} .pbar i.u{background:var(--up)} .pbar i.d{background:var(--down)}
+.pbar s{position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;background:var(--faint)}
+.ms{fill:none;stroke-width:1.5} .ms.u{stroke:var(--up)} .ms.d{stroke:var(--down)}
+.fbtns{display:flex;gap:8px}
+@media(max-width:760px){.fbtns{grid-column:1/-1}.fbtns .btn{flex:1}}
+.mylink{display:flex;justify-content:space-between;align-items:center;margin-top:10px;padding:12px 16px;border-radius:12px;background:var(--surface);border:1px solid var(--line);color:var(--ink);text-decoration:none;font-weight:700;font-size:14px}
+.mylink span{color:var(--muted);font-weight:500;font-size:13px}
+.mylink:hover{border-color:var(--ink)}
+[hidden]{display:none!important}
+.back{display:inline-block;margin:20px 0 0;color:var(--muted);text-decoration:none;font-weight:700}
+.mytbl{min-width:640px}
+.mytbl tr.sel td{background:var(--sunk)}
+.mytbl tbody tr{cursor:pointer}
+.mytbl .vv{font-weight:800}
+.mytbl .vv.ok{color:var(--ok)} .mytbl .vv.mid{color:var(--mid)} .mytbl .vv.no{color:var(--bad)}
+.hold .acts{display:flex;gap:6px;align-items:center}
+.btn.sm{padding:6px 12px;font-size:13px}
 .rechead{margin-top:44px;padding-top:18px;border-top:2px solid var(--ink)}
 .form{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) auto;gap:10px;align-items:end;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px}
 .form label{display:grid;gap:4px;font-size:12.5px;color:var(--muted);font-weight:600}
 .form input{font:inherit;font-size:15px;padding:10px 12px;border:1.5px solid var(--line);border-radius:10px;background:var(--sunk);color:var(--ink);width:100%}
 .form .err{grid-column:1/-1;color:var(--bad);font-size:13px;margin:0}
-@media(max-width:760px){.form{grid-template-columns:1fr 1fr}.form label:first-child{grid-column:1/-1}.form .btn{grid-column:1/-1}}
+@media(max-width:760px){.form{grid-template-columns:1fr 1fr}.form label:first-child{grid-column:1/-1}}
 .hold{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:18px 20px;margin-top:14px;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr);gap:20px}
 @media(max-width:880px){.hold{grid-template-columns:1fr}}
 .hold .hdr{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
@@ -1292,26 +2516,41 @@ svg text{font-family:inherit}
       <h1>오늘의 종목 발굴</h1>
       <div class="meta tn" id="meta"></div>
     </div>
-    <button class="btn" id="refresh">새로고침</button>
+    <span class="hbtns"><a class="btn ghost" href="#guide">📖 상세 설명</a><button class="btn" id="refresh">새로고침</button></span>
   </header>
   <div class="demo" id="demo" hidden>가상 데이터로 만든 미리보기입니다. 실제 종목이 아닙니다.</div>
+  <div id="myview" hidden></div>
+  <div id="guideview" hidden></div>
+  <div id="reviewview" hidden></div>
+  <div id="mainview">
 
 
+  <div class="stale" id="stale" hidden></div>
+  <section class="brief" id="brief"></section>
+  <section class="scoreboard" id="score"></section>
   <section class="mine" id="mine">
-    <h2>내 종목 점검</h2>
-    <p class="sub">보유 중인 종목과 수량, 평균 매입가를 넣으면 차트 기준으로 보유·매도 전략과 손절가·목표가를 알려드립니다. 입력한 내용은 이 기기(브라우저)에만 저장되고 다른 사람에게 보이지 않습니다.</p>
+    <h2>내 종목 점검 <button class="q" data-help="mine" aria-label="설명 보기">?</button></h2>
     <div class="form">
       <label>종목명 또는 코드<input id="fStock" list="stocklist" placeholder="예: 삼성전자 또는 005930" autocomplete="off"></label>
       <label>보유 수량 (주)<input id="fQty" type="number" inputmode="numeric" min="1" placeholder="예: 100"></label>
       <label>평균 매입가 (원)<input id="fAvg" type="number" inputmode="numeric" min="1" placeholder="예: 71000"></label>
-      <button class="btn" id="fAdd">점검하고 저장</button>
+      <span class="fbtns"><button class="btn" id="fCheck">점검하기</button><button class="btn ghost" id="fSave">저장</button></span>
       <p class="err" id="fErr" hidden></p>
     </div>
     <datalist id="stocklist"></datalist>
-    <div id="holds"></div>
+    <a class="mylink" id="mylink" href="#my" hidden></a>
+    <div id="checkResult"></div>
   </section>
 
-  <h2 class="rechead">오늘의 추천 종목</h2>
+  <h2 class="rechead">시장 방향 신호등 <button class="q" data-help="signals" aria-label="설명 보기">?</button></h2>
+  <section class="risk" id="risk"></section>
+  <h2>글로벌 지표 <button class="q" data-help="macro" aria-label="설명 보기">?</button></h2>
+  <section id="macro"></section>
+  <h2>앞으로 5일 전망 <button class="q" data-help="outlook" aria-label="설명 보기">?</button></h2>
+  <section id="outlook"></section>
+  <h2>다가오는 일정 <button class="q" data-help="events" aria-label="설명 보기">?</button></h2>
+  <section id="events"></section>
+  <h2>오늘의 추천 종목 <button class="q" data-help="picks" aria-label="설명 보기">?</button></h2>
   <dl class="pulse" id="pulse"></dl>
 
   <div class="tabs" role="tablist" id="tabs"></div>
@@ -1319,14 +2558,11 @@ svg text{font-family:inherit}
   <div id="panel" role="tabpanel"></div>
 
 
-  <details class="how" id="how" open>
-    <summary>이 페이지가 종목을 고르는 방식 <span>처음 보시면 꼭 읽어주세요</span></summary>
-    <div class="body" id="howbody"></div>
-  </details>
 
+  <section class="revlink" id="revlink"></section>
+  </div>
   <footer>
-    <p>📊 차트 분석은 전 거래일 종가까지의 시세로 계산한 공식 결과이고, 🤖 AI 분석은 Claude가 뉴스·공시를 검색해 낸 의견입니다. 둘 다 참고 자료이며 목표가 도달이나 수익을 보장하지 않습니다.</p>
-    <p>관리종목·투자경고 여부와 최신 공시는 매수 전 HTS에서 한 번 더 확인하세요. 투자 판단과 책임은 본인에게 있습니다.</p>
+    <p>참고 자료이며 수익을 보장하지 않습니다. 투자 판단과 책임은 본인에게 있습니다.</p>
   </footer>
 </div>
 
@@ -1340,12 +2576,17 @@ svg text{font-family:inherit}
     <a class="btn ai" href="https://claude.ai/new" target="_blank" rel="noopener">Claude 열기</a>
   </div>
 </div></dialog>
+<dialog id="help" class="helpdlg"><div class="in">
+  <div class="hhead"><h4 id="helpTitle"></h4><button class="x" id="helpClose" aria-label="닫기">✕</button></div>
+  <div id="helpBody" class="hbody"></div>
+  <a class="hmore" href="#guide" id="helpMore">📖 상세 설명 페이지에서 전체 보기 →</a>
+</div></dialog>
 
 <script>
 const D = __DATA__;
-const STRAT = {1:{n:'추세 눌림목',c:'s1',v:'--s1',d:'상승 추세가 살아 있는 종목이 20일선까지 쉬어 내려온 자리입니다. 가장 무난한 전략입니다.'},
-               2:{n:'거래량 돌파',c:'s2',v:'--s2',d:'좁은 박스권에서 거래량과 함께 위로 뚫고 나온 종목입니다. 수익이 크지만 실패도 빠른 공격형 전략입니다.'},
-               3:{n:'과매도 반등',c:'s3',v:'--s3',d:'볼린저 하단을 찍고 거래량과 함께 반등을 시작한 종목입니다. 처음 정하신 조건에 가장 가까운 전략입니다.'}};
+const STRAT = {1:{n:'추세 눌림목',c:'s1',v:'--s1',d:'상승 추세 중 20일선까지 쉬어 내려온 종목'},
+               2:{n:'거래량 돌파',c:'s2',v:'--s2',d:'거래량과 함께 박스권을 뚫고 나온 종목'},
+               3:{n:'과매도 반등',c:'s3',v:'--s3',d:'볼린저 하단을 찍고 반등을 시작한 종목'}};
 const NS='http://www.w3.org/2000/svg';
 const f0=x=>x==null||isNaN(x)?'-':Math.round(x).toLocaleString('ko-KR');
 const pctS=(x,d=1)=>x==null?'-':(x>0?'+':'')+x.toFixed(d)+'%';
@@ -1494,7 +2735,7 @@ const NEWS=D.news||{};
 function newsHTML(code,max=6){
   const n=(NEWS[code]||[]).slice(0,max);
   if(!n.length)return '';
-  return `<div class="news"><div class="lbl" style="margin:0 0 4px">📰 최근 한 달 뉴스 <span class="vl">(제목만 모은 것 · AI 판단 아님)</span></div><ul>${n.map(x=>
+  return `<div class="news"><div class="lbl" style="margin:0 0 4px">📰 최근 한 달 뉴스 <button class="q" data-help="news" aria-label="설명 보기">?</button></div><ul>${n.map(x=>
     `<li><span class="dt tn">${esc(x.d)}</span>${x.en?'<span class="en">해외</span>':''}<a href="${esc(x.u)}" target="_blank" rel="noopener">${esc(x.t)}</a>${x.s?` <span class="vl">${esc(x.s)}</span>`:''}</li>`).join('')}</ul></div>`;
 }
 // 요청 문장을 Claude 주소에 실어 보냄 (주소가 너무 길면 뉴스·근거를 줄임)
@@ -1512,7 +2753,7 @@ function slotInner(i){
   const s=SLOTS[i],a=s.pre||loadAI(s.key);
   if(a)return aiResultHTML(a,s,i);
   if(AI_URL)return `<div class="aibox aibtn"><p><b style="color:var(--ink)">🤖 AI 분석</b><br>버튼을 누르면 Claude가 최근 한 달의 국내·해외(영문) 기사와 공시를 검색해서 이 자리에 바로 분석 결과를 보여드립니다. 30초~1분 정도 걸립니다.</p><button class="btn ai" data-run="${i}">🤖 AI 분석 요청</button></div>`;
-  return `<div class="aibox aibtn"><p><b style="color:var(--ink)">🤖 AI 분석</b><br>누르면 Claude가 <b>분석 요청이 입력된 채로</b> 열립니다. <b>전송(Enter)만</b> 누르세요. 최근 한 달 국내·해외 기사를 검색해서 분석해 드립니다.</p>
+  return `<div class="aibox aibtn"><p><b style="color:var(--ink)">🤖 AI 분석</b> <button class="q" data-help="ai" aria-label="설명 보기">?</button><br>열리면 <b>Enter</b>만 누르세요</p>
     <span class="acts2"><a class="btn ai" href="${claudeURL(s.prompt,s.code)}" target="_blank" rel="noopener">🤖 Claude에서 분석하기</a><button class="linkbtn" data-p="${i}">요청 문장 복사</button></span></div>`;
 }
 function aiResultHTML(a,s,i){
@@ -1548,12 +2789,12 @@ document.addEventListener('click',e=>{
 });
 
 /* ───── 추천 방식 설명 ───── */
-function renderHow(){
+function helpHow(){
   const c=D.cfg;
   const rule=k=>`<div class="rule"><h5 class="${STRAT[k].c}">${STRAT[k].n}</h5>
     <ol>${D.rules[k].map(([l,w])=>`<li>${esc(l)} <span>${w}점</span></li>`).join('')}</ol>
     <div class="tg">1차 목표: ${D.targets[k][0]}<br>2차 목표: ${D.targets[k][1]}<br>손절: ${D.targets[k][2]}</div></div>`;
-  document.getElementById('howbody').innerHTML=`
+  return `
     <div class="kinds">
       <div class="kind"><b>📊 차트 분석 결론</b>정해진 공식으로 계산한 결과입니다. 사람의 판단이나 AI의 해석은 들어가지 않습니다. 전략·점수·목표가·손절가가 여기에 해당합니다.</div>
       <div class="kind ai"><b>🤖 AI 분석 결론</b>🤖 버튼을 누르면 Claude가 요청이 입력된 채로 열리고, 전송만 누르면 최근 한 달 국내 뉴스·공시와 해외 영문 기사를 검색해 의견(매수 / 관망 / 주의)을 냅니다. 카드의 📰 뉴스 목록은 매일 아침 제목만 모은 것으로 AI 판단이 아닙니다.</div>
@@ -1569,12 +2810,308 @@ function renderHow(){
         <div><b>OBV</b>: 가격은 저점을 낮추는데 거래량 누적은 올라가는 강세 다이버전스 +3~6</div>
         <div><b>상대강도</b>: 최근 20일 수익률이 시장 평균보다 좋으면 +2~4, 크게 나쁘면 −3~4</div>
         <div><b>매물대</b>: 목표가 아래에 거래가 많이 쌓인 가격대가 있으면 목표가를 그 아래로 낮춥니다</div>
+        <div><b>세력 패턴</b> (최근 20일): 장대양봉(+8%·거래량 3배) 뒤 거래량 줄며 눌림 +5, 좁은 박스권에서 OBV·거래량 증가(조용한 매집) +4, 저점권 대량 거래 짧은 몸통 캔들(매집봉) +4, 대량 장대음봉·장대양봉 중간 이탈(이탈 의심) −6 · 수급은 외국인·기관 3일 이상 연속 동반 매수면 +3 추가</div>
         <div><b>피보나치</b> (최근 120일 고점·저점): 눌림목은 상승폭의 50~61.8% 되돌림 +5, 38.2~50% +3, 78.6% 넘게 빠지면 −3 · 반등은 61.8~78.6% 깊은 지지 +5 · 차트에 노란 점선으로 표시</div>
       </div></div>
+    <div><h4>앞으로 5일 전망</h4><p>코스피·코스닥과 섹터 대표 ETF 20개의 과거 약 5년치 데이터로 '5일 뒤 올랐는지'를 학습한 확률 모델(로지스틱 회귀)입니다. 최근 수익률, 이동평균과의 거리, RSI, 변동성, 고점 대비 하락폭, VIX·환율·나스닥·반도체 지수 변화를 입력으로 씁니다. 학습에 쓰지 않은 최근 기간에서 맞힌 비율을 함께 보여드리니, 그 숫자가 '찍기'보다 크게 높지 않으면 방향보다 예상 흔들림 폭을 참고하세요.</p></div>
+    <div><h4>시장 방향 신호등</h4><p>글로벌 지표 15개(VIX·원달러 환율·달러인덱스·미국 10년 금리·국제유가·금·구리·하이일드 채권·S&P500·나스닥·반도체·닛케이·상해·대만·비트코인)의 20일 변화로 주식에 유리·불리를 판단해 함께 반영합니다. 하락 위험 점수와 함께 상승 신호 점수(오르는 종목 급증, 바닥 확인일, 신고가 증가, VIX 진정, 환율 안정, 지수 20일선 회복 등)도 계산합니다. 코스피·코스닥 지수, 전 종목의 20일선 위 비율과 60일 신저가 비율, 미국 공포지수(VIX)·원달러 환율·나스닥·반도체 지수로 0~100점을 계산합니다. 하락 전에 먼저 나타나는 <b>선행 신호</b>(분산일 누적, 지수와 종목 수의 괴리, 변동성 확대, VIX·환율 급등)와 이미 하락 중일 때 켜지는 <b>진행 신호</b>(지수 이동평균 이탈, 신저가 급증 등)로 나눠 보여줍니다. 50점 이상이면 추천 종목 위에 경고가 붙고, 과매도 반등 탭을 먼저 보여드립니다.</p></div>
     <div><h4>4단계 · 순위</h4><p>최종 점수 = 기본 점수 + 가감점 (0~100점). 전략별로 1~3위는 매수 후보, 4~6위는 지켜볼 종목, 7~16위는 목록으로 보여줍니다. 데이터는 네이버 금융 기준이며 평일 아침마다 전 거래일 종가로 다시 계산합니다.</p></div>`;
 }
 
+/* ───── 도움말 (물음표) ───── */
+const T=(rows,head)=>`<table class="ht"><thead><tr>${head.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+const RULE=k=>T(D.rules[k].map(([l,w])=>[esc(l),w+'점']),['조건','배점'])+`<p>조건을 모두 채우면 배점 전부, 벗어나면 벗어난 정도만큼 점수가 줄어듭니다 (예: RSI 40~55 조건에서 RSI 60이면 10만큼 허용 범위 중 5를 벗어나 절반 점수).</p>
+  <p><b>목표·손절</b> · 1차: ${D.targets[k][0]} · 2차: ${D.targets[k][1]} · 손절: ${D.targets[k][2]}</p>`;
+const HELP={
+  how:['이용 안내',()=>helpHow()],
+  mine:['내 종목 점검',()=>`<ol><li>종목명(또는 6자리 코드), 보유 수량, 평균 매입가를 입력합니다.</li><li><b>점검하기</b>: 한 번만 보고 저장하지 않습니다.</li><li><b>저장</b>: '저장한 내 종목' 화면에 모아 두고 매일 새 데이터로 다시 점검합니다.</li></ol><p>저장 내용은 이 휴대폰(브라우저)에만 남고 서버로 가지 않습니다. 다른 기기에서는 따로 저장해야 합니다.</p>`],
+  hold:['차트 기준 전략은 이렇게 정합니다',()=>T([
+      ['손절 검토 / 이익 보호 매도','주가 &lt; 60일선, 60일선 하락 중, MACD 히스토그램 음수이며 하락 확대'],
+      ['일부 익절 (1/3)','RSI ≥ 70 또는 볼린저 상단 돌파 + 수익률 ≥ 10%'],
+      ['보유 (추세 유지)','주가 &gt; 20일선 &gt; 60일선, 60일선 상승 중'],
+      ['보유 (반등 대기)','RSI ≤ 35 + MACD 히스토그램 반등'],
+      ['손절 검토','60일선 아래 + 손실 −10% 이하'],
+      ['보유 · 관망','위 어디에도 해당하지 않음']],['판단','조건'])+
+    `<p><b>손절 참고가</b> = 상승 추세면 max(20일선 − 1×ATR, 20일 저점), 아니면 아래 매물대(또는 20일 저점) − 0.5×ATR. 현재가보다 높게 나오면 현재가 − 1.5×ATR.</p>
+     <p><b>1차 목표</b> = 볼린저 상단·20일 고점·위쪽 매물대 중 현재가보다 1% 이상 높은 가장 가까운 값 (없으면 현재가 + 1.5×ATR) · <b>2차 목표</b> = max(60일 고점, 현재가 + 2.5×ATR)</p>
+     <p>ATR은 하루 평균 변동폭(14일)입니다.</p>`],
+  signals:['시장 방향 신호등 계산법',()=>{const R=D.risk;if(!R)return '';
+    const row=x=>[x.kind,esc(x.label),x.on?'<b>켜짐</b>':'꺼짐',x.val?esc(x.val):''];
+    return `<p><b>선행</b>은 방향이 바뀌기 전에 먼저 켜지는 신호, <b>진행·확인</b>은 이미 움직이고 있을 때 켜지는 신호입니다. 켜진 신호의 점수를 더해 0~100점으로 만듭니다.</p>
+      <p>하락 위험: 0~24 안정 · 25~49 주의 · 50~74 경계 · 75+ 위험 &nbsp;|&nbsp; 상승 신호: 0~14 없음 · 15~34 약함 · 35~59 개선 · 60+ 강함</p>
+      <h5>하락 쪽</h5>${T(R.dn.map(row),['구분','신호','오늘','값'])}<h5>상승 쪽</h5>${T(R.upl.map(row),['구분','신호','오늘','값'])}
+      <p><b>분산일</b>: 지수가 0.2% 이상 하락하면서 거래량이 전날보다 많은 날. 25일 안에 4~5일 이상 쌓이면 큰손이 팔고 있다는 신호로 봅니다.<br><b>바닥 확인일</b>: 최근 저점 이후 4일째부터 지수가 거래량 증가와 함께 +1.5% 이상 오른 날.</p>
+      <p>지수 데이터: ${esc(R.src)}. 폭락이나 상승을 정확히 맞히는 지표는 없고, 여러 신호가 동시에 켜질수록 가능성이 높아진다는 뜻입니다.</p>`;}],
+  macro:['글로벌 지표 판정 기준',()=>`<p>최근 20일 변화가 아래 기준을 넘으면 방향에 따라 주식에 유리·불리로 봅니다. 기준 안이면 중립입니다.</p>`+T([
+      ['원·달러 환율, 달러인덱스','±2%','오르면 불리 (외국인 매도 압력)'],['미국 10년 국채금리','±7%','오르면 불리 (성장주 할인율 상승)'],
+      ['국제유가(WTI)','±12%','오르면 불리 (물가·비용 부담)'],['금','±5%','오르면 불리 (안전자산 선호)'],
+      ['구리','±5%','오르면 유리 (경기 회복 기대)'],['하이일드 채권','±2%','오르면 유리 (신용위험 축소)'],
+      ['S&P500·닛케이·상해·대만','±4~5%','오르면 유리'],['나스닥 ±5%, 반도체 ±7%','','오르면 유리'],['비트코인','±15%','오르면 유리 (위험 선호)'],
+      ['VIX','수준·5일 변화','25 이상 또는 5일 +20% → 불리, 16 미만 또는 5일 −15% → 유리']],['지표','기준','해석'])+
+    `<p>해외 시장은 시차 때문에 전날 밤 마감값입니다. 데이터는 야후 파이낸스입니다.</p>`],
+  outlook:['5일 전망은 이렇게 만듭니다',()=>{const O=D.outlook;if(!O)return '<p>오늘은 계산하지 못했습니다.</p>';
+    return `<p>코스피·코스닥과 섹터 대표 ETF 20개의 과거 데이터(${O.since}부터 ${f0(O.n)}개 표본)로 <b>"5일 뒤 올랐는가"</b>를 학습합니다. 로지스틱 회귀와 그래디언트 부스팅 두 모델을 만들어 중간 기간 성적이 더 좋은 쪽을 고르며, 오늘은 <b>${esc(O.model||'로지스틱 회귀')}</b>를 썼습니다. 입력 지표는 ${O.feats}개입니다 (최근 수익률, 20·60일선과의 거리, 20일선 기울기, RSI, 변동성, 고점 대비 하락폭, 코스피 대비 강도, 글로벌 지표 16개의 5·20일 변화, 미국 장단기 금리차, 월말·월초, 일정 4가지).</p>
+      <p><b>정확도 검증</b>: 앞 60% 기간으로 학습 → 다음 20%로 모델 선택 → 학습·선택에 전혀 쓰지 않은 마지막 20% 기간(${esc(O.test_from||'')}~)에서 맞힌 비율이 <b>${O.hit}%</b>입니다. 많이 나온 쪽만 찍었을 때는 ${O.base}%입니다.${O.hit_conf!=null?` 확률이 60% 이상이거나 40% 이하로 뚜렷할 때만 보면 ${O.hit_conf}%입니다.`:''}</p>
+      ${O.top?`<p><b>모델이 가장 무겁게 본 지표</b>: ${O.top.map(t=>`${esc(t.name)}(${t.dir})`).join(', ')}</p>`:''}
+      <p><b>과거 비슷한 때 평균</b> = 같은 확률 구간(10% 단위)에 있었던 과거 사례들의 5일 뒤 평균 등락률<br>
+      <b>예상 흔들림</b> = 최근 20일 일간 등락률의 표준편차 × √5 (약 68%가 이 범위 안에 들어옴)<br>
+      <b>현재 추세</b> = 상승: 주가 &gt; 20일선 &gt; 60일선 + 20일선 상승 / 하락: 반대 / 나머지 횡보</p>
+      <p>5일 뒤 시장은 전문 기관도 크게 맞히기 어렵습니다. 적중률이 찍기보다 크게 높지 않으면 방향보다 흔들림 폭을 참고하세요.</p>`;}],
+  picks:['추천 종목 순위 매기는 법',()=>`<p><b>1단계 · 기본 필터</b>: 코스피·코스닥, 거래대금 ${f0(D.cfg.min_amount/1e8)}억 이상, 시가총액 ${f0(D.cfg.min_mcap/1e8)}억 이상, 주가 ${f0(D.cfg.min_price)}원 이상, 상장 6개월 이상. 우선주·ETF·ETN·스팩·적자 기업 제외.</p>
+      <p><b>2단계 · 기본 점수 (100점)</b>: 전략마다 조건 5개를 얼마나 채웠는지 (각 카드의 '기본 조건' ? 참고).</p>
+      <p><b>3단계 · 보조 지표 가감점</b>: 손익비, 수급, MACD, OBV, 상대강도, 피보나치, 세력 패턴.</p>
+      <p><b>최종 점수</b> = 기본 점수 + 가감점 (0~100). 1~3위 매수 후보, 4~6위 지켜볼 종목, 7~16위 목록.</p>
+      <p>📊 차트 결론은 공식으로 계산한 결과이고, 🤖 AI 결론은 Claude가 기사를 읽고 낸 의견입니다.</p>`],
+  rules1:['추세 눌림목 · 기본 조건',()=>RULE(1)],rules2:['거래량 돌파 · 기본 조건',()=>RULE(2)],rules3:['과매도 반등 · 기본 조건',()=>RULE(3)],
+  aux:['보조 지표 가감점',()=>T([
+      ['손익비','(1차 목표 − 현재가) ÷ (현재가 − 손절가)','2 이상 +8 · 1.5 이상 +4 · 1 미만 −12'],
+      ['수급 (5일)','외국인·기관 순매수 합계','둘 다 매수 +6 · 합계 매수 +3 · 둘 다 매도 −6 · 3일 이상 연속 동반 매수 +3'],
+      ['MACD 히스토그램','(12일 EMA − 26일 EMA) − 그 9일 EMA','반등: 0선 돌파·하락 둔화 +5 / 그 외: 상승 확대 +3, 꺾이면 감점'],
+      ['OBV','오른 날 거래량 더하고 내린 날 빼서 누적','가격 저점은 낮아지는데 OBV는 높아짐(강세 다이버전스) +3~6'],
+      ['상대강도','종목 20일 수익률 − 시장 중간값','+5%p 넘으면 +4 · 0 넘으면 +2 · −10%p 밑이면 −4 (반등 전략은 기준 완화)'],
+      ['피보나치','120일 고점·저점 사이 되돌림 비율','눌림목 50~61.8% +5 · 38.2~50% +3 / 반등 61.8~78.6% +5'],
+      ['세력 패턴','최근 20일 캔들·거래량 모양','장대양봉 후 눌림 +5 · 조용한 매집 +4 · 저점 매집봉 +4 · 이탈 의심 −6'],
+      ['52주 고가 근접','현재가 ÷ 최근 250일 최고가','90% 이상이면 +3 (눌림목·돌파) — 신고가 근처 종목이 더 오르는 경향(모멘텀)'],
+      ['변동성','하루 평균 변동폭(ATR) ÷ 현재가','7% 넘으면 −3 — 너무 출렁이는 종목은 손절에 쉽게 걸림'],
+      ['실적','네이버 EPS·PER','적자면 추천에서 제외 · PER 80 초과면 −2']],['지표','계산','점수'])],
+  target:['목표가 · 손절가 · 손익비',()=>T([[STRAT[3].n,D.targets[3][0],D.targets[3][1],D.targets[3][2]],[STRAT[1].n,D.targets[1][0],D.targets[1][1],D.targets[1][2]],[STRAT[2].n,D.targets[2][0],D.targets[2][1],D.targets[2][2]]],['전략','1차 목표','2차 목표','손절'])+
+    `<p>1차 목표와 현재가 사이에 거래가 많이 쌓인 가격대(매물대)가 있으면 1차 목표를 그 바로 아래로 낮춥니다. 손절가가 현재가보다 높게 나오면 현재가 − 1.5×ATR로 바꿉니다.</p>
+     <p><b>손익비</b> = (1차 목표 − 현재가) ÷ (현재가 − 손절가). 1 : 2라면 잃을 수 있는 금액의 2배를 노린다는 뜻입니다.</p>`],
+  news:['최근 한 달 뉴스',()=>`<p>매일 아침 구글 뉴스에서 종목명이 제목에 들어간 최근 30일 국내 기사를, 구글 뉴스(영문명)·야후 파이낸스에서 해외 기사를 모아 제목만 보여줍니다. AI가 판단한 내용이 아니며, 제목을 누르면 원문이 열립니다.</p>`],
+  brief:['오늘의 브리핑',()=>`<p>평일 아침 <b>6시 20분, 7시 5분, 7시 30분</b> 세 번 자동으로 다시 만들어서, 넥스트레이드 프리마켓(8시)과 정규장(9시) 전에 최신 자료가 올라가 있도록 했습니다. GitHub 사정으로 한 번이 늦어도 다음 회차가 갱신합니다. 페이지를 열어 두는 동안에도 10분마다 새 버전을 확인해 자동으로 바꿔 보여줍니다.</p>
+      <ul><li><b>밤사이 미국·환율·원자재</b>: 야후 파이낸스 전날 종가 대비</li><li><b>시장 신호등·5일 전망·글로벌 지표</b>: 아래 각 섹션 요약</li><li><b>이번 주 일정</b>: 다가오는 일정 중 7일 이내</li>
+      <li><b>실적 발표</b>: 구글 뉴스의 최근 하루 실적 기사${D.brief&&D.brief.dart?' + DART의 잠정실적 공시(최근 1일)와 기업설명회(IR) 개최 공시(최근 10일)':'. DART API 키(무료)를 등록하면 잠정실적·IR 공시 목록도 함께 나옵니다'}</li>
+      <li><b>국내·해외 증시 뉴스</b>: 구글 뉴스 최근 하루 기사 제목</li><li><b>섹터</b>: 최근 5일 ±3% 넘게 움직였거나 3일 안에 일정이 있는 섹터의 기사</li></ul>
+      <p>뉴스는 제목만 모은 것이며 AI 판단이 아닙니다.</p>`],
+  events:['다가오는 일정',()=>`<p>앞으로 45일 안의 일정을 보여줍니다. D-5 이내는 회색 배경으로 강조합니다.</p>
+      <h5>일정 출처</h5><ul>
+      <li><b>검색해서 넣은 일정</b>: 바이오 학회(JP모건 헬스케어·AACR·ASCO·ESMO·ASH), IT·반도체 행사(CES·엔비디아 GTC·컴퓨텍스·삼성 언팩·애플 발표), 미국 FOMC, 한국은행 금통위. '예상 날짜'는 주최 측 공식 발표 전 관례 날짜입니다.</li>
+      <li><b>규칙으로 자동 계산</b>: 선물옵션 동시만기(3·6·9·12월 둘째 목요일, 6·12월은 코스피200 정기변경), 실적 시즌 시작(1·4·7·10월 7일 무렵), 월간 수출입 동향(매월 1일), 연말 배당락(12월 마지막 거래일 하루 전).</li></ul>
+      <h5>과거 패턴 계산</h5><p><b>일정 전 5일</b> = 일정 전날 종가 ÷ 6거래일 전 종가 − 1 · <b>일정 후 5일</b> = 일정 후 4거래일 종가 ÷ 일정 전날 종가 − 1. 관련 섹터 대표 ETF(시장 전체 일정은 코스피)로 과거 약 5년간 같은 일정을 모아 평균과 상승 비율을 냅니다. 표본이 3번 미만이면 표시하지 않습니다.</p>
+      <h5>5일 전망 모델에 들어가는 값</h5><p>섹터 일정이 5거래일 안에 있는지, 시장 전체 일정이 5거래일 안에 있는지, 섹터 일정 직후인지, 실적 시즌인지 4가지를 입력으로 넣습니다.</p>
+      <h5>일정 추가하기</h5><p>GitHub 저장소에 <b>events.json</b> 파일을 만들고 <code>[{"date":"2027-05-20","name":"행사명","sectors":["반도체"]}]</code> 형식으로 적으면 다음 실행부터 반영됩니다. 섹터 이름은 표의 섹터 이름과 같게 쓰고, 시장 전체 일정은 <code>"*"</code>로 씁니다. 몇 달에 한 번 Claude에게 "일정 업데이트해줘"라고 하시면 다시 검색해서 채워 드립니다.</p>`],
+  ai:['🤖 AI 분석 버튼',()=>`<ol><li>버튼을 누르면 Claude가 이 종목의 차트 결과와 오늘 모은 뉴스 제목이 <b>입력된 상태로</b> 열립니다.</li><li><b>Enter</b>만 누르면 Claude가 최근 한 달 국내·해외(영문) 기사와 공시를 검색해 매수/관망/주의 의견을 냅니다.</li><li>입력칸이 비어 있으면 '요청 문장 복사'를 눌러 붙여넣으세요.</li></ol><p>사장님의 Claude 구독 안에서 처리되어 추가 비용이 없습니다.</p>`],
+};
+const helpDlg=document.getElementById('help');
+document.addEventListener('click',e=>{const q=e.target.closest('[data-help]');if(!q)return;e.preventDefault();e.stopPropagation();
+  const h=HELP[q.dataset.help];if(!h)return;document.getElementById('helpTitle').textContent=h[0];document.getElementById('helpBody').innerHTML=h[1]();helpDlg.showModal();},true);
+document.getElementById('helpClose').onclick=()=>helpDlg.close();
+document.getElementById('helpMore').onclick=()=>helpDlg.close();
+helpDlg.addEventListener('click',e=>{if(e.target===helpDlg)helpDlg.close();});
+
 /* ───── 시장 · 탭 ───── */
+const RLV={'안정':['ok','신규 매수 가능. 평소대로 전략을 쓰세요.'],
+  '주의':['mid','경고 신호가 하나둘 켜졌습니다. 신규 매수 금액을 평소보다 줄이고, 손절가를 꼭 지키세요.'],
+  '경계':['bad','하락 위험이 커졌습니다. 신규 매수는 평소의 절반 이하로 줄이고, 수익 난 종목은 일부 이익을 확정하는 것을 검토하세요.'],
+  '위험':['bad','하락장이 진행 중일 가능성이 큽니다. 신규 매수는 쉬고 현금 비중을 늘리는 것을 검토하세요. 손절가를 깬 종목은 미루지 말고 정리하세요.']};
+function renderRisk(){
+  const R=D.risk;if(!R){document.getElementById('risk').hidden=true;return;}
+  const [tone,act]=RLV[R.level];
+  const utone=R.up>=60?'ok':R.up>=35?'okl':'mute';
+  let msg=act;
+  if(R.score>=50&&R.up>=35)msg='하락 신호와 바닥 신호가 함께 켜졌습니다. 하락이 마무리되는 구간일 수 있으니, 바로 크게 사지 말고 지수가 20일선을 회복하는지 확인하며 조금씩 나눠 사는 것을 검토하세요.';
+  else if(R.score<25&&R.up>=60)msg='상승 신호가 강합니다. 추세 눌림목·거래량 돌파 전략이 잘 맞는 구간입니다. 손절가만 지키면서 평소 비중으로 접근해 보세요.';
+  else if(R.score<50&&R.up>=35)msg='상승 쪽 신호가 늘고 있습니다. '+act;
+  const h=R.hist,W=520,H=78,X=i=>8+i*(W-16)/Math.max(1,h.length-1),Y=v=>H-14-v/100*(H-20);
+  const spark=`<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="최근 30거래일 하락 위험과 상승 신호 점수" class="rspark">
+    ${[25,50,75].map(v=>`<line x1="8" x2="${W-8}" y1="${Y(v)}" y2="${Y(v)}" class="rg"/>`).join('')}
+    <polyline points="${h.map((p,i)=>X(i)+','+Y(p.s)).join(' ')}" class="rl dn"/>
+    <polyline points="${h.map((p,i)=>X(i)+','+Y(p.u)).join(' ')}" class="rl up"/>
+    <text x="8" y="${H-1}" class="rx">${h[0].d}</text><text x="${W-8}" y="${H-1}" class="rx" text-anchor="end">${h[h.length-1].d}</text></svg>`;
+  const tr=(now,prev,word)=>prev==null?'':now>prev?`${word} 커지는 중 (5일 전 ${prev})`:now<prev?`${word} 줄어드는 중 (5일 전 ${prev})`:`5일 전과 같음`;
+  const li=x=>`<li class="${x.on?'on':''}"><span class="ic">${x.on?'●':'○'}</span><span><em class="kd">${x.kind}</em>${esc(x.label)}${x.val?` <span class="vl">${esc(x.val)}</span>`:''}</span><b class="tn">${x.on?'+'+x.pts:''}</b></li>`;
+  const idx=Object.entries(R.idx).map(([k,v])=>`${k} ${f0(v.c)} ${pct(v.chg)} · 60일 고점 대비 ${v.dd}%`).join(' &nbsp;|&nbsp; ');
+  document.getElementById('risk').innerHTML=`
+    <div class="rtop">
+      <div class="rbadges">
+        <div class="rbadge ${tone}"><span>하락 위험 · ${R.level}</span><b class="tn">${R.score}</b><small class="tn">${tr(R.score,R.prev5,'위험')}</small></div>
+        <div class="rbadge ${utone}"><span>상승 신호 · ${R.ulevel}</span><b class="tn">${R.up}</b><small class="tn">${tr(R.up,R.uprev5,'신호')}</small></div>
+      </div>
+      <div class="rmain"><p class="ract">${msg}</p><p class="vl tn" style="text-align:left">${idx}</p></div>
+      <div class="rchart">${spark}<p class="vl" style="text-align:center;margin:0"><span class="lgd dn"></span>하락 위험 &nbsp; <span class="lgd up"></span>상승 신호 · 최근 30거래일</p></div>
+    </div>
+    <div class="rcols">
+      <div><h4>📉 하락 쪽 신호</h4><ul>${R.dn.map(li).join('')}</ul></div>
+      <div><h4>📈 상승 쪽 신호</h4><ul class="upl">${R.upl.map(li).join('')}</ul></div>
+    </div>
+    ${R.ext.length?'':'<p class="vl" style="text-align:left;margin:10px 0 0">오늘은 해외 지표를 받지 못했습니다.</p>'}`;
+}
+function cone(o){
+  const c=o.spark.filter(x=>x!=null),n=c.length,W=360,H=120,pad=6,F=5;
+  const last=c[n-1],mid=last*(1+o.er/100),hiP=mid*(1+o.band/100),loP=mid*(1-o.band/100);
+  const lo=Math.min(...c,loP),hi=Math.max(...c,hiP),X=i=>pad+i*(W-2*pad)/(n-1+F),Y=v=>H-pad-(v-lo)/(hi-lo)*(H-2*pad);
+  const up=o.p>=50;
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="${o.name} 최근 60일과 5일 예상 범위" class="cone">
+    <polygon points="${X(n-1)},${Y(last)} ${X(n-1+F)},${Y(hiP)} ${X(n-1+F)},${Y(loP)}" class="cband"/>
+    <polyline points="${c.map((v,i)=>X(i)+','+Y(v)).join(' ')}" class="cl2"/>
+    <line x1="${X(n-1)}" y1="${Y(last)}" x2="${X(n-1+F)}" y2="${Y(mid)}" class="cmid ${up?'u':'d'}"/>
+    <line x1="${X(n-1)}" x2="${X(n-1)}" y1="${pad}" y2="${H-pad}" class="cnow"/></svg>`;
+}
+function renderMacro(){
+  const M=D.macro||[],box=document.getElementById('macro');
+  if(!M.length){box.innerHTML='<div class="empty">오늘은 해외 지표를 받지 못했습니다.</div>';return;}
+  const g=M.filter(x=>x.eff>0).length,b=M.filter(x=>x.eff<0).length;
+  const eff=e=>e>0?'<span class="tr tg">주식에 유리</span>':e<0?'<span class="tr tb">주식에 불리</span>':'<span class="tr tf">중립</span>';
+  const fmtv=(k,v)=>v==null?'-':k==='us10y'?v.toFixed(2)+'%':v>=1000?f0(v):v.toFixed(2);
+  box.innerHTML=`<p class="mx-sum">${M.length}개 지표 중 <b class="pos">유리 ${g}개</b> · <b class="neg">불리 ${b}개</b> · 중립 ${M.length-g-b}개 </p>
+    <div class="tablewrap"><table class="mxtbl"><thead><tr><th>지표</th><th>최근 60일</th><th>현재</th><th>5일</th><th>20일</th><th>주식 영향</th></tr></thead><tbody>
+    ${M.map(x=>`<tr class="tn"><td class="nm"><b>${esc(x.name)}</b><span>${x.d} 기준</span></td><td>${miniSpark(x.spark)}</td><td>${fmtv(x.key,x.v)}</td><td>${pct(x.c5,1)}</td><td>${pct(x.c20,1)}</td><td>${eff(x.eff)}</td></tr>`).join('')}
+    </tbody></table></div>
+`;
+}
+function renderBrief(){
+  const B=D.brief,box=document.getElementById('brief');
+  if(!B){box.hidden=true;return;}
+  const tone=t=>t>0?'pos':t<0?'neg':'';
+  const item=x=>`<li><span class="dt tn">${esc(x.d||'')}</span>${x.en?'<span class="en">해외</span>':''}<a href="${esc(x.u)}" target="_blank" rel="noopener">${esc(x.t)}</a>${x.s?` <span class="vl">${esc(x.s)}</span>`:''}</li>`;
+  const list=(arr,empty)=>arr&&arr.length?`<ul class="bl">${arr.map(item).join('')}</ul>`:`<p class="vl" style="text-align:left;margin:0">${empty}</p>`;
+  const wk=(B.week||[]).map(e=>`<li class="${e.dday===0?'today':''}"><span class="dt tn">${e.dday===0?'오늘':e.date+'('+e.dow+')'}</span><b>${esc(e.name)}</b> <span class="vl">${e.secs.map(esc).join('·')}</span>${e.st?` <span class="vl">· 과거 일정 전 5일 ${pctS(e.st.pre)} / 후 5일 ${pctS(e.st.post)}</span>`:''}</li>`).join('');
+  box.innerHTML=`
+    <div class="bhead"><h2 style="margin:0">☀️ 오늘의 브리핑 <button class="q" data-help="brief" aria-label="설명 보기">?</button></h2><span class="vl">${B.date}(${B.dow}) 장 시작 전 · ${D.generated} 갱신</span></div>
+    <ul class="blines">${B.lines.map(l=>`<li><b>${esc(l.k)}</b><span class="${tone(l.tone)}">${esc(l.t)}</span></li>`).join('')}
+      ${(B.picks||[]).length?`<li><b>오늘 1위</b><span>${B.picks.map(p=>`${esc(p.tab)} <b>${esc(p.name)}</b>`).join(' · ')}</span></li>`:''}</ul>
+    <div class="bgrid">
+      <div class="bbox"><h4>🗓 이번 주 일정</h4>${wk?`<ul class="bl">${wk}</ul>`:'<p class="vl" style="text-align:left;margin:0">이번 주 등록된 큰 일정이 없습니다.</p>'}</div>
+      <div class="bbox"><h4>📊 실적 발표 ${B.dart?'<span class="vl">(DART 공시 + 뉴스)</span>':'<span class="vl">(뉴스)</span>'}</h4>${list(B.earnings,'최근 하루 동안 실적 관련 소식이 없습니다.')}</div>
+      <div class="bbox"><h4>🇰🇷 국내 증시 뉴스</h4>${list(B.kr,'뉴스를 받지 못했습니다.')}</div>
+      <div class="bbox"><h4>🌎 해외 증시 뉴스</h4>${list(B.gl,'뉴스를 받지 못했습니다.')}</div>
+      ${(B.sectors||[]).length?`<div class="bbox wide"><h4>🔥 움직임 큰 섹터 · 일정 임박 섹터</h4>${B.sectors.map(x=>`<div class="bsec"><span class="sb">${esc(x.sector)}</span>${x.r5!=null?` <span class="vl">5일 ${pct(x.r5,1)}</span>`:''}${x.ev?` <span class="vl">· ${esc(x.ev)}</span>`:''}${list(x.items,'')}</div>`).join('')}</div>`:''}
+    </div>`;
+}
+function checkFresh(){
+  const now=new Date(),gen=new Date((D.gen_iso||'').replace(' ','T'));
+  const wk=now.getDay()>=1&&now.getDay()<=5,today6=new Date(now.getFullYear(),now.getMonth(),now.getDate(),6,0);
+  const stale=wk&&now>=today6&&(isNaN(gen)||gen<today6);
+  const el=document.getElementById('stale');
+  if(stale){el.hidden=false;el.innerHTML=`⚠️ 아직 오늘 아침 자료로 갱신되지 않았습니다 (마지막 갱신 ${esc(D.generated)}). 평일 오전 6시 20분·7시 5분·7시 30분에 자동 갱신되며, 잠시 후 새로고침해 보세요.`;}
+  // 열려 있는 동안에도 새 버전이 올라오면 자동으로 바꿔 보여줌
+  fetch('version.json?t='+Date.now(),{cache:'no-store'}).then(r=>r.ok?r.json():null).then(v=>{
+    if(v&&v.generated&&D.gen_iso&&v.generated>D.gen_iso){const u=new URL(location.href);u.searchParams.set('v',v.generated);location.replace(u.toString());}
+  }).catch(()=>{});
+}
+function renderScore(){
+  const box=document.getElementById('score'),bt=D.bt,O=D.outlook,R=D.risk;
+  const cards=[];
+  if(bt){const rows=[3,1,2].filter(k=>bt.strat[k]).map(k=>{const v=bt.strat[k],good=v.ex5>0&&v.beat>=50;
+      return `<tr class="tn"><td><span class="tag ${STRAT[k].c}">${STRAT[k].n}</span></td><td class="${v.avg5>=0?'upc':'downc'}">${pctS(v.avg5,2)}</td><td>${v.win5}%</td><td class="${v.ex5>=0?'pos':'neg'}"><b>${pctS(v.ex5,2)}</b></td><td>${v.tgt}% / ${v.stp}%</td><td>${good?'<span class="tr tg">시장보다 나음</span>':'<span class="tr tb">시장보다 못함</span>'}</td></tr>`;}).join('');
+    cards.push(`<div class="sc wide"><h4>추천 종목 과거 성적 <span class="vl">${bt.start} ~ ${bt.end} · ${bt.n_days}개 시점 · 전략별 1~3위</span></h4>
+      <div class="tablewrap flat"><table class="sctbl"><thead><tr><th>전략</th><th>5일 평균</th><th>승률</th><th>시장 대비</th><th>목표 / 손절 도달</th><th>판정</th></tr></thead><tbody>${rows}</tbody></table></div></div>`);}
+  if(O){const good=O.hit>O.base+1;
+    cards.push(`<div class="sc"><h4>5일 전망 적중률</h4><div class="big2 tn ${good?'pos':'neg'}">${O.hit}%</div><p class="vl" style="text-align:left;margin:0">찍기 ${O.base}% · ${esc(O.model||'')} · ${O.test_from||''}~ 기간</p><p class="verdict2 ${good?'pos':'neg'}">${good?'찍기보다 조금 나음':'찍기와 비슷 · 흔들림 폭만 참고'}</p></div>`);}
+  if(R&&R.valid&&R.valid.length){const g=k=>R.valid.find(v=>v.lab===k);const a=g('경계 이상'),b=g('안정');
+    cards.push(`<div class="sc"><h4>신호등 과거 검증 <span class="vl">이후 5일 코스피</span></h4>
+      <ul class="scl tn">${R.valid.filter(v=>v.kind==='하락 위험').map(v=>`<li><span>${v.lab}</span><b class="${v.f5>=0?'upc':'downc'}">${pctS(v.f5,2)}</b><span class="vl">${v.up5}% 상승 · ${v.n}일</span></li>`).join('')}</ul>
+      ${a&&b?`<p class="verdict2 ${a.f5<b.f5?'pos':'neg'}">${a.f5<b.f5?'경계일 때 실제로 더 약했음':'경계 신호가 잘 맞지 않았음'}</p>`:''}</div>`);}
+  if(!cards.length){box.hidden=true;return;}
+  box.innerHTML=`<div class="bhead"><h2 style="margin:0">📏 이 도구의 성적표 <a class="q" href="#guide-verify" aria-label="자세히">?</a></h2><span class="vl">과거 실제 데이터로 다시 계산한 결과</span></div><div class="scgrid">${cards.join('')}</div>`;
+}
+function renderGuide(){
+  const g=document.getElementById('guideview'),bt=D.bt,O=D.outlook,R=D.risk,S=D.status||{};
+  const sec=(id,title,body)=>`<section class="gsec" id="guide-${id}"><h3>${title}</h3>${body}</section>`;
+  const st=Object.entries(S).map(([k,v])=>[`${v.ok===null?'➖':v.ok?'✅':'⚠️'} ${esc(k)}`,esc(v.detail)]);
+  const btRows=bt?[3,1,2].filter(k=>bt.strat[k]).map(k=>{const v=bt.strat[k];return [STRAT[k].n,v.n+'건',pctS(v.avg5,2),v.win5+'%',pctS(v.ex5,2),v.beat+'%',pctS(v.avg10,2),v.tgt+'%',v.stp+'%',v.top1_avg5==null?'-':pctS(v.top1_avg5,2)];}):[];
+  const toc=[['verify','성적표 · 팩트 체크'],['data','데이터 수집 상태'],['how','전체 흐름'],['picks','추천 순위'],['rules','전략별 기본 조건'],['aux','보조 지표'],['target','목표가·손절가'],['hold','내 종목 점검'],['signals','시장 방향 신호등'],['macro','글로벌 지표'],['outlook','5일 전망 모델'],['events','다가오는 일정'],['brief','오늘의 브리핑'],['ai','AI 분석·뉴스']];
+  g.innerHTML=`<a class="back" href="#">← 대시보드로 돌아가기</a><h2 style="margin-top:12px">📖 상세 설명 · 검증 결과</h2>
+    <nav class="gtoc">${toc.map(([id,t])=>`<a href="#guide-${id}">${t}</a>`).join('')}</nav>
+    ${sec('verify','📏 성적표 · 팩트 체크',
+      (bt?`<h5>추천 종목 과거 성적 (${bt.start} ~ ${bt.end}, ${bt.n_days}개 시점)</h5>
+       <p>그 기간 5거래일마다 '그날 이 프로그램이 골랐을 전략별 1~3위'를 다시 계산해, <b>다음 날 시가에 샀다고 가정</b>하고 성적을 쟀습니다. 시장 대비 = 같은 기간 필터를 통과한 전 종목 중간값과의 차이(그 기간 시장 5일 평균 ${pctS(bt.bench,2)}). 목표/손절 도달 = 10거래일 안에 1차 목표와 손절가 중 먼저 닿은 쪽.</p>
+       ${T(btRows,['전략','표본','5일 평균','승률','시장 대비','시장 이긴 비율','10일 평균','목표 도달','손절 도달','1위만 5일'])}
+       <p class="vl" style="text-align:left">과거 수급·실적·매물대 자료가 없어 그 부분은 빼고 계산한 단순화 버전입니다. 거래 비용(수수료·세금 약 0.2%)은 빼지 않았습니다. 6개월은 짧은 기간이라 시장 상황이 바뀌면 결과도 달라질 수 있습니다.</p>`:'<p>과거 성적을 계산하지 못했습니다.</p>')+
+      (O?`<h5>5일 전망 모델</h5><p>모델 후보 중간 기간 성적: ${Object.entries(O.va||{}).map(([k,v])=>`${esc(k)} ${v}%`).join(' · ')} → <b>${esc(O.model)}</b> 선택. 마지막 기간(${esc(O.test_from)}~) 적중률 <b>${O.hit}%</b>, 찍기 ${O.base}%.</p>
+       ${(O.calib||[]).length?T(O.calib.map(c=>[c.lab,c.n+'건',c.up+'%',pctS(c.ret,2)]),['모델이 말한 상승 확률','표본','실제 상승 비율','실제 5일 평균']):''}
+       <p class="vl" style="text-align:left">모델이 "55% 이상"이라고 한 구간에서 실제 상승 비율이 더 높고, "45% 미만" 구간에서 더 낮아야 믿을 만한 모델입니다.</p>`:'')+
+      (R&&R.valid&&R.valid.length?`<h5>시장 방향 신호등 (${esc(R.vperiod)})</h5>${T(R.valid.map(v=>[v.kind,v.lab,v.n+'일',pctS(v.f5,2),v.up5+'%',v.f20==null?'-':pctS(v.f20,2)]),['점수','단계','일수','이후 5일 코스피','5일 상승 비율','이후 20일'])}
+       <p class="vl" style="text-align:left">시장 폭(20일선 위 종목 비율) 자료가 1년치뿐이라 표본이 적습니다. 참고용으로 보세요.</p>`:''))}
+    ${sec('data','📡 데이터 수집 상태 (오늘)',T(st,['출처','결과'])+'<p class="vl" style="text-align:left">모두 무료 공개 데이터입니다. ⚠️가 있으면 그 항목은 오늘 빠졌거나 대체 자료로 계산했습니다.</p>')}
+    ${sec('how','전체 흐름',helpHow())}
+    ${sec('picks',HELP.picks[0],HELP.picks[1]())}
+    ${sec('rules','전략별 기본 조건',[3,1,2].map(k=>`<h5 class="${STRAT[k].c}">${STRAT[k].n}</h5>${RULE(k)}`).join(''))}
+    ${['aux','target','hold','signals','macro','outlook','events','brief'].map(k=>sec(k,HELP[k][0],HELP[k][1]())).join('')}
+    ${sec('ai','AI 분석 · 뉴스',HELP.ai[1]()+HELP.news[1]())}
+    <p class="vl" style="text-align:left;margin-top:20px">이 도구의 모든 결과는 참고 자료이며 수익을 보장하지 않습니다. 투자 판단과 책임은 본인에게 있습니다.</p>`;
+}
+const SEV={bad:['🔴','수정 필요'],warn:['🟠','점검 권장'],info:['🔵','참고'],ok:['🟢','양호']};
+function revPrompt(){
+  const rv=D.review,ts=D.tips||[];
+  const st=rv?Object.entries(rv.strat).map(([k,v])=>`${STRAT[k].n}: 다음날 ${v.n1}건 평균 ${pctS(v.avg1,2)}, 시장대비 ${pctS(v.ex1,2)}, 승률 ${v.win1}%`+(v.n5?` / 5일 ${v.n5}건 평균 ${pctS(v.avg5,2)}, 시장대비 ${pctS(v.ex5,2)}, 목표 ${v.tgt}%·손절 ${v.stp}%`:'')).join('\n'):'';
+  return `내 주식 대시보드(stock_dashboard.py)의 예측 기록과 실제 결과를 비교한 점검 결과야.\n기록 ${rv?rv.n_snap:0}일치 (${rv?rv.first:''}~${rv?rv.last:''})\n${st}\n`+
+    (rv&&rv.ol?`5일 전망: ${rv.ol.n}건 적중 ${rv.ol.hit}%, 흔들림 범위 안 ${rv.ol.inband}%\n`:'')+
+    `자동 진단:\n${ts.map(t=>`- [${SEV[t.sev][1]}] ${t.title}: ${t.detail}${t.fix?` → 제안: ${t.fix}`:''}`).join('\n')}\n\n`+
+    `이 결과를 보고 프로그램에서 무엇을 어떻게 고치면 좋을지 우선순위대로 정리해 주고, stock_dashboard.py에서 바꿔야 할 부분(조건 기준값, 점수, 함수)을 구체적으로 알려줘.`;
+}
+function renderRevLink(){
+  const rv=D.review,ts=D.tips||[],box=document.getElementById('revlink');
+  const last=rv&&rv.daylog&&rv.daylog.length?rv.daylog[rv.daylog.length-1]:null;
+  const main=ts.filter(t=>t.sev!=='ok').slice(0,2);
+  box.innerHTML=`<div class="bhead"><h2 style="margin:0">🔧 프로그램 점검</h2><a class="btn" href="#review">점검 페이지 열기 →</a></div>
+    <div class="rlrow">${last?`<div><span class="vl">어제(${last.day}) 추천 1~3위 ${last.n}종목</span><b class="tn ${last.avg1>=0?'upc':'downc'}">${pctS(last.avg1,2)}</b><span class="vl">시장 ${pctS(last.b1,2)} · 승률 ${last.win1}%</span></div>`:'<div><span class="vl">예측 기록을 쌓는 중입니다.</span></div>'}
+      ${main.length?`<ul class="tips mini">${main.map(t=>`<li class="${t.sev}"><span>${SEV[t.sev][0]}</span><b>${esc(t.title)}</b></li>`).join('')}</ul>`:'<p class="vl" style="margin:0">지금은 수정이 필요한 항목이 없습니다.</p>'}</div>`;
+}
+function renderReview(){
+  const g=document.getElementById('reviewview'),rv=D.review,ts=D.tips||[];
+  const tipsH=`<ul class="tips">${ts.map(t=>`<li class="${t.sev}"><div class="th"><span>${SEV[t.sev][0]} ${SEV[t.sev][1]}</span><b>${esc(t.title)}</b></div><div class="vl" style="text-align:left">${esc(t.detail)}</div>${t.fix?`<div class="fix">제안 · ${esc(t.fix)}</div>`:''}</li>`).join('')}</ul>`;
+  let body='';
+  if(rv&&rv.n_snap){
+    const L=rv.latest||[],ld=rv.daylog[rv.daylog.length-1];
+    const latestH=L.length?`<div class="tablewrap"><table class="revtbl"><thead><tr><th>전략</th><th>종목</th><th>예측 (목표 / 손절)</th><th>시가 매수 → 종가</th><th>시장 대비</th><th>지금까지</th><th>결과</th></tr></thead><tbody>
+      ${L.filter(x=>x.rank<=3).map(x=>`<tr class="tn"><td><span class="tag ${STRAT[x.k].c}">${STRAT[x.k].n} ${x.rank}위</span></td><td class="nm"><b>${esc(x.name)}</b><span>${x.code}</span></td>
+        <td>${f0(x.t1)} / ${f0(x.stop)}<br><span class="vl">매수가 ${f0(x.entry)}</span></td><td class="${x.r1>=0?'upc':'downc'}"><b>${pctS(x.r1,2)}</b></td><td class="${x.ex1>=0?'pos':'neg'}">${pctS(x.ex1,2)}</td>
+        <td class="${x.now>=0?'upc':'downc'}">${pctS(x.now,2)} <span class="vl">(${x.held}일)</span></td><td>${x.out==='목표'?'<span class="tr tg">목표 도달</span>':x.out==='손절'?'<span class="tr tb">손절 도달</span>':'<span class="tr tf">진행 중</span>'}</td></tr>`).join('')}</tbody></table></div>`:'';
+    const S=rv.strat,cum=Object.keys(S).length?`<div class="tablewrap"><table class="revtbl"><thead><tr><th>전략</th><th>다음 날 (건수)</th><th>평균</th><th>승률</th><th>시장 대비</th><th>5일 (건수)</th><th>5일 평균</th><th>시장 대비</th><th>목표 / 손절</th></tr></thead><tbody>
+      ${[3,1,2].filter(k=>S[k]).map(k=>{const v=S[k];return `<tr class="tn"><td><span class="tag ${STRAT[k].c}">${STRAT[k].n}</span></td><td>${v.n1}</td><td class="${v.avg1>=0?'upc':'downc'}">${pctS(v.avg1,2)}</td><td>${v.win1}%</td><td class="${v.ex1>=0?'pos':'neg'}"><b>${pctS(v.ex1,2)}</b></td>
+        <td>${v.n5}</td><td>${v.avg5==null?'-':pctS(v.avg5,2)}</td><td>${v.ex5==null?'-':`<b class="${v.ex5>=0?'pos':'neg'}">${pctS(v.ex5,2)}</b>`}</td><td>${v.tgt==null?'-':v.tgt+'% / '+v.stp+'%'}</td></tr>`;}).join('')}</tbody></table></div>`:'';
+    const O=rv.ol,olH=O?`<div class="revkpi tn"><div><span class="vl">검증된 예측</span><b>${O.n}건</b></div><div><span class="vl">방향 적중</span><b class="${O.hit>=50?'pos':'neg'}">${O.hit}%</b></div><div><span class="vl">흔들림 범위 안</span><b>${O.inband}%</b><span class="vl">기대 약 68%</span></div>
+      <div><span class="vl">'55% 이상'이라 한 때 실제 상승</span><b>${O.up_hi==null?'-':O.up_hi+'%'}</b><span class="vl">${O.n_hi}건</span></div><div><span class="vl">'45% 미만'이라 한 때 실제 상승</span><b>${O.up_lo==null?'-':O.up_lo+'%'}</b><span class="vl">${O.n_lo}건</span></div></div>
+      ${(rv.latest_ol||[]).length?`<div class="tablewrap"><table class="revtbl"><thead><tr><th>대상</th><th>예측 (오를 확률)</th><th>예상 흔들림</th><th>실제 5일</th><th>방향</th><th>범위</th></tr></thead><tbody>${rv.latest_ol.map(x=>`<tr class="tn"><td><b>${esc(x.name)}</b></td><td>${x.p}%</td><td>${pctS(x.er,2)} ± ${x.band}%</td><td class="${x.act>=0?'upc':'downc'}">${pctS(x.act,2)}</td><td>${x.hit?'✅ 맞음':'❌ 틀림'}</td><td>${x.inband?'안':'밖'}</td></tr>`).join('')}</tbody></table></div><p class="vl" style="text-align:left">${esc(rv.latest_ol[0].asof)} 아침 예측 → 5거래일 뒤 결과</p>`:''}`:'<p class="vl" style="text-align:left">5거래일이 지난 예측이 아직 없습니다.</p>';
+    const R=rv.rk,rkH=R?`<p>위험 50점 이상이던 날(${R.n_hi}일) 다음 5일 코스피 ${R.hi==null?'-':pctS(R.hi,2)} · 25점 미만이던 날(${R.n_lo}일) ${R.lo==null?'-':pctS(R.lo,2)}</p>`:'<p class="vl" style="text-align:left">5거래일이 지난 기록이 아직 없습니다.</p>';
+    const log=`<div class="tablewrap"><table class="revtbl"><thead><tr><th>예측한 날 (기준일)</th><th>결과 날</th><th>추천 1~3위 평균</th><th>승률</th><th>시장</th></tr></thead><tbody>${rv.daylog.slice().reverse().map(d=>`<tr class="tn"><td>${d.asof}</td><td>${d.day}</td><td class="${(d.avg1||0)>=0?'upc':'downc'}"><b>${d.avg1==null?'-':pctS(d.avg1,2)}</b></td><td>${d.win1==null?'-':d.win1+'%'}</td><td>${pctS(d.b1,2)}</td></tr>`).join('')}</tbody></table></div>`;
+    body=`${ld?`<section class="gsec"><h3>어제 예측 vs 실제 <span class="vl">${ld.asof} 아침 추천 → ${ld.day} 결과</span></h3>${latestH}</section>`:''}
+      <section class="gsec"><h3>추천 종목 누적 성적 <span class="vl">${rv.first} ~ ${rv.last} · ${rv.n_snap}일치</span></h3>${cum}</section>
+      <section class="gsec"><h3>5일 전망 검증</h3>${olH}</section>
+      <section class="gsec"><h3>시장 신호등 검증</h3>${rkH}</section>
+      <section class="gsec"><h3>날짜별 기록</h3>${log}</section>`;
+  }
+  g.innerHTML=`<a class="back" href="#">← 대시보드로 돌아가기</a><h2 style="margin-top:12px">🔧 프로그램 점검 · 수정 제안</h2>
+    <p class="vl" style="text-align:left">매일 마지막 장전 갱신(보통 7시 30분) 때의 추천 종목·5일 전망·신호등을 저장하고, 다음 날 아침 실제 결과와 비교합니다. 추천 종목은 '그날 시가에 샀다면'으로 계산합니다.${D.demo?' (미리보기: 과거 시점을 다시 계산한 가상 기록)':''}</p>
+    <section class="gsec"><h3>자동 진단 · 수정 제안</h3>${tipsH}
+      <div class="aibox aibtn" style="margin-top:10px"><p><b style="color:var(--ink)">🤖 Claude에게 수정 방법 받기</b><br>위 결과가 입력된 채로 Claude가 열립니다. Enter를 누르면 고칠 부분과 방법을 구체적으로 알려드립니다.</p>
+      <a class="btn ai" href="${claudeURL(revPrompt(),null)}" target="_blank" rel="noopener">🤖 수정 방법 받기</a></div></section>
+    ${body}`;
+}
+function renderEvents(){
+  const box=document.getElementById('events'),E=(D.outlook&&D.outlook.events)||[];
+  if(!E.length){box.innerHTML='<div class="empty">앞으로 45일 안에 등록된 일정이 없습니다.</div>';return;}
+  const pat=(v,up,lab)=>v==null?'':`<span class="evp"><span class="vl">${lab}</span> ${pct(v,1)} <span class="vl">· ${up}% 상승</span></span>`;
+  box.innerHTML=`<div class="tablewrap"><table class="evtbl"><thead><tr><th>날짜</th><th>일정</th><th>관련</th><th>과거 패턴</th></tr></thead><tbody>
+    ${E.map(e=>`<tr class="tn ${e.dday<=5?'soon':''}"><td><b>${e.date}</b> <span class="vl">(${e.dow})</span><br><span class="dd">${e.dday===0?'오늘':'D-'+e.dday}</span></td>
+      <td><b>${esc(e.name)}</b>${e.tent||e.note?`<br><span class="vl">${e.tent?'예상 날짜':''}${e.note&&!e.tent?esc(e.note):''}</span>`:''}</td>
+      <td>${e.secs.map(x=>`<span class="sb">${esc(x)}</span>`).join(' ')}</td>
+      <td>${e.st?`${pat(e.st.pre,e.st.pre_up,'일정 전 5일')}<br>${pat(e.st.post,e.st.post_up,'일정 후 5일')}<br><span class="vl">${esc(e.st.target)} 기준 · 과거 ${e.st.n}번</span>`:'<span class="vl">과거 자료 부족</span>'}</td></tr>`).join('')}
+    </tbody></table></div>`;
+}
+function renderOutlook(){
+  const O=D.outlook,box=document.getElementById('outlook');
+  if(!O){box.innerHTML='<div class="empty">오늘은 지수·섹터 데이터를 받지 못해 5일 전망을 계산하지 못했습니다.</div>';return;}
+  const weak=O.hit<=O.base+1;
+  const pbar=p=>{const q=Math.max(0,Math.min(100,50+(p-50)*3));return `<div class="pbar" title="50%가 가운데"><i style="left:${Math.min(q,50)}%;width:${Math.abs(q-50)}%" class="${p>=50?'u':'d'}"></i><s></s></div>`;};
+  const word=p=>p>=60?'상승 우세':p>=53?'약한 상승':p>48?'방향 불분명':p>40?'약한 하락':'하락 우세';
+  const tcls=t=>t==='상승'?'tu':t==='하락'?'td':'tf';
+  box.innerHTML=`
+    <div class="olk-note ${weak?'weak':''}">검증 적중률 <b>${O.hit}%</b> <span class="vl">· 찍기 ${O.base}%</span> ${weak?'<span class="chip">방향은 참고만 · 흔들림 폭 위주로</span>':'<span class="chip">참고용</span>'}</div>
+    <div class="olk-idx">${O.idx.map(o=>`<div class="oi"><div class="oh"><b>${o.name}</b><span class="tn">${f0(o.last)}</span><span class="tr ${tcls(o.trend)}">${o.trend} 추세</span></div>
+      ${cone(o)}
+      <div class="op tn"><div><span class="vl">5일 뒤 오를 확률</span><b class="${o.p>=50?'upc':'downc'}">${o.p}%</b> <small>${word(o.p)}</small></div>
+      <div><span class="vl">과거 비슷한 때 평균</span><b>${pctS(o.er,2)}</b></div><div><span class="vl">예상 흔들림 (68%)</span><b>±${o.band}%</b></div></div></div>`).join('')}</div>
+    <h3 class="sec">섹터별 추세와 5일 전망</h3>
+    <div class="tablewrap"><table class="sectbl"><thead><tr><th>섹터</th><th>최근 60일</th><th>현재 추세</th><th>5일 / 20일</th><th>코스피 대비</th><th>5일 뒤 오를 확률</th><th>예상 흔들림</th><th>다가오는 일정</th></tr></thead><tbody>
+    ${O.sec.map(o=>`<tr class="tn"><td class="nm"><b>${esc(o.name)}</b><span>${esc(o.etf)}</span></td><td>${miniSpark(o.spark)}</td>
+      <td><span class="tr ${tcls(o.trend)}">${o.trend}</span></td><td>${pct(o.r5,1)} / ${pct(o.r20,1)}</td><td>${o.rs==null?'-':pct(o.rs,1)}</td>
+      <td><div class="pcell">${pbar(o.p)}<b class="${o.p>=50?'upc':'downc'}">${o.p}%</b></div></td><td>±${o.band}%</td><td class="vl">${esc(o.next_ev||'')}</td></tr>`).join('')}</tbody></table></div>
+`;
+}
+function miniSpark(arr){const c=arr.filter(x=>x!=null);if(c.length<2)return '';const W=90,H=26,lo=Math.min(...c),hi=Math.max(...c);
+  return `<svg viewBox="0 0 ${W} ${H}" width="90" height="26" aria-hidden="true"><polyline points="${c.map((v,i)=>(i*(W-2)/(c.length-1)+1)+','+(H-2-(v-lo)/((hi-lo)||1)*(H-4))).join(' ')}" class="ms ${c[c.length-1]>=c[0]?'u':'d'}"/></svg>`;}
 function renderPulse(){
   const B=D.breadth;
   const regime=B.above20>=60?['상승 우위','추세 눌림목·거래량 돌파가 잘 맞는 장입니다.']:B.above20>=45?['중립','추세 눌림목 위주로, 종목 수를 줄이세요.']:['약세','과매도 반등 위주로, 비중을 줄이세요.'];
@@ -1598,13 +3135,13 @@ function tgHTML(x){const t=x.tg;return `<dl class="tgbox tn">
   <div><dt>1차 목표</dt><dd class="upc">${f0(t.t1)}<small>${pctS(t.t1p)}</small></dd></div>
   <div><dt>2차 목표</dt><dd class="upc">${f0(t.t2)}<small>${pctS(t.t2p)}</small></dd></div>
   <div><dt>손절 · ${esc(t.stop_label)}</dt><dd class="downc">${f0(t.stop)}<small>${pctS(t.sp)}</small></dd></div>
-  <div class="rr"><span>손익비 <b>1 : ${t.rr==null?'-':t.rr.toFixed(1)}</b></span><span class="vl">${esc(t.note||'')}</span></div></dl>`;}
+  <div class="rr"><span>손익비 <b>1 : ${t.rr==null?'-':t.rr.toFixed(1)}</b> <button class="q" data-help="target" aria-label="설명 보기">?</button></span><span class="vl">${esc(t.note||'')}</span></div></dl>`;}
 function aiHTML(x){
   return aiSlot({prompt:x.prompt,code:x.code,kind:'pick',key:`ai:${D.asof}:${x.code}:p${x.strat}`,score:x.score,pre:x.ai||null});
 }
 function renderPanel(){
   const tab=D.tabs.find(t=>t.k===current),st=tab.stocks;
-  document.getElementById('tabdesc').textContent=STRAT[current].d+(tab.loss?` (적자 기업 ${tab.loss}개는 제외했습니다.)`:'');
+  document.getElementById('tabdesc').innerHTML=(D.risk&&D.risk.score>=50?`<span class="rwarn">⚠️ 시장 위험 '${D.risk.level}' 단계입니다. 아래 종목도 매수 금액을 크게 줄여서 보세요.</span><br>`:'')+esc(STRAT[current].d+(tab.loss?` (적자 기업 ${tab.loss}개는 제외했습니다.)`:''));
   const picks=st.slice(0,3),watch=st.slice(3,6),rest=st.slice(6);
   let h='';
   h+='<h3 class="sec">매수 후보 1–3위</h3>';
@@ -1615,11 +3152,11 @@ function renderPanel(){
         <span class="tag ${STRAT[x.strat].c}">${STRAT[x.strat].n}</span>
         <div class="name">${esc(x.name)} <span class="code tn">${x.code} ${x.market}</span></div>
         <div class="price tn">${f0(x.close)}<span>${pct(x.chg)}</span></div>
-        <div class="lbl">📊 차트 분석 결론</div>
+        <div class="lbl">📊 차트 분석 결론 <button class="q" data-help="picks" aria-label="설명 보기">?</button></div>
         ${scoreHTML(x)}
         ${tgHTML(x)}
-        <div class="lbl">기본 조건</div>${checksHTML(x.checks)}
-        <div class="lbl">보조 지표 가감점</div>${auxHTML(x.aux)}
+        <div class="lbl">기본 조건 <button class="q" data-help="rules${x.strat}" aria-label="설명 보기">?</button></div>${checksHTML(x.checks)}
+        <div class="lbl">보조 지표 가감점 <button class="q" data-help="aux" aria-label="설명 보기">?</button></div>${auxHTML(x.aux)}
         <dl class="kv tn">
           <div><dt>거래대금</dt><dd>${won(x.amount)}</dd></div>
           <div><dt>시가총액</dt><dd>${won(x.mcap)}</dd></div>
@@ -1692,14 +3229,14 @@ async function fetchSnap(code){
   if(PENDING[code])return;PENDING[code]=1;
   try{const j=await relay('/chart?code='+code);SNAP[code]=computeSnap(j,NAMES[code]||code);}
   catch(e){SNAP[code]=null;PENDING[code]='err:'+e.message;}
-  renderHolds();
+  rerender();
 }
 function findCode(q){q=q.trim();if(!q)return null;if(NAMES[q])return q;const m=q.match(/\((\w{6})\)/);if(m&&NAMES[m[1]])return m[1];
   if(/^[0-9A-Z]{6}$/.test(q)&&AI_URL)return q;
   if(byName[q])return byName[q];const k=Object.keys(byName).find(n=>n.replace(/\s/g,'')===q.replace(/\s/g,''));return k?byName[k]:null;}
 
 function analyzeHolding(code,qty,avg){
-  const [name,mk,c,chg,ma20,ma60,slope,bbu,bbl,rsi,atr0,h0,h1,hi20,lo20,hi60,res,sup,pick,rs,fhi,flo,fup]=snapOf(code);
+  const [name,mk,c,chg,ma20,ma60,slope,bbu,bbl,rsi,atr0,h0,h1,hi20,lo20,hi60,res,sup,pick,rs,fhi,flo,fup,patt]=snapOf(code);
   const atr=atr0||c*.03,pl=(c/avg-1)*100,plAmt=(c-avg)*qty;
   const pb=(bbu&&bbl&&bbu>bbl)?(c-bbl)/(bbu-bbl):null;
   const up=ma20&&ma60&&c>ma20&&ma20>ma60&&slope>0, down=ma60&&c<ma60&&slope<0;
@@ -1720,6 +3257,7 @@ function analyzeHolding(code,qty,avg){
     const below=lv.filter(x=>x[1]<c).sort((a,b)=>b[1]-a[1])[0],above=lv.filter(x=>x[1]>c).sort((a,b)=>a[1]-b[1])[0];
     why.push(`피보나치(최근 120일 ${fup?'상승':'하락'} 파동): `+[below?`아래 지지 ${f0(below[1])}원(${(below[0]*100).toFixed(1)}%)`:'',above?`위 저항 ${f0(above[1])}원(${(above[0]*100).toFixed(1)}%)`:''].filter(Boolean).join(', ')+'.');
   }
+  if(patt&&patt!=='없음')why.push(`세력 패턴(최근 20일): ${patt}${patt.includes('이탈')?' — 큰손이 빠져나간 흔적일 수 있어 주의가 필요합니다.':' — 큰손이 사 모은 흔적으로 볼 수 있습니다.'}`);
   if(pick)why.push(`오늘 매수 후보 목록에 있습니다: ${pick}.`);
   let v,tone,plan;
   if(down&&h0!=null&&h0<0&&!macdUp){v=pl<0?'손절 검토':'이익 보호 매도';tone='no';plan=pl<0?`하락 추세가 이어지고 있습니다. 반등 시 ${f0(Math.min(ma20||t1,t1))}원 부근에서 비중을 줄이고, ${f0(stop)}원을 깨면 정리하는 것을 검토하세요.`:'수익이 남아 있을 때 일부(1/2)를 정리하고, 나머지는 손절가 이탈 시 정리하는 방법을 검토하세요.';}
@@ -1750,68 +3288,111 @@ function holdPrompt(r){
     `최근 한 달 주요 이슈를 날짜순으로 정리하고, 차트 점검 결과와 같은 방향인지 확인해줘. `+
     `보유 / 일부 매도 / 전량 매도 중 어떤 전략이 좋을지 근거 3가지, 주요 리스크, 참고 기사 링크와 함께 알려줘.`;
 }
-function renderHolds(){
-  const list=loadH(),box=document.getElementById('holds');
-  if(!list.length){box.innerHTML='<div class="empty" style="margin-top:14px">아직 저장된 종목이 없습니다. 위에 종목과 수량, 평균 매입가를 넣고 <b>점검하고 저장</b>을 눌러 보세요.</div>';return;}
-  box.innerHTML=list.map((h,idx)=>{
-    if(!snapOf(h.code)){
-      const nm=esc(NAMES[h.code]||h.code),st=PENDING[h.code];
-      if(AI_URL&&!st)setTimeout(()=>fetchSnap(h.code),0);
-      const msg=!AI_URL?'오늘 아침 시세 수집에서 빠진 종목이라 차트 점검을 할 수 없습니다. 내일 아침 갱신 때 다시 나타나는지 확인해 주세요. 아래 AI 분석은 지금도 쓸 수 있습니다.':
-        (typeof st==='string'&&st.startsWith('err:'))?'시세를 불러오지 못했습니다: '+esc(st.slice(4)):'시세를 불러오는 중입니다…';
-      const bp=`한국 주식 ${NAMES[h.code]||h.code}(${h.code})을 ${f0(h.qty)}주, 평균 ${f0(h.avg)}원에 보유하고 있어. `+
-        `현재 주가와 최근 차트 흐름(20일선·60일선, RSI, 거래량), 최근 한 달 국내 뉴스·공시와 Reuters·Bloomberg 같은 해외 영문 기사(영문은 한국어로 요약)를 웹에서 검색해서 `+
-        `최근 한 달 주요 이슈를 날짜순으로 정리하고, 보유 / 일부 매도 / 전량 매도 중 어떤 전략이 좋을지 손절가·목표가, 근거 3가지, 리스크, 참고 기사 링크와 함께 알려줘.`;
-      return `<div class="hold"><div><div class="hdr"><div><b>${nm}</b> <span class="code">${esc(h.code)}</span> · ${f0(h.qty)}주 · 평단 ${f0(h.avg)}</div><button class="rm" data-rm="${idx}">삭제</button></div>
-        <p class="vl" style="text-align:left;margin:8px 0 0">${msg}</p></div><div>${aiSlot({prompt:bp,code:h.code,kind:'hold',key:`ai:${D.asof}:${h.code}:hx`,tone:'mid'})}</div></div>`;
-    }
-    const r=analyzeHolding(h.code,h.qty,h.avg);
-    const row=(l,p,why)=>`<tr><td>${l}<br><small class="vl" style="text-align:left">${why}</small></td><td>${f0(p)}</td><td>${pctS((p/r.c-1)*100)}</td><td class="${p>=r.avg?'upc':'downc'}">${(p-r.avg)*r.qty>=0?'+':''}${f0((p-r.avg)*r.qty)}원</td></tr>`;
-    return `<article class="hold">
-      <div>
-        <div class="hdr"><div><div class="name" style="margin:0">${esc(r.name)} <span class="code tn">${r.code} ${r.mk}</span></div>
-          <div class="price tn">${f0(r.c)}<span>${pct(r.chg)}</span></div></div><button class="rm" data-rm="${idx}">삭제</button></div>
-        <dl class="pos-grid tn">
-          <div><dt>보유</dt><dd>${f0(r.qty)}주 · 평단 ${f0(r.avg)}</dd></div>
-          <div><dt>평가금액</dt><dd>${f0(r.val)}원</dd></div>
-          <div><dt>평가손익</dt><dd class="${r.pl>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</dd></div>
-          <div><dt>수익률</dt><dd class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,2)}</dd></div>
-        </dl>
-        <div class="hv"><div class="lab">📊 차트 기준 전략</div><div class="val ${r.tone}">${r.v}</div></div>
-        <div class="plan"><b>실행 계획 (예시)</b>${r.plan}${r.tips.map(t=>`<br>· ${t}`).join('')}</div>
-        <div style="margin-top:12px">${aiSlot({prompt:holdPrompt(r),code:r.code,kind:'hold',key:`ai:${D.asof}:${r.code}:h${r.qty}:${r.avg}`,tone:r.tone==='no'?'bad':r.tone})}</div>
-      </div>
-      <div>
-        ${lvBar(r)}
-        <table class="lvtable tn"><thead><tr><th>가격</th><th>원</th><th>현재가 대비</th><th>그때 손익</th></tr></thead><tbody>
-          ${row('2차 목표',r.t2,'')}${row('1차 목표',r.t1,'')}${row('손절 참고',r.stop,r.stopWhy)}</tbody></table>
-        <div class="lbl">판단 근거</div><ul class="why">${r.why.map(w=>`<li>${esc(w)}</li>`).join('')}</ul>
-        ${newsHTML(r.code,4)}
-      </div></article>`;
-  }).join('');
-  box.querySelectorAll('[data-rm]').forEach(b=>b.onclick=()=>{const l=loadH();l.splice(+b.dataset.rm,1);saveH(l);renderHolds();});
+function holdCard(h,saved){
+  const act=saved?`<button class="rm" data-rm="${h.code}">저장 목록에서 삭제</button>`:`<button class="btn ghost sm" data-save="1">이 종목 저장</button>`;
+  if(!snapOf(h.code)){
+    const nm=esc(NAMES[h.code]||h.code),st=PENDING[h.code];
+    if(AI_URL&&!st)setTimeout(()=>fetchSnap(h.code),0);
+    const msg=!AI_URL?'오늘 아침 시세 수집에서 빠진 종목이라 차트 점검을 할 수 없습니다. 내일 아침 갱신 때 다시 확인해 주세요. 아래 AI 분석은 지금도 쓸 수 있습니다.':
+      (typeof st==='string'&&st.startsWith('err:'))?'시세를 불러오지 못했습니다: '+esc(st.slice(4)):'시세를 불러오는 중입니다…';
+    const bp=`한국 주식 ${NAMES[h.code]||h.code}(${h.code})을 ${f0(h.qty)}주, 평균 ${f0(h.avg)}원에 보유하고 있어. `+
+      `현재 주가와 최근 차트 흐름(20일선·60일선, RSI, 거래량), 최근 한 달 국내 뉴스·공시와 Reuters·Bloomberg 같은 해외 영문 기사(영문은 한국어로 요약)를 웹에서 검색해서 `+
+      `최근 한 달 주요 이슈를 날짜순으로 정리하고, 보유 / 일부 매도 / 전량 매도 중 어떤 전략이 좋을지 손절가·목표가, 근거 3가지, 리스크, 참고 기사 링크와 함께 알려줘.`;
+    return `<div class="hold"><div><div class="hdr"><div><b>${nm}</b> <span class="code">${esc(h.code)}</span> · ${f0(h.qty)}주 · 평단 ${f0(h.avg)}</div><span class="acts">${act}</span></div>
+      <p class="vl" style="text-align:left;margin:8px 0 0">${msg}</p></div><div>${aiSlot({prompt:bp,code:h.code,kind:'hold',key:`ai:${D.asof}:${h.code}:hx`,tone:'mid'})}</div></div>`;
+  }
+  const r=analyzeHolding(h.code,h.qty,h.avg);
+  const row=(l,p,why)=>`<tr><td>${l}<br><small class="vl" style="text-align:left">${why}</small></td><td>${f0(p)}</td><td>${pctS((p/r.c-1)*100)}</td><td class="${p>=r.avg?'upc':'downc'}">${(p-r.avg)*r.qty>=0?'+':''}${f0((p-r.avg)*r.qty)}원</td></tr>`;
+  return `<article class="hold">
+    <div>
+      <div class="hdr"><div><div class="name" style="margin:0">${esc(r.name)} <span class="code tn">${r.code} ${r.mk}</span></div>
+        <div class="price tn">${f0(r.c)}<span>${pct(r.chg)}</span></div></div><span class="acts">${act}</span></div>
+      <dl class="pos-grid tn">
+        <div><dt>보유</dt><dd>${f0(r.qty)}주 · 평단 ${f0(r.avg)}</dd></div>
+        <div><dt>평가금액</dt><dd>${f0(r.val)}원</dd></div>
+        <div><dt>평가손익</dt><dd class="${r.pl>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</dd></div>
+        <div><dt>수익률</dt><dd class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,2)}</dd></div>
+      </dl>
+      <div class="hv"><div class="lab">📊 차트 기준 전략 <button class="q" data-help="hold" aria-label="설명 보기">?</button></div><div class="val ${r.tone}">${r.v}</div></div>
+      <div class="plan"><b>실행 계획 (예시)</b>${r.plan}${r.tips.map(t=>`<br>· ${t}`).join('')}</div>
+      <div style="margin-top:12px">${aiSlot({prompt:holdPrompt(r),code:r.code,kind:'hold',key:`ai:${D.asof}:${r.code}:h${r.qty}:${r.avg}`,tone:r.tone==='no'?'bad':r.tone})}</div>
+    </div>
+    <div>
+      ${lvBar(r)}
+      <table class="lvtable tn"><thead><tr><th>가격</th><th>원</th><th>현재가 대비</th><th>그때 손익</th></tr></thead><tbody>
+        ${row('2차 목표',r.t2,'')}${row('1차 목표',r.t1,'')}${row('손절 참고',r.stop,r.stopWhy)}</tbody></table>
+      <div class="lbl">판단 근거</div><ul class="why">${r.why.map(w=>`<li>${esc(w)}</li>`).join('')}</ul>
+      ${newsHTML(r.code,4)}
+    </div></article>`;
 }
+let CHECK=null, MYSEL=null;
+const isSaved=code=>loadH().some(h=>h.code===code);
+function renderCheck(){
+  document.getElementById('checkResult').innerHTML=CHECK?holdCard(CHECK,isSaved(CHECK.code)):'';
+}
+function renderMyLink(){
+  const n=loadH().length,a=document.getElementById('mylink');
+  a.hidden=!n;a.innerHTML=`<b>📁 저장한 내 종목 ${n}개</b><span>한눈에 보기 →</span>`;
+}
+function renderMy(){
+  const list=loadH(),box=document.getElementById('myview');
+  if(MYSEL&&!list.some(h=>h.code===MYSEL))MYSEL=null;
+  let tot=0,cost=0;
+  const rows=list.map(h=>{
+    if(!snapOf(h.code)){
+      if(AI_URL&&!PENDING[h.code])setTimeout(()=>fetchSnap(h.code),0);
+      return `<tr data-sel="${h.code}" class="${MYSEL===h.code?'sel':''}"><td class="nm"><b>${esc(NAMES[h.code]||h.code)}</b><span>${h.code}</span></td><td>${f0(h.qty)}주 · ${f0(h.avg)}</td><td>-</td><td>-</td><td>-</td><td class="vl">데이터 없음</td></tr>`;}
+    const r=analyzeHolding(h.code,h.qty,h.avg);tot+=r.val;cost+=r.avg*r.qty;
+    return `<tr data-sel="${h.code}" class="tn ${MYSEL===h.code?'sel':''}"><td class="nm"><b>${esc(r.name)}</b><span>${r.code}</span></td><td>${f0(r.qty)}주 · ${f0(r.avg)}</td>
+      <td>${f0(r.c)} ${pct(r.chg)}</td><td class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,2)}</td><td class="${r.plAmt>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</td><td class="vv ${r.tone}">${r.v}</td></tr>`;
+  }).join('');
+  const pl=tot-cost;
+  box.innerHTML=`<a class="back" href="#">← 오늘의 추천 종목으로</a>
+    <h2 style="margin-top:12px">📁 저장한 내 종목</h2>
+    <p class="sub">종목을 누르면 아래에 자세한 점검 결과가 나옵니다. ${list.length?`합계 평가금액 <b class="tn">${f0(tot)}원</b>, 평가손익 <b class="tn ${pl>=0?'upc':'downc'}">${pl>=0?'+':''}${f0(pl)}원</b>`:''}</p>
+    ${list.length?`<div class="tablewrap"><table class="mytbl"><thead><tr><th>종목</th><th>수량 · 평단</th><th>현재가</th><th>수익률</th><th>평가손익</th><th>차트 전략</th></tr></thead><tbody>${rows}</tbody></table></div>`:
+      '<div class="empty">저장한 종목이 없습니다. 첫 화면에서 종목을 점검한 뒤 <b>저장</b>을 눌러 보세요.</div>'}
+    <div id="mydetail">${MYSEL?holdCard(list.find(h=>h.code===MYSEL),true):''}</div>`;
+}
+function rerender(){renderCheck();renderMyLink();if(location.hash==='#my')renderMy();}
+function route(){
+  const h=location.hash,my=h==='#my',gd=h.startsWith('#guide'),rvw=h==='#review';
+  document.getElementById('myview').hidden=!my;document.getElementById('guideview').hidden=!gd;document.getElementById('reviewview').hidden=!rvw;
+  document.getElementById('mainview').hidden=my||gd||rvw;
+  if(rvw){renderReview();scrollTo(0,0);}
+  else if(my){renderMy();scrollTo(0,0);}
+  else if(gd){renderGuide();const t=h.length>6&&document.getElementById(h.slice(1));if(t)t.scrollIntoView();else scrollTo(0,0);}
+  else{rerender();drawAll();}
+}
+addEventListener('hashchange',route);
+document.addEventListener('click',e=>{
+  const rm=e.target.closest('[data-rm]');
+  if(rm){const l=loadH().filter(h=>h.code!==rm.dataset.rm);saveH(l);if(MYSEL===rm.dataset.rm)MYSEL=null;rerender();return;}
+  const sv=e.target.closest('[data-save]');
+  if(sv&&CHECK){const l=loadH().filter(h=>h.code!==CHECK.code);l.unshift(CHECK);saveH(l);rerender();return;}
+  const sel=e.target.closest('[data-sel]');
+  if(sel){MYSEL=MYSEL===sel.dataset.sel?null:sel.dataset.sel;renderMy();const d=document.getElementById('mydetail');if(MYSEL&&d)d.scrollIntoView({behavior:'smooth',block:'start'});}
+});
 function initHolds(){
   const dl=document.getElementById('stocklist');
   dl.innerHTML=Object.entries(NAMES).map(([code,n])=>`<option value="${esc(n)} (${code})"></option>`).join('');
   const err=document.getElementById('fErr');
-  document.getElementById('fAdd').onclick=()=>{
+  const read=()=>{
     const code=findCode(document.getElementById('fStock').value),qty=+document.getElementById('fQty').value,avg=+document.getElementById('fAvg').value;
     const bad=!code?'종목을 찾지 못했습니다. 목록에서 골라 주시거나 6자리 종목코드로 입력해 주세요 (ETF·ETN은 지원하지 않습니다).':!(qty>0)?'보유 수량을 입력해 주세요.':!(avg>0)?'평균 매입가를 입력해 주세요.':'';
-    err.hidden=!bad;err.textContent=bad;if(bad)return;
-    const l=loadH().filter(h=>h.code!==code);l.unshift({code,qty,avg});saveH(l);renderHolds();
-    ['fStock','fQty','fAvg'].forEach(id=>document.getElementById(id).value='');
+    err.hidden=!bad;err.textContent=bad;return bad?null:{code,qty,avg};
   };
-  renderHolds();
+  document.getElementById('fCheck').onclick=()=>{const h=read();if(!h)return;CHECK=h;rerender();document.getElementById('checkResult').scrollIntoView({behavior:'smooth',block:'start'});};
+  document.getElementById('fSave').onclick=()=>{const h=read();if(!h)return;CHECK=h;const l=loadH().filter(x=>x.code!==h.code);l.unshift(h);saveH(l);rerender();};
+  rerender();
 }
 
 /* ───── 시작 ───── */
 document.getElementById('meta').textContent=`${D.asof} 종가 기준 · 분석 ${D.universe.toLocaleString()}종목 · ${D.generated} 생성 · AI 분석 ${D.ai_mode==='auto'?'자동':'버튼 방식'}`;
 document.getElementById('demo').hidden=!D.demo;
 document.getElementById('refresh').onclick=()=>location.reload();
-try{if(localStorage.getItem('how-closed')==='1')document.getElementById('how').open=false;}catch(_){}
-document.getElementById('how').addEventListener('toggle',e=>{try{localStorage.setItem('how-closed',e.target.open?'0':'1');}catch(_){}});
-renderHow();renderPulse();renderTabs();renderPanel();initHolds();
+
+renderBrief();renderScore();renderRevLink();checkFresh();setInterval(checkFresh,10*60*1000);renderRisk();renderMacro();renderOutlook();renderEvents();renderPulse();renderTabs();renderPanel();initHolds();route();
 let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(drawAll,150);});
 </script>
 </body>
