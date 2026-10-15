@@ -20,19 +20,17 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pykrx pandas numpy
-      - name: 시세 캐시 불러오기
-        uses: actions/cache@v4
-        with:
-          path: krx_cache.pkl
-          key: krx-${{ github.run_id }}
-          restore-keys: krx-
+      - run: pip install pandas numpy
       - name: 대시보드 생성
+        env:
+          AI_WORKER_URL: ${{ vars.AI_WORKER_URL }}               # Cloudflare 중계 서버 주소 (있으면 버튼 누르면 바로 분석)
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # (선택) 등록하면 매일 아침 1~3위 미리 분석
         run: python stock_dashboard.py --no-open --out site/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
