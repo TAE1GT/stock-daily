@@ -2,17 +2,20 @@ name: 매일 종목 발굴
 
 on:
   schedule:
-    - cron: "30 21 * * 0-4"   # 한국시간 평일(월~금) 오전 6:30
+    # 한국시간 평일(월~금) 오전 6:20 · 7:05 · 7:30 세 번 갱신 (GitHub 지연 대비)
+    - cron: "20 21 * * 0-4"
+    - cron: "5 22 * * 0-4"
+    - cron: "30 22 * * 0-4"
   workflow_dispatch:           # Actions 탭에서 수동 실행 버튼
 
 permissions:
-  contents: read
+  contents: write              # 매일 예측 기록(history 폴더)을 저장소에 저장
   pages: write
   id-token: write
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false    # 앞 회차가 돌고 있으면 끝날 때까지 기다렸다가 실행
 
 env:
   TZ: Asia/Seoul
@@ -26,12 +29,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pandas numpy
+      - run: pip install pandas numpy scikit-learn
       - name: 대시보드 생성
         env:
-          AI_WORKER_URL: ${{ vars.AI_WORKER_URL }}               # Cloudflare 중계 서버 주소 (있으면 버튼 누르면 바로 분석)
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # (선택) 등록하면 매일 아침 1~3위 미리 분석
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}             # (선택, 무료) 실적·IR 공시 목록
+          AI_WORKER_URL: ${{ vars.AI_WORKER_URL }}               # (선택) 버튼 누르면 바로 AI 분석
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # (선택, 유료) 매일 아침 1~3위 미리 분석
         run: python stock_dashboard.py --no-open --out site/index.html
+      - name: 예측 기록 저장 (다음 날 실제 결과와 비교용)
+        continue-on-error: true      # 저장이 실패해도 화면 갱신은 계속
+        run: |
+          git config user.name "stock-daily-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          [ -d history ] && git add history
+          git diff --cached --quiet || git commit -m "예측 기록 $(date +%Y-%m-%d_%H%M)"
+          git pull --rebase --autostash || true
+          git push || echo "기록 저장 실패 (다음 회차에 다시 저장됩니다)"
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
