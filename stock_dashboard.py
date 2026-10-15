@@ -4,7 +4,7 @@
 매일 아침 종목 발굴 대시보드 (코스피 · 코스닥)
 
 설치 (최초 1회)
-    pip install pykrx pandas numpy
+    pip install pandas numpy
 
 실행
     python stock_dashboard.py --serve   # 추천: http://localhost:8000 에서 보기, 새로고침하면 최신 데이터 반영
@@ -12,7 +12,7 @@
     python stock_dashboard.py --demo    # 가상 데이터로 화면 미리보기 (인터넷 불필요)
 
 동작
-    - 최근 160 거래일 시세를 KRX에서 받아 krx_cache.pkl 에 저장 (최초 1~3분, 이후에는 새 거래일만 받음)
+    - 네이버 금융에서 종목 목록과 최근 160 거래일 시세를 받음 (약 1~2분)
     - 장 마감 데이터는 16:00 이후 확정본으로 간주. --serve 모드에서는 16:00 이후 첫 새로고침 때 자동 재계산
     - 3가지 전략(추세 눌림목 / 거래량 돌파 / 과매도 반등) 점수 중 최고점으로 순위 산정
 """
@@ -20,7 +20,7 @@ import argparse
 import json
 import math
 import os
-import pickle
+import re
 import sys
 import threading
 import webbrowser
@@ -30,7 +30,6 @@ import numpy as np
 import pandas as pd
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-CACHE = os.path.join(BASE, "krx_cache.pkl")
 
 CFG = dict(
     days=160,              # 수집 거래일 수
@@ -46,56 +45,128 @@ STOP_LABEL = {1: "20일선 -3%", 2: "돌파 기준가(60일 고가)", 3: "최근
 
 
 # ───────────────────────────── 데이터 수집 ─────────────────────────────
-def load_krx(days):
-    try:
-        from pykrx import stock
-    except ImportError:
-        sys.exit("pykrx가 없습니다. 먼저 실행하세요:  pip install pykrx pandas numpy")
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Referer": "https://finance.naver.com/",
+}
+ETF_BRANDS = {"KODEX", "TIGER", "KBSTAR", "RISE", "ACE", "SOL", "HANARO", "KOSEF", "ARIRANG", "PLUS", "KIWOOM",
+              "TIMEFOLIO", "WOORI", "BNK", "파워", "마이다스", "히어로즈", "1Q", "ITF", "에셋플러스", "트러스톤",
+              "UNICORN", "FOCUS", "KTOP", "VITA", "TRUSTON", "마이티", "DAISHIN343", "TREX", "HK", "더제이"}
 
-    now = datetime.now()
-    start = now - timedelta(days=int(days * 1.6) + 30)
-    ref = stock.get_market_ohlcv(start.strftime("%Y%m%d"), now.strftime("%Y%m%d"), "005930")
-    tdays = [d.strftime("%Y%m%d") for d in ref.index]
-    # 장중·마감 직후 데이터는 확정 전이므로 제외
-    if tdays and tdays[-1] == now.strftime("%Y%m%d") and now.hour < 16:
-        tdays = tdays[:-1]
-    tdays = tdays[-days:]
 
-    cache = {}
-    if os.path.exists(CACHE):
+def http_get(url, retries=3):
+    import time
+    import urllib.request
+    for k in range(retries):
         try:
-            with open(CACHE, "rb") as f:
-                cache = pickle.load(f)
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.read().decode("cp949", errors="replace")
         except Exception:
-            cache = {}
-    ohlcv = cache.setdefault("ohlcv", {})
-    missing = [d for d in tdays if d not in ohlcv]
-    for i, d in enumerate(missing, 1):
-        print(f"  [{i}/{len(missing)}] {d} 시세 수집", flush=True)
-        df = stock.get_market_ohlcv(d, market="ALL")
-        ohlcv[d] = df[["시가", "고가", "저가", "종가", "거래량", "거래대금"]].copy()
-    for d in list(ohlcv):
-        if d not in tdays:
-            del ohlcv[d]
-    with open(CACHE, "wb") as f:
-        pickle.dump(cache, f)
+            if k == retries - 1:
+                raise
+            time.sleep(1.5 * (k + 1))
 
-    last = tdays[-1]
-    mcap = stock.get_market_cap(last, market="ALL")["시가총액"]
-    market = {t: "KOSPI" for t in stock.get_market_ticker_list(last, market="KOSPI")}
-    market.update({t: "KOSDAQ" for t in stock.get_market_ticker_list(last, market="KOSDAQ")})
 
-    cols = {"시가": "o", "고가": "h", "저가": "l", "종가": "c", "거래량": "v", "거래대금": "a"}
-    P = {}
-    for k, key in cols.items():
-        df = pd.DataFrame({d: ohlcv[d][k] for d in tdays}).T
-        df.index = pd.to_datetime(df.index)
-        P[key] = df.astype(float)
-    # 거래정지일(시가 0) 보정
+def _strip(s):
+    return re.sub(r"<[^>]+>", "", s).replace("&nbsp;", " ").strip()
+
+
+def _num(s):
+    try:
+        return float(_strip(s).replace(",", "").replace("%", ""))
+    except ValueError:
+        return np.nan
+
+
+def is_excluded_name(name):
+    first = name.split()[0] if name.split() else ""
+    return first in ETF_BRANDS or "ETN" in name or "스팩" in name
+
+
+def naver_listing():
+    """네이버 금융 시가총액 페이지에서 코스피·코스닥 종목 목록"""
+    rows = []
+    for sosok, mk in ((0, "KOSPI"), (1, "KOSDAQ")):
+        seen = set()
+        for page in range(1, 90):
+            html = http_get(f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}")
+            heads = [_strip(h) for h in re.findall(r'<th[^>]*scope="col"[^>]*>(.*?)</th>', html, re.S)]
+            new = 0
+            for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S):
+                mm = re.search(r'<a[^>]*code=(\d{6})[^>]*>(.*?)</a>', tr, re.S)
+                if not mm or not _strip(mm.group(2)):
+                    continue
+                code, name = mm.group(1), _strip(mm.group(2))
+                if code in seen:
+                    continue
+                seen.add(code)
+                new += 1
+                cells = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+                rec = dict(code=code, name=name, market=mk)
+                for key in ("현재가", "시가총액", "거래량"):
+                    i = heads.index(key) if key in heads else -1
+                    rec[key] = _num(cells[i]) if 0 <= i < len(cells) else np.nan
+                rows.append(rec)
+            if new == 0:
+                break
+        print(f"  {mk} 종목 목록 {len(seen)}개", flush=True)
+    if not rows:
+        raise RuntimeError("네이버 종목 목록을 읽지 못했습니다 (페이지 형식 변경 가능성)")
+    return pd.DataFrame(rows).set_index("code")
+
+
+def naver_ohlcv(code, count):
+    xml = http_get(f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count={count}&requestType=0")
+    recs = re.findall(r'data="(\d{8})\|([\d.]+)\|([\d.]+)\|([\d.]+)\|([\d.]+)\|([\d.]+)"', xml)
+    if not recs:
+        return None
+    df = pd.DataFrame(recs, columns=["d", "o", "h", "l", "c", "v"])
+    df.index = pd.to_datetime(df.pop("d"), format="%Y%m%d")
+    return df.astype(float)
+
+
+def load_naver(days):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    print("종목 목록 받는 중…", flush=True)
+    lst = naver_listing()
+    lst = lst[[c.endswith("0") and not is_excluded_name(n) for c, n in zip(lst.index, lst["name"])]]
+    # 목록의 전일 기준 값으로 1차 거르기 (값을 못 읽으면 통과)
+    amt = lst["현재가"] * lst["거래량"]
+    keep = (amt.isna() | (amt >= CFG["min_amount"] * 0.4)) & (lst["현재가"].isna() | (lst["현재가"] >= CFG["min_price"] * 0.8))
+    keep &= lst["시가총액"].isna() | (lst["시가총액"] * 1e8 >= CFG["min_mcap"] * 0.8)
+    lst = lst[keep]
+    print(f"시세 받는 중… ({len(lst)}종목)", flush=True)
+
+    data = {}
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        futs = {ex.submit(naver_ohlcv, code, days + 5): code for code in lst.index}
+        for i, f in enumerate(as_completed(futs), 1):
+            try:
+                df = f.result()
+                if df is not None and len(df):
+                    data[futs[f]] = df
+            except Exception:
+                pass
+            if i % 200 == 0:
+                print(f"  {i}/{len(futs)}", flush=True)
+    if not data:
+        raise RuntimeError("네이버 시세를 하나도 받지 못했습니다")
+
+    P = {k: pd.DataFrame({code: df[k] for code, df in data.items()}).sort_index() for k in "ohlcv"}
+    now = datetime.now()
+    today = pd.Timestamp(now.date())
+    if P["c"].index[-1] == today and now.hour < 16:      # 장중 미확정 데이터 제외
+        P = {k: df.iloc[:-1] for k, df in P.items()}
+    P = {k: df.iloc[-days:] for k, df in P.items()}
     halted = P["o"] <= 0
     for key in ("o", "h", "l"):
         P[key] = P[key].mask(halted, P["c"])
-    return P, mcap, market, stock.get_market_ticker_name
+    P["a"] = P["c"] * P["v"]                                # 거래대금(종가×거래량 근사)
+    mcap = lst["시가총액"] * 1e8
+    market = lst["market"].to_dict()
+    names = lst["name"].to_dict()
+    return P, mcap, market, names.get
 
 
 def load_demo(days, n=180):
@@ -245,7 +316,7 @@ def num(x, nd=0):
 
 def build(demo=False, mode="file"):
     print("데이터 준비 중…", flush=True)
-    P, mcap, market, namefn = load_demo(CFG["days"]) if demo else load_krx(CFG["days"])
+    P, mcap, market, namefn = load_demo(CFG["days"]) if demo else load_naver(CFG["days"])
     I = indicators(P)
     ev = evaluate(P, I)
     m = ev["m"]
@@ -255,7 +326,7 @@ def build(demo=False, mode="file"):
     codes = pd.Series(c.index, index=c.index)
     mask = (hist & (m["a"] >= CFG["min_amount"]) & (c >= CFG["min_price"]) & (P["v"].iloc[-1] > 0)
             & codes.map(lambda t: t in market and t.endswith("0"))
-            & (mcap.reindex(c.index).fillna(0) >= CFG["min_mcap"]))
+            & (mcap.reindex(c.index).fillna(np.inf) >= CFG["min_mcap"]))
     names = {t: namefn(t) for t in c.index[mask]}
     mask &= codes.map(lambda t: t in names and "스팩" not in str(names[t]))
     uni = c.index[mask]
@@ -350,7 +421,7 @@ def serve(port, demo, out, open_browser):
                         body = f.read()
                 except Exception as ex:
                     body = (f"<meta charset='utf-8'><h2>데이터를 불러오지 못했습니다</h2><pre>{ex}</pre>"
-                            "<p>인터넷 연결을 확인하고, pykrx를 최신으로 올려 보세요: pip install -U pykrx</p>").encode("utf-8")
+                            "<p>인터넷 연결을 확인한 뒤 다시 새로고침해 보세요.</p>").encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
