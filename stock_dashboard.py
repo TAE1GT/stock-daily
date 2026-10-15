@@ -1080,7 +1080,7 @@ h1{font-size:32px;line-height:1.15;margin:0;font-weight:800;letter-spacing:-.025
 .demo{margin:16px 0 0;padding:10px 14px;border-radius:10px;background:var(--sunk);border:1px dashed var(--mid);color:var(--muted);font-size:13px}
 
 /* 추천 방식 */
-.how{margin:20px 0 0;background:var(--surface);border:1px solid var(--line);border-radius:14px}
+.how{margin:44px 0 0;background:var(--surface);border:1px solid var(--line);border-radius:14px}
 .how>summary{cursor:pointer;padding:14px 18px;font-weight:800;font-size:15px;list-style:none;display:flex;justify-content:space-between;align-items:center;gap:12px}
 .how>summary::-webkit-details-marker{display:none}
 .how>summary span{font-weight:500;font-size:13px;color:var(--muted)}
@@ -1218,7 +1218,8 @@ td.rk{color:var(--muted);font-weight:700;width:44px}
 .empty{padding:20px;border:1px dashed var(--line);border-radius:12px;color:var(--muted);font-size:13.5px}
 
 /* 내 종목 점검 */
-.mine{margin-top:44px;padding-top:8px;border-top:2px solid var(--ink)}
+.mine{margin-top:8px}
+.rechead{margin-top:44px;padding-top:18px;border-top:2px solid var(--ink)}
 .form{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) auto;gap:10px;align-items:end;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px}
 .form label{display:grid;gap:4px;font-size:12.5px;color:var(--muted);font-weight:600}
 .form input{font:inherit;font-size:15px;padding:10px 12px;border:1.5px solid var(--line);border-radius:10px;background:var(--sunk);color:var(--ink);width:100%}
@@ -1295,16 +1296,6 @@ svg text{font-family:inherit}
   </header>
   <div class="demo" id="demo" hidden>가상 데이터로 만든 미리보기입니다. 실제 종목이 아닙니다.</div>
 
-  <details class="how" id="how" open>
-    <summary>이 페이지가 종목을 고르는 방식 <span>처음 보시면 꼭 읽어주세요</span></summary>
-    <div class="body" id="howbody"></div>
-  </details>
-
-  <dl class="pulse" id="pulse"></dl>
-
-  <div class="tabs" role="tablist" id="tabs"></div>
-  <p class="tabdesc" id="tabdesc"></p>
-  <div id="panel" role="tabpanel"></div>
 
   <section class="mine" id="mine">
     <h2>내 종목 점검</h2>
@@ -1319,6 +1310,19 @@ svg text{font-family:inherit}
     <datalist id="stocklist"></datalist>
     <div id="holds"></div>
   </section>
+
+  <h2 class="rechead">오늘의 추천 종목</h2>
+  <dl class="pulse" id="pulse"></dl>
+
+  <div class="tabs" role="tablist" id="tabs"></div>
+  <p class="tabdesc" id="tabdesc"></p>
+  <div id="panel" role="tabpanel"></div>
+
+
+  <details class="how" id="how" open>
+    <summary>이 페이지가 종목을 고르는 방식 <span>처음 보시면 꼭 읽어주세요</span></summary>
+    <div class="body" id="howbody"></div>
+  </details>
 
   <footer>
     <p>📊 차트 분석은 전 거래일 종가까지의 시세로 계산한 공식 결과이고, 🤖 AI 분석은 Claude가 뉴스·공시를 검색해 낸 의견입니다. 둘 다 참고 자료이며 목표가 도달이나 수익을 보장하지 않습니다.</p>
