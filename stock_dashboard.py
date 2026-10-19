@@ -291,7 +291,7 @@ def load_naver(days):
 def load_demo(days, n=180):
     """화면 확인용 가상 데이터"""
     rng = np.random.default_rng(int(datetime.now().strftime("%Y%m%d")))
-    dates = pd.bdate_range(end=pd.Timestamp.today().normalize() - pd.Timedelta(days=1), periods=days)
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize() - pd.offsets.BDay(1), periods=days)
     A = ["한빛", "대성", "미래", "동방", "세원", "태광", "청람", "가온", "새롬", "누리", "금강", "백두", "서진", "해솔"]
     B = ["전자", "반도체", "바이오", "화학", "정밀", "테크", "에너지", "소재", "제약", "중공업", "시스템", "로보틱스", "모빌리티"]
     tickers, names, mk = [], {}, {}
@@ -1479,7 +1479,9 @@ def build_briefing(risk, outlook, macro, tabs, demo):
         stat("DART 공시 (선택)", True if key else None, "키 등록됨" if key else "키 미등록 (선택 사항)")
     top_picks = [dict(tab=t["name"], name=t["stocks"][0]["name"], code=t["stocks"][0]["code"], score=t["stocks"][0]["score"])
                  for t in tabs if t["stocks"]]
-    return dict(date=now.strftime("%m월 %d일"), dow="월화수목금토일"[now.weekday()], lines=lines, week=week_ev,
+    quick = [dict(n=nm, chg=round(v[1], 2)) for nm, v in us] + \
+            [dict(n=nm, chg=round(v[1], 2)) for nm, v in fx if nm in ("원·달러", "WTI")]
+    return dict(date=now.strftime("%m월 %d일"), dow="월화수목금토일"[now.weekday()], lines=lines, week=week_ev, quick=quick,
                 earnings=earnings, kr=kr_news, gl=gl_news, sectors=sector_issues, picks=top_picks, dart=dart_used)
 
 
@@ -2507,64 +2509,208 @@ svg text{font-family:inherit}
 .chart .slx{fill:var(--down);font-size:11px;font-weight:700}
 .lvbar .ax{stroke:var(--line);stroke-width:2}
 .lvbar text{font-size:11px;font-weight:700}
+
+/* ════════ 새 화면 (앱처럼: 홈 · 추천 · 내 종목 · 시장 · 더보기) ════════ */
+html{-webkit-text-size-adjust:100%}
+body{overflow-x:hidden}
+.wrap{max-width:1180px;padding:0 16px calc(84px + env(safe-area-inset-bottom,0px))}
+.wrap *{min-width:0}
+header.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;padding:10px 0;background:var(--bg);border-bottom:1px solid var(--line);margin:0 0 14px}
+.brand{display:flex;flex-direction:column;text-decoration:none;color:var(--ink);flex:1}
+.brand b{font-size:18px;font-weight:900;letter-spacing:-.02em;white-space:nowrap}
+.brand .meta{margin:0;font-size:12px}
+.iconbtn{width:40px;height:40px;border-radius:12px;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:20px;cursor:pointer;flex:none}
+.tabbar{display:flex;gap:4px}
+.tabbar a{display:flex;align-items:center;gap:6px;padding:8px 12px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:800;font-size:14px}
+.tabbar a i{font-style:normal}
+.tabbar a.on{background:var(--ink);color:var(--surface)}
+@media(max-width:899px){
+  .tabbar{position:fixed;left:0;right:0;bottom:0;z-index:30;justify-content:space-around;gap:0;background:var(--surface);border-top:1px solid var(--line);
+    padding:6px 4px calc(6px + env(safe-area-inset-bottom,0px));box-shadow:0 -4px 16px rgba(0,0,0,.06)}
+  .tabbar a{flex-direction:column;gap:2px;padding:4px 2px;font-size:11px;flex:1;border-radius:10px}
+  .tabbar a i{font-size:20px;line-height:1.1}
+  .tabbar a.on{background:transparent;color:var(--ink)}
+  .tabbar a.on i{transform:scale(1.12)}
+}
+.view h2{margin:4px 0 10px}
+.vh{display:flex;align-items:center;justify-content:space-between}
+.demo,.stale{margin:0 0 12px}
+footer{margin:28px 0 0;padding-top:14px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
+
+/* 홈 */
+.hgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+@media(max-width:720px){.hgrid{grid-template-columns:1fr}}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:14px 16px}
+.card.wide,.card.wx,.card.strip{grid-column:1/-1}
+.card h3{margin:0;font-size:15px;font-weight:800}
+.ch{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px}
+.more{display:inline-block;margin-top:8px;font-size:13px;font-weight:700;color:var(--muted);text-decoration:none}
+.ch .more{margin:0}
+.wx{display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center;text-decoration:none;color:var(--ink);border-width:2px}
+.wx.ok{border-color:var(--ok)} .wx.mid{border-color:var(--mid)} .wx.bad{border-color:var(--bad)}
+.wxi{font-size:clamp(40px,11vw,60px);line-height:1}
+.wxb{display:grid;gap:2px} .wxb small{color:var(--muted);font-weight:700;font-size:12px}
+.wxb b{font-size:clamp(22px,6vw,30px);font-weight:900;letter-spacing:-.02em} .wxb span{font-size:14px;font-weight:600}
+.wx.ok .wxb b{color:var(--ok)} .wx.mid .wxb b{color:var(--mid)} .wx.bad .wxb b{color:var(--bad)}
+.wxs{display:grid;grid-template-columns:auto auto;gap:0 8px;align-items:baseline;font-size:12px;color:var(--muted)} .wxs b{font-size:18px;color:var(--ink);text-align:right}
+@media(max-width:420px){.wx{grid-template-columns:auto 1fr}.wxs{grid-column:1/-1;grid-template-columns:repeat(4,auto);justify-content:start}}
+.strip{display:flex;gap:8px;overflow-x:auto;padding:10px 12px;scrollbar-width:none}
+.strip>div{flex:1 0 auto;display:grid;text-align:center;padding:4px 8px;min-width:72px}
+.strip small{color:var(--muted);font-size:11.5px;font-weight:700} .strip b{font-size:16px}
+.hlist{display:grid;gap:6px}
+.hrow{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:center;width:100%;text-align:left;font:inherit;color:var(--ink);background:var(--sunk);border:0;border-radius:12px;padding:10px 12px;cursor:pointer}
+.chip{font-size:11.5px;font-weight:800;padding:2px 8px;border-radius:999px;white-space:nowrap;background:var(--sunk);color:var(--muted)}
+.chip.ok{background:rgba(15,118,110,.14);color:var(--ok)} .chip.mid{background:rgba(183,121,31,.15);color:var(--mid)} .chip.no{background:rgba(194,65,12,.14);color:var(--bad)}
+.evl{list-style:none;margin:0;padding:0;display:grid;gap:6px;font-size:14px}
+.evl li{display:grid;grid-template-columns:48px 1fr auto;gap:8px;align-items:baseline}
+.evl .dd{font-weight:900;color:var(--bad);font-size:13px}
+.heat{display:grid;grid-template-columns:repeat(auto-fill,minmax(92px,1fr));gap:6px}
+.ht2{border-radius:10px;padding:8px 8px;display:grid;gap:2px;color:var(--ink)}
+.ht2 b{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .ht2 span{font-size:13px;font-weight:800}
+
+/* 추천 목록 */
+.plist{display:grid;gap:6px}
+.prow{display:grid;grid-template-columns:28px minmax(0,1fr) 72px 58px 58px 64px;gap:10px;align-items:center;width:100%;text-align:left;font:inherit;color:var(--ink);
+  background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:10px 12px;cursor:pointer}
+.card .prow{background:var(--sunk);border:0;grid-template-columns:28px minmax(0,1fr) 58px 58px}
+.prow:hover{border-color:var(--ink)}
+.prow .rk{display:grid;place-items:center;width:26px;height:26px;border-radius:8px;background:var(--sunk);font-weight:900;font-size:13px}
+.prow.top .rk{background:var(--ink);color:var(--surface)}
+.pn{display:grid;gap:1px} .pn b{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .pn small{font-size:12.5px;color:var(--muted)}
+.pt{display:grid;text-align:right} .pt small{font-size:11px;color:var(--muted)} .pt b{font-size:14px}
+.ps{position:relative;height:22px;border-radius:6px;background:var(--sunk);overflow:hidden;display:grid;place-items:center}
+.ps i{position:absolute;left:0;top:0;bottom:0;background:var(--line)} .ps b{position:relative;font-size:12.5px}
+.sp svg{width:72px;height:24px}
+@media(max-width:620px){.prow{grid-template-columns:26px minmax(0,1fr) 54px 54px}.prow .sp,.prow .ps{display:none}}
+@media(max-width:340px){.prow,.card .prow{grid-template-columns:24px minmax(0,1fr) 50px;gap:6px;padding:9px 8px}.prow .pt:last-of-type{display:none}.pn b{font-size:14px}}
+.tabs{margin:0;gap:2px}
+.tab{font-size:15px;padding:10px 12px 8px}
+.tabdesc{margin:8px 0 12px}
+
+/* 내 종목 */
+.form{padding:12px}
+@media(max-width:420px){.form{grid-template-columns:1fr 1fr;gap:8px}.form label:first-child{grid-column:1/-1}.fbtns{grid-column:1/-1}.fbtns .btn{flex:1}}
+.fbtns .btn{white-space:nowrap}
+.msum{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin:14px 0 8px;font-size:13px;color:var(--muted)} .msum b{font-size:16px}
+.mlist{display:grid;gap:6px}
+.mrow{display:grid;grid-template-columns:1fr auto;gap:6px;align-items:stretch}
+.mmain{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;text-align:left;font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:10px 12px;cursor:pointer}
+.mpl{display:grid;text-align:right} .mpl b{font-size:15px} .mpl small{font-size:11.5px}
+.del{width:44px;border-radius:14px;border:1px solid var(--line);background:var(--surface);color:var(--muted);font-size:16px;cursor:pointer}
+.del:hover{color:var(--bad);border-color:var(--bad)}
+@media(max-width:400px){.mmain{grid-template-columns:minmax(0,1fr) auto}.mmain .chip{grid-column:1/-1;justify-self:start}}
+.btn.danger{color:var(--bad);border-color:var(--bad)}
+
+/* 시장 (접는 상자) */
+.fold{background:var(--surface);border:1px solid var(--line);border-radius:16px;margin-bottom:10px;overflow:hidden}
+.fold>summary{list-style:none;cursor:pointer;padding:14px 16px;font-weight:800;font-size:16px;display:flex;align-items:center;gap:8px}
+.fold>summary::-webkit-details-marker{display:none}
+.fold>summary::after{content:"▾";margin-left:auto;color:var(--muted);transition:transform .2s}
+.fold[open]>summary::after{transform:rotate(180deg)}
+.fold>section{border:0;border-radius:0;margin:0;padding:0 16px 16px;background:transparent}
+.fold .risk,.fold #outlook,.fold #macro{border:0;padding:0 16px 16px}
+.bgrid{grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr))}
+
+/* 더보기 */
+.morelink{display:block;margin-top:12px;padding:14px 16px;border-radius:16px;background:var(--surface);border:1px solid var(--line);color:var(--ink);font-weight:800;text-decoration:none}
+.scoreboard,.revlink{margin-top:0;margin-bottom:12px}
+
+/* 자세히 보기 시트 (휴대폰: 아래에서 올라오는 전체 화면 / PC: 가운데 창) */
+.sheet{padding:0;border:0;background:transparent;max-width:none;max-height:none;width:100%;height:100%;margin:0}
+.sheet::backdrop{background:rgba(0,0,0,.45)}
+.shin{position:absolute;left:50%;transform:translateX(-50%);bottom:0;width:min(1000px,100%);max-height:92dvh;max-height:92vh;overflow:auto;background:var(--bg);
+  border-radius:20px 20px 0 0;padding:0 14px calc(18px + env(safe-area-inset-bottom,0px));overscroll-behavior:contain}
+@media(min-width:900px){.shin{top:4vh;bottom:auto;border-radius:20px;max-height:92vh}}
+.shbar{position:sticky;top:0;z-index:2;display:flex;justify-content:center;align-items:center;padding:10px 0 8px;background:var(--bg)}
+.grab{width:44px;height:5px;border-radius:3px;background:var(--line)}
+.shbar .x{position:absolute;right:0;top:6px;width:36px;height:36px;border-radius:50%;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:15px;cursor:pointer}
+.sheet .pick{margin:0}
+.sheet .pick .big{display:none}
+.mini-fold{margin-top:12px}
+.mini-fold>summary{cursor:pointer;font-weight:700;font-size:13px;color:var(--muted);padding:6px 0}
+.sheet .hold{margin-top:0}
+
+/* 표가 화면보다 넓으면 표 안에서만 옆으로 밀기 */
+.gsec .ht,.hbody .ht{display:block;overflow-x:auto;max-width:100%}
+.gsec{overflow-wrap:anywhere}
+
+/* 아주 좁은 화면 (폴드 커버 등) */
+@media(max-width:360px){
+  body{font-size:13.5px}
+  .wrap{padding-left:10px;padding-right:10px}
+  .brand b{font-size:16px}
+  .card{padding:12px}
+  .price{font-size:22px} .name{font-size:19px}
+  .tgbox{grid-template-columns:1fr 1fr}.tgbox>div:nth-child(3){grid-column:1/-1}
+  .kv{grid-template-columns:1fr 1fr}
+  .pos-grid{grid-template-columns:1fr}
+  .rbadges{flex-direction:column}
+  .revkpi,.olk-idx .op{grid-template-columns:1fr 1fr}
+}
+@media(min-width:900px){.wrap{padding-bottom:40px}}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <header>
-    <div>
-      <h1>오늘의 종목 발굴</h1>
-      <div class="meta tn" id="meta"></div>
-    </div>
-    <span class="hbtns"><a class="btn ghost" href="#guide">📖 상세 설명</a><button class="btn" id="refresh">새로고침</button></span>
+  <header class="top">
+    <a class="brand" href="#home"><b>오늘의 종목 발굴</b><span class="meta tn" id="meta"></span></a>
+    <nav class="tabbar" id="tabbar" aria-label="화면 이동">
+      <a href="#home" data-v="home"><i aria-hidden="true">🏠</i><span>홈</span></a>
+      <a href="#picks" data-v="picks"><i aria-hidden="true">⭐</i><span>추천</span></a>
+      <a href="#mine" data-v="mine"><i aria-hidden="true">💼</i><span>내 종목</span></a>
+      <a href="#market" data-v="market"><i aria-hidden="true">📈</i><span>시장</span></a>
+      <a href="#more" data-v="more"><i aria-hidden="true">☰</i><span>더보기</span></a>
+    </nav>
+    <button class="iconbtn" id="refresh" aria-label="새로고침">↻</button>
   </header>
   <div class="demo" id="demo" hidden>가상 데이터로 만든 미리보기입니다. 실제 종목이 아닙니다.</div>
-  <div id="myview" hidden></div>
-  <div id="guideview" hidden></div>
-  <div id="reviewview" hidden></div>
-  <div id="mainview">
-
-
   <div class="stale" id="stale" hidden></div>
-  <section class="brief" id="brief"></section>
-  <section class="scoreboard" id="score"></section>
-  <section class="mine" id="mine">
-    <h2>내 종목 점검 <button class="q" data-help="mine" aria-label="설명 보기">?</button></h2>
+
+  <section class="view" id="v-home"></section>
+
+  <section class="view" id="v-picks" hidden>
+    <div class="vh"><h2>오늘의 추천 <button class="q" data-help="picks" aria-label="설명 보기">?</button></h2></div>
+    <div class="tabs" role="tablist" id="tabs"></div>
+    <p class="tabdesc" id="tabdesc"></p>
+    <div id="panel"></div>
+  </section>
+
+  <section class="view" id="v-mine" hidden>
+    <div class="vh"><h2>내 종목 <button class="q" data-help="mine" aria-label="설명 보기">?</button></h2></div>
     <div class="form">
-      <label>종목명 또는 코드<input id="fStock" list="stocklist" placeholder="예: 삼성전자 또는 005930" autocomplete="off"></label>
-      <label>보유 수량 (주)<input id="fQty" type="number" inputmode="numeric" min="1" placeholder="예: 100"></label>
-      <label>평균 매입가 (원)<input id="fAvg" type="number" inputmode="numeric" min="1" placeholder="예: 71000"></label>
-      <span class="fbtns"><button class="btn" id="fCheck">점검하기</button><button class="btn ghost" id="fSave">저장</button></span>
+      <label>종목명 또는 코드<input id="fStock" list="stocklist" placeholder="예: 삼성전자" autocomplete="off"></label>
+      <label>수량 (주)<input id="fQty" type="number" inputmode="numeric" min="1" placeholder="100"></label>
+      <label>평균 매입가 (원)<input id="fAvg" type="number" inputmode="numeric" min="1" placeholder="71000"></label>
+      <span class="fbtns"><button class="btn" id="fCheck">점검</button><button class="btn ghost" id="fSave">저장</button></span>
       <p class="err" id="fErr" hidden></p>
     </div>
     <datalist id="stocklist"></datalist>
-    <a class="mylink" id="mylink" href="#my" hidden></a>
-    <div id="checkResult"></div>
+    <div id="mylist"></div>
   </section>
 
-  <h2 class="rechead">시장 방향 신호등 <button class="q" data-help="signals" aria-label="설명 보기">?</button></h2>
-  <section class="risk" id="risk"></section>
-  <h2>글로벌 지표 <button class="q" data-help="macro" aria-label="설명 보기">?</button></h2>
-  <section id="macro"></section>
-  <h2>앞으로 5일 전망 <button class="q" data-help="outlook" aria-label="설명 보기">?</button></h2>
-  <section id="outlook"></section>
-  <h2>다가오는 일정 <button class="q" data-help="events" aria-label="설명 보기">?</button></h2>
-  <section id="events"></section>
-  <h2>오늘의 추천 종목 <button class="q" data-help="picks" aria-label="설명 보기">?</button></h2>
-  <dl class="pulse" id="pulse"></dl>
+  <section class="view" id="v-market" hidden>
+    <details class="fold" open><summary>🚦 시장 신호등 <button class="q" data-help="signals" aria-label="설명 보기">?</button></summary><section class="risk" id="risk"></section></details>
+    <details class="fold"><summary>🔮 5일 전망 · 섹터 <button class="q" data-help="outlook" aria-label="설명 보기">?</button></summary><section id="outlook"></section></details>
+    <details class="fold"><summary>🗓 다가오는 일정 <button class="q" data-help="events" aria-label="설명 보기">?</button></summary><section id="events"></section></details>
+    <details class="fold"><summary>🌎 글로벌 지표 <button class="q" data-help="macro" aria-label="설명 보기">?</button></summary><section id="macro"></section></details>
+    <details class="fold"><summary>📰 오늘의 뉴스 <button class="q" data-help="brief" aria-label="설명 보기">?</button></summary><section id="brief"></section></details>
+  </section>
 
-  <div class="tabs" role="tablist" id="tabs"></div>
-  <p class="tabdesc" id="tabdesc"></p>
-  <div id="panel" role="tabpanel"></div>
+  <section class="view" id="v-more" hidden>
+    <section class="scoreboard" id="score"></section>
+    <section class="revlink" id="revlink"></section>
+    <a class="morelink" href="#guide">📖 상세 설명 · 계산 방법 보기 →</a>
+  </section>
 
-
-
-  <section class="revlink" id="revlink"></section>
-  </div>
-  <footer>
-    <p>참고 자료이며 수익을 보장하지 않습니다. 투자 판단과 책임은 본인에게 있습니다.</p>
-  </footer>
+  <div class="view" id="guideview" hidden></div>
+  <div class="view" id="reviewview" hidden></div>
+  <footer>참고 자료이며 수익을 보장하지 않습니다. 투자 판단과 책임은 본인에게 있습니다.</footer>
 </div>
+
+<dialog id="sheet" class="sheet" aria-label="자세히 보기"><div class="shin">
+  <div class="shbar"><span class="grab" aria-hidden="true"></span><button class="x" id="sheetClose" aria-label="닫기">✕</button></div>
+  <div id="sheetBody"></div>
+</div></dialog>
 
 <dialog id="dlg"><div class="in">
   <h4>🤖 AI 분석 요청</h4>
@@ -2605,8 +2751,8 @@ function legend(t,parts){t.textContent='';parts.forEach(([s,c])=>{const sp=docum
 
 function drawChart(box,s){
   box.innerHTML='';
-  const W=Math.max(300,box.clientWidth),small=W<560;
-  const m={l:4,r:66,t:24,b:20},hP=small?240:300,hV=56,hM=50,hR=70,g=14;
+  const W=Math.max(240,box.clientWidth),small=W<560;
+  const m={l:4,r:small?58:66,t:24,b:20},hP=small?220:300,hV=56,hM=50,hR=70,g=14;
   const H=m.t+hP+g+hV+g+hM+g+hR+m.b;
   const svg=el('svg',{width:W,height:H,viewBox:`0 0 ${W} ${H}`,class:'chart',role:'img','aria-label':'가격 차트'},box);
   const n=s.c.length,pw=W-m.l-m.r,step=pw/n,cw=Math.max(1,Math.min(9,step*.64));
@@ -2631,7 +2777,7 @@ function drawChart(box,s){
   path(svg,s.bbu,X,YP,'bb');path(svg,s.bbl,X,YP,'bb');path(svg,s.bbm,X,YP,'bbm');path(svg,s.ma60,X,YP,'ma');
   // 피보나치 되돌림
   (s.fib||[]).forEach(([lab,v])=>{ if(v==null||v<lo||v>hi)return; const y=YP(v);
-    el('line',{x1:m.l,x2:m.l+pw,y1:y,y2:y,class:'fib'},svg); tx(svg,m.l+pw-vpw-6,y-3,'Fib '+lab+' '+f0(v),'fibx','end'); });
+    el('line',{x1:m.l,x2:m.l+pw,y1:y,y2:y,class:'fib'},svg); if(!small)tx(svg,m.l+pw-vpw-6,y-3,'Fib '+lab+' '+f0(v),'fibx','end'); });
   // 목표가 · 손절가
   let prevY=null;
   [['t2','목표2','tl'],['t1','목표1','tl'],['stop','손절','sl']].forEach(([k,lab,cls])=>{
@@ -2682,7 +2828,7 @@ function drawChart(box,s){
 
 function drawMini(box,s){
   box.innerHTML='';
-  const k=60,W=Math.max(240,box.clientWidth),H=96,m=6;
+  const k=60,W=Math.max(200,box.clientWidth),H=96,m=6;
   const c=s.c.slice(-k),u=s.bbu.slice(-k),b=s.bbl.slice(-k),n=c.length;
   const lo=Math.min(...c,...b.filter(x=>x!=null),s.stop||Infinity),hi=Math.max(...c,...u.filter(x=>x!=null),s.t1||-Infinity);
   const X=i=>m+(W-2*m)*i/(n-1),Y=v=>H-m-(v-lo)/(hi-lo)*(H-2*m);
@@ -2824,7 +2970,7 @@ const RULE=k=>T(D.rules[k].map(([l,w])=>[esc(l),w+'점']),['조건','배점'])+`
   <p><b>목표·손절</b> · 1차: ${D.targets[k][0]} · 2차: ${D.targets[k][1]} · 손절: ${D.targets[k][2]}</p>`;
 const HELP={
   how:['이용 안내',()=>helpHow()],
-  mine:['내 종목 점검',()=>`<ol><li>종목명(또는 6자리 코드), 보유 수량, 평균 매입가를 입력합니다.</li><li><b>점검하기</b>: 한 번만 보고 저장하지 않습니다.</li><li><b>저장</b>: '저장한 내 종목' 화면에 모아 두고 매일 새 데이터로 다시 점검합니다.</li></ol><p>저장 내용은 이 휴대폰(브라우저)에만 남고 서버로 가지 않습니다. 다른 기기에서는 따로 저장해야 합니다.</p>`],
+  mine:['내 종목',()=>`<ol><li>종목명(또는 6자리 코드), 보유 수량, 평균 매입가를 입력합니다.</li><li><b>점검</b>: 한 번만 보고 저장하지 않습니다.</li><li><b>저장</b>: 아래 목록에 모아 두고 매일 새 데이터로 다시 점검합니다. 홈 화면에도 나옵니다.</li><li><b>삭제</b>: 목록 오른쪽 <b>✕</b>를 누르거나, 종목을 눌러 열린 화면의 <b>🗑 삭제</b>를 누릅니다.</li><li><b>수량·평단 수정</b>: 같은 종목을 새 값으로 다시 저장하면 덮어씁니다.</li></ol><p>저장 내용은 이 휴대폰(브라우저)에만 남고 서버로 가지 않습니다. 다른 기기에서는 따로 저장해야 합니다.</p>`],
   hold:['차트 기준 전략은 이렇게 정합니다',()=>T([
       ['손절 검토 / 이익 보호 매도','주가 &lt; 60일선, 60일선 하락 중, MACD 히스토그램 음수이며 하락 확대'],
       ['일부 익절 (1/3)','RSI ≥ 70 또는 볼린저 상단 돌파 + 수익률 ≥ 10%'],
@@ -2961,21 +3107,14 @@ function renderMacro(){
 }
 function renderBrief(){
   const B=D.brief,box=document.getElementById('brief');
-  if(!B){box.hidden=true;return;}
-  const tone=t=>t>0?'pos':t<0?'neg':'';
-  const item=x=>`<li><span class="dt tn">${esc(x.d||'')}</span>${x.en?'<span class="en">해외</span>':''}<a href="${esc(x.u)}" target="_blank" rel="noopener">${esc(x.t)}</a>${x.s?` <span class="vl">${esc(x.s)}</span>`:''}</li>`;
+  if(!B){box.innerHTML='<div class="empty">오늘은 뉴스를 받지 못했습니다.</div>';return;}
+  const item=x=>`<li><span class="dt tn">${esc(x.d||'')}</span>${x.en?'<span class="en">해외</span>':''}<a href="${esc(x.u)}" target="_blank" rel="noopener">${esc(x.t)}</a></li>`;
   const list=(arr,empty)=>arr&&arr.length?`<ul class="bl">${arr.map(item).join('')}</ul>`:`<p class="vl" style="text-align:left;margin:0">${empty}</p>`;
-  const wk=(B.week||[]).map(e=>`<li class="${e.dday===0?'today':''}"><span class="dt tn">${e.dday===0?'오늘':e.date+'('+e.dow+')'}</span><b>${esc(e.name)}</b> <span class="vl">${e.secs.map(esc).join('·')}</span>${e.st?` <span class="vl">· 과거 일정 전 5일 ${pctS(e.st.pre)} / 후 5일 ${pctS(e.st.post)}</span>`:''}</li>`).join('');
-  box.innerHTML=`
-    <div class="bhead"><h2 style="margin:0">☀️ 오늘의 브리핑 <button class="q" data-help="brief" aria-label="설명 보기">?</button></h2><span class="vl">${B.date}(${B.dow}) 장 시작 전 · ${D.generated} 갱신</span></div>
-    <ul class="blines">${B.lines.map(l=>`<li><b>${esc(l.k)}</b><span class="${tone(l.tone)}">${esc(l.t)}</span></li>`).join('')}
-      ${(B.picks||[]).length?`<li><b>오늘 1위</b><span>${B.picks.map(p=>`${esc(p.tab)} <b>${esc(p.name)}</b>`).join(' · ')}</span></li>`:''}</ul>
-    <div class="bgrid">
-      <div class="bbox"><h4>🗓 이번 주 일정</h4>${wk?`<ul class="bl">${wk}</ul>`:'<p class="vl" style="text-align:left;margin:0">이번 주 등록된 큰 일정이 없습니다.</p>'}</div>
-      <div class="bbox"><h4>📊 실적 발표 ${B.dart?'<span class="vl">(DART 공시 + 뉴스)</span>':'<span class="vl">(뉴스)</span>'}</h4>${list(B.earnings,'최근 하루 동안 실적 관련 소식이 없습니다.')}</div>
-      <div class="bbox"><h4>🇰🇷 국내 증시 뉴스</h4>${list(B.kr,'뉴스를 받지 못했습니다.')}</div>
-      <div class="bbox"><h4>🌎 해외 증시 뉴스</h4>${list(B.gl,'뉴스를 받지 못했습니다.')}</div>
-      ${(B.sectors||[]).length?`<div class="bbox wide"><h4>🔥 움직임 큰 섹터 · 일정 임박 섹터</h4>${B.sectors.map(x=>`<div class="bsec"><span class="sb">${esc(x.sector)}</span>${x.r5!=null?` <span class="vl">5일 ${pct(x.r5,1)}</span>`:''}${x.ev?` <span class="vl">· ${esc(x.ev)}</span>`:''}${list(x.items,'')}</div>`).join('')}</div>`:''}
+  box.innerHTML=`<div class="bgrid">
+      <div class="bbox"><h4>📊 실적 발표</h4>${list(B.earnings,'최근 하루 실적 소식이 없습니다.')}</div>
+      <div class="bbox"><h4>🇰🇷 국내 증시</h4>${list(B.kr,'뉴스를 받지 못했습니다.')}</div>
+      <div class="bbox"><h4>🌎 해외 증시</h4>${list(B.gl,'뉴스를 받지 못했습니다.')}</div>
+      ${(B.sectors||[]).length?`<div class="bbox"><h4>🔥 움직임 큰 섹터</h4>${B.sectors.map(x=>`<div class="bsec"><span class="sb">${esc(x.sector)}</span>${x.r5!=null?` <span class="vl">5일 ${pct(x.r5,1)}</span>`:''}${list(x.items,'')}</div>`).join('')}</div>`:''}
     </div>`;
 }
 function checkFresh(){
@@ -3139,62 +3278,55 @@ function tgHTML(x){const t=x.tg;return `<dl class="tgbox tn">
 function aiHTML(x){
   return aiSlot({prompt:x.prompt,code:x.code,kind:'pick',key:`ai:${D.asof}:${x.code}:p${x.strat}`,score:x.score,pre:x.ai||null});
 }
-function renderPanel(){
-  const tab=D.tabs.find(t=>t.k===current),st=tab.stocks;
-  document.getElementById('tabdesc').innerHTML=(D.risk&&D.risk.score>=50?`<span class="rwarn">⚠️ 시장 위험 '${D.risk.level}' 단계입니다. 아래 종목도 매수 금액을 크게 줄여서 보세요.</span><br>`:'')+esc(STRAT[current].d+(tab.loss?` (적자 기업 ${tab.loss}개는 제외했습니다.)`:''));
-  const picks=st.slice(0,3),watch=st.slice(3,6),rest=st.slice(6);
-  let h='';
-  h+='<h3 class="sec">매수 후보 1–3위</h3>';
-  h+=picks.length?picks.map((x,i)=>`
-    <article class="pick">
+function pickCard(x){
+  return `<article class="pick">
       <div class="info">
-        <span class="big tn" aria-hidden="true">${x.rank}</span>
-        <span class="tag ${STRAT[x.strat].c}">${STRAT[x.strat].n}</span>
+        <span class="tag ${STRAT[x.strat].c}">${STRAT[x.strat].n} ${x.rank}위</span>
         <div class="name">${esc(x.name)} <span class="code tn">${x.code} ${x.market}</span></div>
         <div class="price tn">${f0(x.close)}<span>${pct(x.chg)}</span></div>
-        <div class="lbl">📊 차트 분석 결론 <button class="q" data-help="picks" aria-label="설명 보기">?</button></div>
         ${scoreHTML(x)}
         ${tgHTML(x)}
-        <div class="lbl">기본 조건 <button class="q" data-help="rules${x.strat}" aria-label="설명 보기">?</button></div>${checksHTML(x.checks)}
-        <div class="lbl">보조 지표 가감점 <button class="q" data-help="aux" aria-label="설명 보기">?</button></div>${auxHTML(x.aux)}
-        <dl class="kv tn">
-          <div><dt>거래대금</dt><dd>${won(x.amount)}</dd></div>
-          <div><dt>시가총액</dt><dd>${won(x.mcap)}</dd></div>
-          <div><dt>거래량</dt><dd>${x.vr==null?'-':x.vr.toFixed(1)+'배'}</dd></div>
-        </dl>
+        <details class="mini-fold"><summary>기본 조건 · 보조 지표 보기</summary>
+          <div class="lbl">기본 조건 <button class="q" data-help="rules${x.strat}" aria-label="설명 보기">?</button></div>${checksHTML(x.checks)}
+          <div class="lbl">보조 지표 가감점 <button class="q" data-help="aux" aria-label="설명 보기">?</button></div>${auxHTML(x.aux)}
+          <dl class="kv tn"><div><dt>거래대금</dt><dd>${won(x.amount)}</dd></div><div><dt>시가총액</dt><dd>${won(x.mcap)}</dd></div><div><dt>거래량</dt><dd>${x.vr==null?'-':x.vr.toFixed(1)+'배'}</dd></div></dl>
+        </details>
       </div>
-      <div class="right"><div class="chartbox" data-i="${i}"></div>${newsHTML(x.code)}${aiHTML(x)}</div>
-    </article>`).join(''):'<div class="empty">오늘은 이 전략에 맞는 종목이 없습니다.</div>';
-  if(watch.length){
-    h+='<h3 class="sec">지켜볼 종목 4–6위</h3><div class="watch">'+watch.map((x,i)=>`
-      <article class="w">
-        <div class="top"><span class="rk">${x.rank}위</span><span class="tag ${STRAT[x.strat].c}">점수 ${x.score}</span></div>
-        <div class="name">${esc(x.name)} <span class="code tn">${x.code}</span></div>
-        <div class="price tn">${f0(x.close)}<span>${pct(x.chg)}</span></div>
-        <div class="mini" data-i="${i+3}"></div>
-        ${tgHTML(x)}
-        <div class="lbl">빠진 조건</div>
-        ${checksHTML(x.checks.filter(k=>k.s<.99).length?x.checks.filter(k=>k.s<.99):x.checks.slice(0,2))}
-        ${newsHTML(x.code,3)}
-        <div style="margin-top:12px">${aiHTML(x)}</div>
-      </article>`).join('')+'</div>';
-  }
-  if(rest.length){
-    h+='<h3 class="sec">그 외 후보 7–16위</h3><div class="tablewrap"><table><thead><tr><th>순위</th><th>종목</th><th>종가</th><th>등락률</th><th>1차 목표</th><th>손절</th><th>손익비</th><th>수급(5일)</th><th>RSI</th><th>점수</th></tr></thead><tbody>'+
-      rest.map(x=>{const fl=x.aux.find(a=>a.label.startsWith('수급'));return `<tr class="tn"><td class="rk">${x.rank}</td><td class="nm"><b>${esc(x.name)}</b><span>${x.code} ${x.market}</span></td>
-      <td>${f0(x.close)}</td><td>${pct(x.chg)}</td><td class="upc">${f0(x.tg.t1)} <small>${pctS(x.tg.t1p)}</small></td><td class="downc">${f0(x.tg.stop)}</td>
-      <td>${x.tg.rr==null?'-':'1:'+x.tg.rr.toFixed(1)}</td><td class="${fl?dcls(fl.d):''}">${fl&&fl.d>0?'매수 우위':fl&&fl.d<0?'매도 우위':'중립'}</td><td>${x.rsi??'-'}</td><td><b>${x.score}</b></td></tr>`;}).join('')+'</tbody></table></div>';
-  }
-  document.getElementById('panel').innerHTML=h;
-  drawAll();
+      <div class="right">${x.series?'<div class="chartbox"></div>':'<p class="vl" style="text-align:left">차트는 1~6위만 제공합니다.</p>'}${newsHTML(x.code,4)}${aiHTML(x)}</div>
+    </article>`;
 }
-function drawAll(){
-  const st=D.tabs.find(t=>t.k===current).stocks;
-  document.querySelectorAll('#panel .chartbox').forEach(b=>drawChart(b,st[+b.dataset.i].series));
-  document.querySelectorAll('#panel .mini').forEach(b=>drawMini(b,st[+b.dataset.i].series));
+let SHEET_DRAW=null;
+const sheet=document.getElementById('sheet');
+function openSheet(html,draw){
+  document.getElementById('sheetBody').innerHTML=html;SHEET_DRAW=draw||null;
+  if(!sheet.open)sheet.showModal();
+  document.getElementById('sheetBody').scrollTop=0;sheet.querySelector('.shin').scrollTop=0;
+  requestAnimationFrame(()=>SHEET_DRAW&&SHEET_DRAW());
 }
+document.getElementById('sheetClose').onclick=()=>sheet.close();
+sheet.addEventListener('click',e=>{if(e.target===sheet)sheet.close();});
+function openPick(k,i){
+  const x=D.tabs.find(t=>t.k===k).stocks[i];
+  openSheet(pickCard(x),()=>{const b=sheet.querySelector('.chartbox');if(b&&x.series)drawChart(b,x.series);});
+}
+function renderPanel(){
+  const tab=D.tabs.find(t=>t.k===current),st=tab.stocks;
+  document.getElementById('tabdesc').innerHTML=(D.risk&&D.risk.score>=50?`<span class="rwarn">⚠️ 시장 위험 '${D.risk.level}' · 매수 금액을 크게 줄이세요</span><br>`:'')+esc(STRAT[current].d);
+  if(!st.length){document.getElementById('panel').innerHTML='<div class="empty">오늘은 이 전략에 맞는 종목이 없습니다.</div>';return;}
+  const row=(x,i)=>`<button class="prow ${i<3?'top':''}" data-pick="${tab.k}:${i}">
+      <span class="rk tn">${x.rank}</span>
+      <span class="pn"><b>${esc(x.name)}</b><small class="tn">${f0(x.close)} ${pct(x.chg)}</small></span>
+      ${x.series?`<span class="sp">${miniSpark(x.series.c.slice(-40))}</span>`:'<span class="sp"></span>'}
+      <span class="pt tn"><small>목표</small><b class="upc">${pctS(x.tg.t1p)}</b></span>
+      <span class="pt tn"><small>손절</small><b class="downc">${pctS(x.tg.sp)}</b></span>
+      <span class="ps tn"><i style="width:${x.score}%"></i><b>${x.score}</b></span></button>`;
+  document.getElementById('panel').innerHTML=
+    `<div class="plist">${st.slice(0,3).map(row).join('')}</div>`+
+    (st.length>3?`<h3 class="sec">지켜볼 종목</h3><div class="plist">${st.slice(3).map((x,i)=>row(x,i+3)).join('')}</div>`:'')+
+    `<p class="vl" style="text-align:left;margin-top:8px">종목을 누르면 차트·조건·뉴스·AI 분석이 열립니다.</p>`;
+}
+function drawAll(){if(sheet.open&&SHEET_DRAW)SHEET_DRAW();}
 
-/* ───── 내 종목 점검 ───── */
 const KEY='my-holdings-v1';
 const loadH=()=>{try{return JSON.parse(localStorage.getItem(KEY))||[];}catch(_){return [];}};
 const saveH=h=>{try{localStorage.setItem(KEY,JSON.stringify(h));}catch(_){}};
@@ -3289,7 +3421,7 @@ function holdPrompt(r){
     `보유 / 일부 매도 / 전량 매도 중 어떤 전략이 좋을지 근거 3가지, 주요 리스크, 참고 기사 링크와 함께 알려줘.`;
 }
 function holdCard(h,saved){
-  const act=saved?`<button class="rm" data-rm="${h.code}">저장 목록에서 삭제</button>`:`<button class="btn ghost sm" data-save="1">이 종목 저장</button>`;
+  const act=saved?`<button class="btn ghost sm danger" data-rm="${h.code}">🗑 삭제</button>`:`<button class="btn ghost sm" data-save="1">＋ 저장</button>`;
   if(!snapOf(h.code)){
     const nm=esc(NAMES[h.code]||h.code),st=PENDING[h.code];
     if(AI_URL&&!st)setTimeout(()=>fetchSnap(h.code),0);
@@ -3325,53 +3457,93 @@ function holdCard(h,saved){
       ${newsHTML(r.code,4)}
     </div></article>`;
 }
-let CHECK=null, MYSEL=null;
+let CHECK=null;
 const isSaved=code=>loadH().some(h=>h.code===code);
-function renderCheck(){
-  document.getElementById('checkResult').innerHTML=CHECK?holdCard(CHECK,isSaved(CHECK.code)):'';
+function openHold(h){
+  const draw=()=>{};
+  openSheet(holdCard(h,isSaved(h.code)),draw);
 }
-function renderMyLink(){
-  const n=loadH().length,a=document.getElementById('mylink');
-  a.hidden=!n;a.innerHTML=`<b>📁 저장한 내 종목 ${n}개</b><span>한눈에 보기 →</span>`;
-}
-function renderMy(){
-  const list=loadH(),box=document.getElementById('myview');
-  if(MYSEL&&!list.some(h=>h.code===MYSEL))MYSEL=null;
+function renderMine(){
+  const list=loadH(),box=document.getElementById('mylist');
+  if(!list.length){box.innerHTML='<div class="empty">저장한 종목이 없습니다. 위에 입력하고 <b>저장</b>을 누르면 매일 자동으로 다시 점검합니다.</div>';return;}
   let tot=0,cost=0;
   const rows=list.map(h=>{
-    if(!snapOf(h.code)){
-      if(AI_URL&&!PENDING[h.code])setTimeout(()=>fetchSnap(h.code),0);
-      return `<tr data-sel="${h.code}" class="${MYSEL===h.code?'sel':''}"><td class="nm"><b>${esc(NAMES[h.code]||h.code)}</b><span>${h.code}</span></td><td>${f0(h.qty)}주 · ${f0(h.avg)}</td><td>-</td><td>-</td><td>-</td><td class="vl">데이터 없음</td></tr>`;}
+    if(!snapOf(h.code)){if(AI_URL&&!PENDING[h.code])setTimeout(()=>fetchSnap(h.code),0);
+      return `<div class="mrow"><button class="mmain" data-hold="${h.code}"><span class="pn"><b>${esc(NAMES[h.code]||h.code)}</b><small>${f0(h.qty)}주 · 평단 ${f0(h.avg)}</small></span><span class="vl">데이터 없음</span></button><button class="del" data-rm="${h.code}" aria-label="${esc(NAMES[h.code]||h.code)} 삭제">✕</button></div>`;}
     const r=analyzeHolding(h.code,h.qty,h.avg);tot+=r.val;cost+=r.avg*r.qty;
-    return `<tr data-sel="${h.code}" class="tn ${MYSEL===h.code?'sel':''}"><td class="nm"><b>${esc(r.name)}</b><span>${r.code}</span></td><td>${f0(r.qty)}주 · ${f0(r.avg)}</td>
-      <td>${f0(r.c)} ${pct(r.chg)}</td><td class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,2)}</td><td class="${r.plAmt>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</td><td class="vv ${r.tone}">${r.v}</td></tr>`;
+    return `<div class="mrow"><button class="mmain" data-hold="${h.code}">
+        <span class="pn"><b>${esc(r.name)}</b><small class="tn">${f0(r.qty)}주 · 평단 ${f0(r.avg)} · 현재 ${f0(r.c)}</small></span>
+        <span class="mpl tn"><b class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,1)}</b><small class="${r.plAmt>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</small></span>
+        <span class="chip ${r.tone}">${r.v}</span></button>
+      <button class="del" data-rm="${h.code}" aria-label="${esc(r.name)} 삭제">✕</button></div>`;
   }).join('');
   const pl=tot-cost;
-  box.innerHTML=`<a class="back" href="#">← 오늘의 추천 종목으로</a>
-    <h2 style="margin-top:12px">📁 저장한 내 종목</h2>
-    <p class="sub">종목을 누르면 아래에 자세한 점검 결과가 나옵니다. ${list.length?`합계 평가금액 <b class="tn">${f0(tot)}원</b>, 평가손익 <b class="tn ${pl>=0?'upc':'downc'}">${pl>=0?'+':''}${f0(pl)}원</b>`:''}</p>
-    ${list.length?`<div class="tablewrap"><table class="mytbl"><thead><tr><th>종목</th><th>수량 · 평단</th><th>현재가</th><th>수익률</th><th>평가손익</th><th>차트 전략</th></tr></thead><tbody>${rows}</tbody></table></div>`:
-      '<div class="empty">저장한 종목이 없습니다. 첫 화면에서 종목을 점검한 뒤 <b>저장</b>을 눌러 보세요.</div>'}
-    <div id="mydetail">${MYSEL?holdCard(list.find(h=>h.code===MYSEL),true):''}</div>`;
+  box.innerHTML=`<div class="msum tn"><span>저장 ${list.length}종목</span><span>평가 ${f0(tot)}원</span><b class="${pl>=0?'upc':'downc'}">${pl>=0?'+':''}${f0(pl)}원</b></div><div class="mlist">${rows}</div>
+    <p class="vl" style="text-align:left;margin-top:6px">종목을 누르면 자세한 점검이 열리고, ✕를 누르면 목록에서 지워집니다.</p>`;
 }
-function rerender(){renderCheck();renderMyLink();if(location.hash==='#my')renderMy();}
+function rerender(){renderMine();if(location.hash==='#home'||location.hash==='')renderHome();}
+function weather(){const R=D.risk;if(!R)return ['🌫️','정보 없음','신호등 자료를 받지 못했습니다','mid'];const s=R.score,u=R.up;
+  if(s>=75)return ['⛈️','폭풍','신규 매수는 쉬고 현금을 늘리세요','bad'];
+  if(s>=50)return u>=35?['🌦️','비 그칠 조짐','바닥 신호가 보여요 · 아주 조금씩만','mid']:['🌧️','비','신규 매수는 평소의 절반 이하로','bad'];
+  if(s>=25)return ['⛅','구름','조금만 사고 손절가는 꼭 지키기','mid'];
+  return u>=35?['☀️','맑음','매수하기 좋은 날','ok']:['🌤️','대체로 맑음','평소처럼 해도 괜찮아요','ok'];}
+function renderHome(){
+  const box=document.getElementById('v-home'),W=weather(),R=D.risk||{},q=(D.brief&&D.brief.quick)||[];
+  const tab=D.tabs.find(t=>t.k===D.default_tab)||D.tabs[0],top=(tab?tab.stocks:[]).slice(0,3);
+  const saved=loadH(),evs=((D.outlook&&D.outlook.events)||[]).filter(e=>e.dday<=7).slice(0,4),secs=(D.outlook&&D.outlook.sec)||[];
+  const heat=x=>{const v=Math.max(-8,Math.min(8,x.r5||0)),a=(Math.abs(v)/8*.55+.08).toFixed(2);return v>=0?`rgba(212,42,60,${a})`:`rgba(29,91,216,${a})`;};
+  const mine=saved.slice(0,4).map(h=>{const s=snapOf(h.code);if(!s)return `<button class="hrow" data-hold="${h.code}"><b>${esc(NAMES[h.code]||h.code)}</b><span class="vl">데이터 없음</span></button>`;
+    const r=analyzeHolding(h.code,h.qty,h.avg);return `<button class="hrow" data-hold="${h.code}"><b>${esc(r.name)}</b><span class="tn ${r.pl>=0?'upc':'downc'}">${pctS(r.pl,1)}</span><span class="chip ${r.tone}">${r.v}</span></button>`;}).join('');
+  box.innerHTML=`
+    <div class="hgrid">
+      <a class="card wx ${W[3]}" href="#market">
+        <span class="wxi" aria-hidden="true">${W[0]}</span>
+        <span class="wxb"><small>오늘 시장 날씨</small><b>${W[1]}</b><span>${W[2]}</span></span>
+        <span class="wxs tn"><small>하락 위험</small><b>${R.score??'-'}</b><small>상승 신호</small><b>${R.up??'-'}</b></span>
+      </a>
+      ${q.length?`<div class="card strip tn">${q.map(x=>`<div><small>${esc(x.n)}</small><b class="${x.chg>=0?'upc':'downc'}">${pctS(x.chg,2)}</b></div>`).join('')}</div>`:''}
+      <div class="card">
+        <div class="ch"><h3>오늘의 TOP 3</h3>${tab?`<span class="tag ${STRAT[tab.k].c}">${tab.name}</span>`:''}</div>
+        ${top.length?`<div class="plist">${top.map((x,i)=>`<button class="prow top" data-pick="${tab.k}:${i}"><span class="rk tn">${i+1}</span><span class="pn"><b>${esc(x.name)}</b><small class="tn">${f0(x.close)} ${pct(x.chg)}</small></span><span class="pt tn"><small>목표</small><b class="upc">${pctS(x.tg.t1p)}</b></span><span class="pt tn"><small>손절</small><b class="downc">${pctS(x.tg.sp)}</b></span></button>`).join('')}</div>`:'<p class="vl" style="text-align:left">오늘은 추천 종목이 없습니다.</p>'}
+        <a class="more" href="#picks">전략별 추천 전체 →</a>
+      </div>
+      <div class="card">
+        <div class="ch"><h3>내 종목</h3><a class="more" href="#mine">${saved.length?'관리 →':'＋ 추가'}</a></div>
+        ${saved.length?`<div class="hlist">${mine}</div>${saved.length>4?`<a class="more" href="#mine">외 ${saved.length-4}종목 →</a>`:''}`:'<p class="vl" style="text-align:left;margin:0">보유 종목을 저장하면 여기서 매일 보유·매도 신호를 보여드려요.</p>'}
+      </div>
+      <div class="card">
+        <div class="ch"><h3>이번 주 일정</h3><a class="more" href="#market">전체 →</a></div>
+        ${evs.length?`<ul class="evl">${evs.map(e=>`<li><span class="dd tn">${e.dday===0?'오늘':'D-'+e.dday}</span><b>${esc(e.name)}</b><span class="vl">${esc(e.secs[0]||'')}</span></li>`).join('')}</ul>`:'<p class="vl" style="text-align:left;margin:0">이번 주 큰 일정이 없습니다.</p>'}
+      </div>
+      ${secs.length?`<div class="card wide">
+        <div class="ch"><h3>섹터 지도 <small class="vl">최근 5일</small></h3><a class="more" href="#market">5일 전망 →</a></div>
+        <div class="heat">${secs.slice().sort((a,b)=>(b.r5||0)-(a.r5||0)).map(x=>`<div class="ht2" style="background:${heat(x)}"><b>${esc(x.name)}</b><span class="tn">${pctS(x.r5,1)}</span></div>`).join('')}</div>
+      </div>`:''}
+    </div>`;
+}
 function route(){
-  const h=location.hash,my=h==='#my',gd=h.startsWith('#guide'),rvw=h==='#review';
-  document.getElementById('myview').hidden=!my;document.getElementById('guideview').hidden=!gd;document.getElementById('reviewview').hidden=!rvw;
-  document.getElementById('mainview').hidden=my||gd||rvw;
-  if(rvw){renderReview();scrollTo(0,0);}
-  else if(my){renderMy();scrollTo(0,0);}
-  else if(gd){renderGuide();const t=h.length>6&&document.getElementById(h.slice(1));if(t)t.scrollIntoView();else scrollTo(0,0);}
-  else{rerender();drawAll();}
+  let h=location.hash||'#home';if(h==='#my')h='#mine';
+  const views={'#home':'v-home','#picks':'v-picks','#mine':'v-mine','#market':'v-market','#more':'v-more','#review':'reviewview'};
+  const id=h.startsWith('#guide')?'guideview':(views[h]||'v-home');
+  document.querySelectorAll('.view').forEach(v=>v.hidden=v.id!==id);
+  const tabKey=id==='guideview'||id==='reviewview'?'more':id.replace('v-','');
+  document.querySelectorAll('#tabbar a').forEach(a=>a.classList.toggle('on',a.dataset.v===tabKey));
+  if(sheet.open)sheet.close();
+  if(id==='v-home')renderHome();
+  else if(id==='v-mine')renderMine();
+  else if(id==='reviewview')renderReview();
+  else if(id==='guideview'){renderGuide();const t=h.length>6&&document.getElementById(h.slice(1));if(t){t.scrollIntoView();return;}}
+  scrollTo(0,0);
 }
 addEventListener('hashchange',route);
 document.addEventListener('click',e=>{
+  const pk=e.target.closest('[data-pick]');if(pk){const [k,i]=pk.dataset.pick.split(':').map(Number);openPick(k,i);return;}
+  const hd=e.target.closest('[data-hold]');if(hd){const h=loadH().find(x=>x.code===hd.dataset.hold);if(h)openHold(h);return;}
   const rm=e.target.closest('[data-rm]');
-  if(rm){const l=loadH().filter(h=>h.code!==rm.dataset.rm);saveH(l);if(MYSEL===rm.dataset.rm)MYSEL=null;rerender();return;}
+  if(rm){const code=rm.dataset.rm,nm=NAMES[code]||code;if(!confirm(`${nm}을(를) 내 종목에서 삭제할까요?`))return;
+    saveH(loadH().filter(h=>h.code!==code));if(sheet.open)sheet.close();rerender();return;}
   const sv=e.target.closest('[data-save]');
-  if(sv&&CHECK){const l=loadH().filter(h=>h.code!==CHECK.code);l.unshift(CHECK);saveH(l);rerender();return;}
-  const sel=e.target.closest('[data-sel]');
-  if(sel){MYSEL=MYSEL===sel.dataset.sel?null:sel.dataset.sel;renderMy();const d=document.getElementById('mydetail');if(MYSEL&&d)d.scrollIntoView({behavior:'smooth',block:'start'});}
+  if(sv&&CHECK){const l=loadH().filter(h=>h.code!==CHECK.code);l.unshift(CHECK);saveH(l);rerender();openHold(CHECK);return;}
 });
 function initHolds(){
   const dl=document.getElementById('stocklist');
@@ -3379,20 +3551,21 @@ function initHolds(){
   const err=document.getElementById('fErr');
   const read=()=>{
     const code=findCode(document.getElementById('fStock').value),qty=+document.getElementById('fQty').value,avg=+document.getElementById('fAvg').value;
-    const bad=!code?'종목을 찾지 못했습니다. 목록에서 골라 주시거나 6자리 종목코드로 입력해 주세요 (ETF·ETN은 지원하지 않습니다).':!(qty>0)?'보유 수량을 입력해 주세요.':!(avg>0)?'평균 매입가를 입력해 주세요.':'';
+    const bad=!code?'종목을 찾지 못했습니다. 목록에서 고르거나 6자리 코드로 입력해 주세요.':!(qty>0)?'수량을 입력해 주세요.':!(avg>0)?'평균 매입가를 입력해 주세요.':'';
     err.hidden=!bad;err.textContent=bad;return bad?null:{code,qty,avg};
   };
-  document.getElementById('fCheck').onclick=()=>{const h=read();if(!h)return;CHECK=h;rerender();document.getElementById('checkResult').scrollIntoView({behavior:'smooth',block:'start'});};
-  document.getElementById('fSave').onclick=()=>{const h=read();if(!h)return;CHECK=h;const l=loadH().filter(x=>x.code!==h.code);l.unshift(h);saveH(l);rerender();};
-  rerender();
+  const clear=()=>['fStock','fQty','fAvg'].forEach(id=>document.getElementById(id).value='');
+  document.getElementById('fCheck').onclick=()=>{const h=read();if(!h)return;CHECK=h;openHold(h);};
+  document.getElementById('fSave').onclick=()=>{const h=read();if(!h)return;CHECK=h;const l=loadH().filter(x=>x.code!==h.code);l.unshift(h);saveH(l);clear();rerender();openHold(h);};
+  renderMine();
 }
 
 /* ───── 시작 ───── */
-document.getElementById('meta').textContent=`${D.asof} 종가 기준 · 분석 ${D.universe.toLocaleString()}종목 · ${D.generated} 생성 · AI 분석 ${D.ai_mode==='auto'?'자동':'버튼 방식'}`;
+document.getElementById('meta').textContent=`${D.asof} 종가 · ${D.generated.slice(5)} 갱신`;
 document.getElementById('demo').hidden=!D.demo;
 document.getElementById('refresh').onclick=()=>location.reload();
-
-renderBrief();renderScore();renderRevLink();checkFresh();setInterval(checkFresh,10*60*1000);renderRisk();renderMacro();renderOutlook();renderEvents();renderPulse();renderTabs();renderPanel();initHolds();route();
+renderBrief();renderScore();renderRevLink();checkFresh();setInterval(checkFresh,10*60*1000);renderRisk();renderMacro();renderOutlook();renderEvents();
+renderTabs();renderPanel();initHolds();route();
 let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(drawAll,150);});
 </script>
 </body>
