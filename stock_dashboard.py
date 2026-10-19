@@ -33,7 +33,7 @@ import pandas as pd
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 CFG = dict(
-    days=260,              # 수집 거래일 수 (약 1년: 52주 지표 · 과거 성적 검증용)
+    days=500,              # 수집 거래일 수 (약 2년: 52주 지표 · 1년 반 과거 성적 검증용)
     min_amount=30e8,       # 최소 거래대금 30억
     min_mcap=1000e8,       # 최소 시가총액 1,000억
     min_price=2000,        # 최소 주가
@@ -41,6 +41,10 @@ CFG = dict(
     chart_days=100,        # 차트 표시 기간
     top_n=16,              # 1~3 / 4~6 / 7~16
     cand_n=25,             # 전략별 2차 검토(수급·실적 조회) 후보 수
+    cost=0.25,             # 왕복 거래비용 % (수수료+세금) — 성적 계산 때 차감
+    vb_filter=dict(max_day_change=15.0, min_close_to_high=0.95, min_vol_ratio=3.0),   # 거래량 돌파 '그림자 필터' (기록만, 아직 미적용)
+    min_samples=30, min_days=15,   # 실시간 기록 진단: 이보다 적으면 '관찰 중'
+
 )
 
 STATUS = {}   # 데이터 출처별 수집 결과 (상세 설명 페이지에 표시)
@@ -1583,90 +1587,17 @@ def run_ai(tabs, asof):
     return "auto"
 
 
-# ───────────────────────────── 과거 성적 검증 (백테스트) ─────────────────────────────
-def backtest(P, I, market, mcap, names, offsets=range(12, 132, 5)):
-    """최근 약 6개월 동안 5거래일마다 '그날 이 프로그램이 골랐을 1~3위'를 다시 계산해서 이후 성적을 확인.
-    진입 = 다음 날 시가, 5일 수익 = 5거래일 뒤 종가, 목표·손절 = 그날 기준 1차 목표/손절가를 10거래일 안에 먼저 닿은 쪽
-    (수급·실적·매물대 조정은 과거 자료가 없어 제외한 단순화 버전)"""
-    n = len(P["c"].index)
-    res, bench, days_ = {1: [], 2: [], 3: []}, [], []
-    for off in offsets:
-        t = n - 1 - off
-        if t < CFG["min_history"] + 5 or t + 10 > n - 1:
-            continue
-        Pt = {k: v.iloc[:t + 1] for k, v in P.items()}
-        It = {k: v.iloc[:t + 1] for k, v in I.items()}
-        try:
-            ev = evaluate(Pt, It, market, light=True)
-        except Exception:
-            continue
-        c = Pt["c"].iloc[-1]
-        ok = (Pt["c"].iloc[-CFG["min_history"]:].notna().sum() >= CFG["min_history"]) & (Pt["a"].iloc[-1] >= CFG["min_amount"]) \
-            & (c >= CFG["min_price"]) & (Pt["v"].iloc[-1] > 0) & (mcap.reindex(c.index).fillna(np.inf) >= CFG["min_mcap"])
-        ok &= pd.Series([(x in market) and x.endswith("0") and "스팩" not in str(names.get(x, "")) for x in c.index], index=c.index)
-        uni = c.index[ok]
-        if len(uni) < 30:
-            continue
-        o1, c5, c10 = P["o"].iloc[t + 1], P["c"].iloc[t + 5], P["c"].iloc[t + 10]
-        H, L = P["h"].iloc[t + 1:t + 11], P["l"].iloc[t + 1:t + 11]
-        b5 = float(((c5[uni] / o1[uni]) - 1).median() * 100)
-        bench.append(b5)
-        days_.append(P["c"].index[t])
-        for k in (1, 2, 3):
-            sc = ev["scores"][f"s{k}"][uni] + sum(d[uni] for _, d, _ in ev["aux"][k])
-            t1s, _, sts = ev["tg"][k]
-            for rank, tk in enumerate(sc.sort_values(ascending=False).head(3).index, 1):
-                e = float(o1[tk])
-                if not (e > 0) or not (c5[tk] > 0):
-                    continue
-                c0, atr = float(c[tk]), float(ev["m"]["atr"][tk])
-                atr = atr if np.isfinite(atr) and atr > 0 else c0 * 0.03
-                tgt, stp = float(t1s[tk]), float(sts[tk])
-                if not (np.isfinite(stp) and stp < c0 * 0.995):
-                    stp = c0 - 1.5 * atr
-                if not (np.isfinite(tgt) and tgt > c0 * 1.01):
-                    tgt = c0 + 1.5 * atr
-                out = "none"
-                for hh, ll in zip(H[tk].to_numpy(float), L[tk].to_numpy(float)):
-                    if ll <= stp:
-                        out = "stop"
-                        break
-                    if hh >= tgt:
-                        out = "target"
-                        break
-                r5 = (float(c5[tk]) / e - 1) * 100
-                res[k].append(dict(rank=rank, r5=r5, r10=(float(c10[tk]) / e - 1) * 100, ex5=r5 - b5, out=out))
-    if not days_:
-        stat("과거 성적 검증", False, "기간 부족")
-        return None
-    summ = {}
-    for k, rows in res.items():
-        if not rows:
-            continue
-        a = pd.DataFrame(rows)
-        one = a[a["rank"] == 1]
-        summ[k] = dict(n=len(a), avg5=round(a.r5.mean(), 2), win5=round((a.r5 > 0).mean() * 100), ex5=round(a.ex5.mean(), 2),
-                       beat=round((a.ex5 > 0).mean() * 100), avg10=round(a.r10.mean(), 2),
-                       tgt=round((a.out == "target").mean() * 100), stp=round((a.out == "stop").mean() * 100),
-                       top1_avg5=(round(one.r5.mean(), 2) if len(one) else None))
-    days_.sort()
-    stat("과거 성적 검증", True, f"{len(days_)}개 시점 · {days_[0]:%Y-%m-%d}~{days_[-1]:%Y-%m-%d}")
-    print(f"  과거 성적: {len(days_)}개 시점 " + " · ".join(f"{STRATS[k]} 5일 {v['avg5']:+.2f}% (시장 대비 {v['ex5']:+.2f}%)" for k, v in summ.items()), flush=True)
-    return dict(strat={str(k): v for k, v in summ.items()}, bench=round(float(np.mean(bench)), 2), n_days=len(days_),
-                start=days_[0].strftime("%Y-%m-%d"), end=days_[-1].strftime("%Y-%m-%d"))
-
-
 # ───────────────────────────── 예측 기록 · 다음 날 비교 (프로그램 점검) ─────────────────────────────
 HIST_DIR = os.path.join(BASE, "history")
 SERIES = {}     # 5일 전망에 쓴 지수·섹터 시세 (점검 때 실제 결과 확인용)
 
 
-def make_snapshot(asof, tabs, outlook, risk):
-    picks = [dict(k=tab["k"], rank=e["rank"], code=e["code"], name=e["name"], close=e["close"], score=e["score"],
-                  t1=e["tg"]["t1"], stop=e["tg"]["stop"]) for tab in tabs for e in tab["stocks"][:6]]
+def make_snapshot(asof, tabs, outlook, risk, regime=None):
+    picks = [dict(k=tab["k"], rank=e["rank"], code=e["code"], name=e["name"], market=e.get("market", ""), close=e["close"], score=e["score"],
+                  t1=e["tg"]["t1"], stop=e["tg"]["stop"], feat=e.get("feat", {})) for tab in tabs for e in tab["stocks"][:6]]
     ol = (outlook or {})
     outs = [dict(name=o["name"], p=o["p"], er=o["er"], band=o["band"]) for o in ol.get("idx", []) + ol.get("sec", [])]
-    return dict(asof=asof, made=datetime.now().strftime("%Y-%m-%d %H:%M"), picks=picks, outlook=outs,
+    return dict(asof=asof, made=datetime.now().strftime("%Y-%m-%d %H:%M"), picks=picks, outlook=outs, regime=regime,
                 risk=(dict(score=risk["score"], up=risk["up"], level=risk["level"]) if risk else None))
 
 
@@ -1719,7 +1650,7 @@ def demo_history(P, I, market, k_days=12):
     return out
 
 
-def review(hist, P):
+def review(hist, P, market=None):
     dates = P["c"].index
     pos = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(dates)}
     n = len(dates)
@@ -1730,9 +1661,15 @@ def review(hist, P):
         if i is None or i + 1 >= n:
             continue
         liq = (a.iloc[i] >= CFG["min_amount"]) & (o.iloc[i + 1] > 0)
-        b1 = float(((c.iloc[i + 1][liq] / o.iloc[i + 1][liq]) - 1).median() * 100)
+        mkS = pd.Series([(market or {}).get(x, "") for x in c.columns], index=c.columns)
+        bench = {}
+        for hh in H_LIST:
+            if i + hh < n:
+                rr = (c.iloc[i + hh][liq] / o.iloc[i + 1][liq] - 1) * 100
+                bench[hh] = rr.groupby(mkS[liq]).median().to_dict()
+                bench[hh]["_all"] = float(rr.median())
+        b1 = bench[1]["_all"]
         mat = i + 5 < n
-        b5 = float(((c.iloc[i + 5][liq] / o.iloc[i + 1][liq]) - 1).median() * 100) if mat else None
         day = []
         for pk in s.get("picks", []):
             t = pk["code"]
@@ -1742,9 +1679,17 @@ def review(hist, P):
             if not (e > 0) or not (c.iloc[i + 1][t] > 0):
                 continue
             j_now = min(i + 5, n - 1)
-            r1 = (float(c.iloc[i + 1][t]) / e - 1) * 100
-            rn = (float(c.iloc[j_now][t]) / e - 1) * 100
-            res = "진행 중"
+            mk_t = pk.get("market") or mkS.get(t, "")
+            rec_ = dict(asof=s["asof"], date=s["asof"], k=pk["k"], rank=pk["rank"], code=t, name=pk["name"], entry=num(e),
+                        regime=s.get("regime"), vb_pass=(pk.get("feat") or {}).get("vb_pass"))
+            for hh in H_LIST:
+                if hh in bench and c.iloc[i + hh][t] > 0:
+                    g = (float(c.iloc[i + hh][t]) / e - 1) * 100 - CFG["cost"]
+                    rec_[f"r{hh}"] = round(g, 2)
+                    rec_[f"ex{hh}"] = round(g - bench[hh].get(mk_t, bench[hh]["_all"]), 2)
+                else:
+                    rec_[f"r{hh}"] = rec_[f"ex{hh}"] = None
+            res = "진행"
             for j in range(i + 1, min(i + 11, n)):
                 if pk.get("stop") and l.iloc[j][t] <= pk["stop"]:
                     res = "손절"
@@ -1752,10 +1697,9 @@ def review(hist, P):
                 if pk.get("t1") and h.iloc[j][t] >= pk["t1"]:
                     res = "목표"
                     break
-            day.append(dict(asof=s["asof"], k=pk["k"], rank=pk["rank"], code=t, name=pk["name"], entry=num(e),
-                            r1=round(r1, 2), ex1=round(r1 - b1, 2), r5=(round(rn, 2) if mat else None),
-                            ex5=(round(rn - b5, 2) if mat else None), now=round(rn, 2), held=j_now - i, out=res,
-                            t1=pk.get("t1"), stop=pk.get("stop")))
+            rec_.update(now=round((float(c.iloc[j_now][t]) / e - 1) * 100 - CFG["cost"], 2), held=j_now - i, out=res,
+                        t1=pk.get("t1"), stop=pk.get("stop"))
+            day.append(rec_)
         recs += day
         top = [x for x in day if x["rank"] <= 3]
         daylog.append(dict(asof=s["asof"], day=dates[i + 1].strftime("%m/%d"), n=len(top),
@@ -1777,18 +1721,23 @@ def review(hist, P):
             if 0 <= k0 and k0 + 5 < len(sr):
                 rev.append(dict(score=s["risk"]["score"], act=(float(sr.iloc[k0 + 5]) / float(sr.iloc[k0]) - 1) * 100))
 
-    strat = {}
+    strat, regime_live = {}, {}
     for k in (1, 2, 3):
         r = [x for x in recs if x["k"] == k and x["rank"] <= 3]
-        m5 = [x for x in r if x["r5"] is not None]
         if not r:
             continue
-        strat[str(k)] = dict(n1=len(r), avg1=round(float(np.mean([x["r1"] for x in r])), 2), win1=round(float(np.mean([x["r1"] > 0 for x in r])) * 100),
-                             ex1=round(float(np.mean([x["ex1"] for x in r])), 2), n5=len(m5),
-                             avg5=(round(float(np.mean([x["r5"] for x in m5])), 2) if m5 else None),
-                             ex5=(round(float(np.mean([x["ex5"] for x in m5])), 2) if m5 else None),
-                             tgt=(round(float(np.mean([x["out"] == "목표" for x in m5])) * 100) if m5 else None),
-                             stp=(round(float(np.mean([x["out"] == "손절" for x in m5])) * 100) if m5 else None))
+        rr = [dict(x, **{f"r{hh}": (np.nan if x[f"r{hh}"] is None else x[f"r{hh}"]) for hh in H_LIST},
+                   **{f"ex{hh}": (np.nan if x[f"ex{hh}"] is None else x[f"ex{hh}"]) for hh in H_LIST}) for x in r]
+        sm = summarize_rows(rr)
+        sm["watch"] = sm["n"] < CFG["min_samples"] or sm["days"] < CFG["min_days"]
+        strat[str(k)] = sm
+        regime_live[str(k)] = {g: summarize_rows([x for x in rr if x.get("regime") == g]) for g in ("강세", "약세")}
+    vbl = [x for x in recs if x["k"] == 2 and x["rank"] <= 3 and x.get("vb_pass") is not None]
+    vb_live = None
+    if vbl:
+        cv = lambda L: [dict(x, **{f"r{hh}": (np.nan if x[f"r{hh}"] is None else x[f"r{hh}"]) for hh in H_LIST},
+                             **{f"ex{hh}": (np.nan if x[f"ex{hh}"] is None else x[f"ex{hh}"]) for hh in H_LIST}) for x in L]
+        vb_live = dict(pass_=summarize_rows(cv([x for x in vbl if x["vb_pass"]])), fail=summarize_rows(cv([x for x in vbl if not x["vb_pass"]])))
     ol = None
     if oev:
         hi = [x for x in oev if x["p"] >= 55]
@@ -1806,6 +1755,7 @@ def review(hist, P):
     latest = [x for x in recs if x["asof"] == (daylog[-1]["asof"] if daylog else None)]
     latest_ol = [x for x in oev if x["asof"] == (oev[-1]["asof"] if oev else None)]
     return dict(n_snap=len(hist), first=(hist[0]["asof"] if hist else None), last=last, daylog=daylog[-20:], strat=strat,
+                regime=regime_live, vb=vb_live, cost=CFG["cost"],
                 ol=ol, rk=rk, latest=latest, latest_ol=latest_ol, recent=recs[-60:])
 
 
@@ -1816,29 +1766,74 @@ FIX = {
 }
 
 
-def diagnose(rv, status):
+def diagnose_bt(bt, add):
+    """1년 반 과거 검증(표본 수백 건) 기반 진단 — 지금 바로 믿을 수 있는 쪽"""
+    if not bt:
+        return
+    for k_, v in bt["strat"].items():
+        k, nm, h3 = int(k_), STRATS[int(k_)], v.get("h3") or {}
+        if not h3:
+            continue
+        txt = f"{v['n']}건·{v['days']}거래일 · 3일 시장 대비 {h3['ex']:+.2f}%p (비용 차감) · t={h3['t']}"
+        if v["verdict"] == "역효과":
+            add("bad", f"{nm}: 과거 1년 반 검증에서 시장보다 못함", txt, FIX[k])
+        elif v["verdict"] == "효과 있음":
+            add("ok", f"{nm}: 과거 검증에서 시장보다 꾸준히 나음", txt, "현재 설정 유지")
+        else:
+            add("info", f"{nm}: 과거 검증에서 뚜렷한 우위 없음", txt, "점수 상위 종목만 추천하거나, 약한 시장에서 이 전략을 쉬는 방법 검토")
+        rg = bt["regime"].get(k_, {})
+        w, s_ = (rg.get("약세") or {}).get("h3"), (rg.get("강세") or {}).get("h3")
+        if w and s_ and w["n"] >= 30 and w["ex"] < -0.5 and s_["ex"] > 0:
+            add("warn", f"{nm}: 약세장에서만 성적이 나쁨", f"강세장 {s_['ex']:+.2f}%p ({s_['n']}건) · 약세장 {w['ex']:+.2f}%p ({w['n']}건)",
+                "시장 날씨가 비·폭풍일 때 이 전략을 홈 TOP 3과 추천에서 빼는 수정")
+        if v.get("stp") is not None and v["stp"] >= 50 and v["stp"] > v.get("tgt", 0):
+            add("warn", f"{nm}: 손절이 목표보다 먼저 닿는 경우가 많음", f"10일 안에 손절 {v['stp']}% · 목표 {v['tgt']}%",
+                "손절가를 ATR 1.5배→2배로 넓히거나, 손익비 2 이상인 종목만 추천하는 수정")
+    g = bt.get("vb_grid") or []
+    base = next((x for x in g if x["vmin"] == 2.0 and x["cmax"] == 30.0), None)
+    good = [x for x in g if x["n"] >= 60 and (x["t"] or 0) >= 2 and (x["ex3_a"] or -1) > 0 and (x["ex3_b"] or -1) > 0]
+    if base and good:
+        best = max(good, key=lambda x: x["ex3"])
+        if best["ex3"] - base["ex3"] >= 0.3:
+            add("warn", "거래량 돌파: 기준값을 바꾸면 과거 성적이 좋아짐",
+                f"지금(거래량 2배·상승 제한 없음) 3일 시장 대비 {base['ex3']:+.2f}%p → 거래량 {best['vmin']:g}배 이상·당일 상승 {best['cmax']:g}% 이하만 고르면 {best['ex3']:+.2f}%p (t={best['t']}, 앞·뒤 기간 모두 플러스)",
+                f"거래량 돌파 후보에서 거래량 {best['vmin']:g}배 미만, 당일 +{best['cmax']:g}% 초과 종목을 빼는 수정")
+    sh = bt.get("vb_shadow") or {}
+    pa, fa = (sh.get("pass_") or {}).get("h3"), (sh.get("fail") or {}).get("h3")
+    if pa and fa and pa["n"] >= 30 and fa["n"] >= 30 and pa["ex"] - fa["ex"] >= 0.5:
+        add("info", "거래량 돌파 그림자 필터가 효과 있어 보임", f"필터 통과 {pa['ex']:+.2f}%p ({pa['n']}건) vs 미통과 {fa['ex']:+.2f}%p ({fa['n']}건)",
+            "그림자 필터(당일 +15% 이하·종가가 고가의 95% 이상·거래량 3배 이상)를 실제 조건으로 바꾸는 수정")
+
+
+def diagnose(rv, status, bt=None):
     tips = []
     add = lambda sev, title, detail, fix="": tips.append(dict(sev=sev, title=title, detail=detail, fix=fix))
     for k_, v in status.items():
         if v["ok"] is False:
             add("bad", f"데이터 수집 실패: {k_}", v["detail"], "이 출처를 다른 무료 출처로 바꾸거나 재시도 횟수를 늘리는 수정")
+    diagnose_bt(bt, add)
     if not rv or rv["n_snap"] == 0:
-        add("info", "기록 시작", "오늘부터 아침 예측을 저장합니다. 내일 아침부터 하루 결과, 5거래일 뒤부터 5일 결과를 비교합니다.")
-        return tips
+        add("info", "실시간 기록 시작", "오늘부터 아침 예측을 저장합니다. 내일 아침부터 하루 결과, 5거래일 뒤부터 5일 결과를 비교합니다.")
+        order = {"bad": 0, "warn": 1, "info": 2, "ok": 3}
+        return sorted(tips, key=lambda x: order[x["sev"]])
+    watch = [f"{STRATS[int(k_)]} {v['n']}건·{v['days']}일" for k_, v in rv["strat"].items() if v.get("watch")]
+    if watch:
+        add("info", "실시간 기록은 아직 관찰 중", " · ".join(watch) + f" (판단 기준: 전략별 {CFG['min_samples']}건·{CFG['min_days']}거래일 이상)",
+            "그 전까지는 위의 '과거 1년 반 검증' 결과를 기준으로 판단하세요")
     for k_, v in rv["strat"].items():
-        k = int(k_)
-        nm = STRATS[k]
-        if v["n1"] >= 15 and v["ex1"] <= -0.5 and v["win1"] < 45:
-            add("bad", f"{nm} 다음 날 성적 부진", f"{v['n1']}건 평균 {v['avg1']:+.2f}% · 시장 대비 {v['ex1']:+.2f}%p · 승률 {v['win1']}%", FIX[k])
-        elif v["n1"] >= 15 and v["ex1"] >= 0.3 and v["win1"] >= 55:
-            add("ok", f"{nm} 잘 맞고 있음", f"{v['n1']}건 평균 {v['avg1']:+.2f}% · 시장 대비 {v['ex1']:+.2f}%p · 승률 {v['win1']}%", "현재 설정 유지")
-        if v["n5"] >= 10 and v["ex5"] is not None and v["ex5"] <= -1:
-            add("bad", f"{nm} 5일 성적이 시장보다 낮음", f"{v['n5']}건 5일 평균 {v['avg5']:+.2f}% · 시장 대비 {v['ex5']:+.2f}%p", FIX[k])
-        if v["n5"] >= 10 and v["stp"] is not None and v["stp"] >= 50 and v["stp"] > (v["tgt"] or 0):
-            add("warn", f"{nm} 손절 도달이 너무 많음", f"10일 안에 손절 {v['stp']}% · 목표 {v['tgt']}%",
-                "손절 폭이 좁습니다: 손절가를 ATR 1.5배→2배로 넓히거나, 손익비 2 이상인 종목만 추천하는 수정")
-        if v["n5"] >= 10 and v["tgt"] is not None and v["tgt"] >= 60 and (v["avg5"] or 0) > 0:
-            add("info", f"{nm} 1차 목표 도달이 잦음", f"목표 도달 {v['tgt']}%", "1차 목표가 낮을 수 있습니다: 2차 목표까지 일부 보유하도록 안내를 바꾸는 수정")
+        if v.get("watch"):
+            continue
+        k, nm = int(k_), STRATS[int(k_)]
+        for hh in (3, 1):
+            x = v.get(f"h{hh}")
+            if not x or x["t"] is None:
+                continue
+            txt = f"{x['n']}건 · {hh}일 평균 {x['avg']:+.2f}% (비용 차감) · 시장 대비 {x['ex']:+.2f}%p · t={x['t']}"
+            if x["t"] <= -2:
+                add("bad", f"{nm}: 실제 기록에서 시장보다 꾸준히 못함", txt, FIX[k])
+            elif x["t"] >= 2:
+                add("ok", f"{nm}: 실제 기록에서도 시장보다 나음", txt, "현재 설정 유지")
+            break
     ol = rv.get("ol")
     if ol and ol["n"] >= 30:
         if ol["hit"] < 50:
@@ -1861,11 +1856,194 @@ def diagnose(rv, status):
                 "분산일·VIX 점수를 줄이고 지수 이동평균·신저가 비율 점수를 늘리는 수정")
         else:
             add("ok", "시장 신호등이 방향대로 작동", f"위험 50점 이상 다음 5일 {rk['hi']:+.2f}% < 25점 미만 {rk['lo']:+.2f}%", "현재 설정 유지")
-    n1 = sum(v["n1"] for v in rv["strat"].values())
-    if n1 < 45:
-        add("info", "아직 기록이 적음", f"추천 결과 {n1}건 · 예측 기록 {rv['n_snap']}일치", "2~3주 이상 쌓이면 진단이 훨씬 정확해집니다")
     order = {"bad": 0, "warn": 1, "info": 2, "ok": 3}
     return sorted(tips, key=lambda x: order[x["sev"]])
+
+
+# ───────────────────────────── 과거 성적 검증 (백테스트, 약 1년 반 · 매 거래일) ─────────────────────────────
+H_LIST = (1, 3, 5)
+
+
+def _tstat(vals):
+    v = np.asarray([x for x in vals if x == x], float)
+    if len(v) < 5 or v.std(ddof=1) == 0:
+        return None
+    return float(v.mean() / (v.std(ddof=1) / np.sqrt(len(v))))
+
+
+def summarize_rows(rows, key_day="date"):
+    """보유기간별: 건수·평균(비용 차감)·중앙값·승률·시장 대비·최대 손실·t값(날짜별 평균 기준)"""
+    if not rows:
+        return None
+    a = pd.DataFrame(rows)
+    out = dict(n=len(a), days=int(a[key_day].nunique()))
+    for h in H_LIST:
+        r, e = a[f"r{h}"].dropna(), a[f"ex{h}"].dropna()
+        if not len(r):
+            continue
+        daily = a.dropna(subset=[f"ex{h}"]).groupby(key_day)[f"ex{h}"].mean()
+        out[f"h{h}"] = dict(n=int(len(r)), avg=round(float(r.mean()), 2), med=round(float(r.median()), 2),
+                            win=round(float((r > 0).mean() * 100)), ex=round(float(e.mean()), 2),
+                            worst=round(float(r.min()), 1), t=(round(_tstat(daily.values), 2) if _tstat(daily.values) is not None else None))
+    if "out" in a:
+        done = a[a["out"] != "진행"]
+        if len(done):
+            out["tgt"] = round(float((done["out"] == "목표").mean() * 100))
+            out["stp"] = round(float((done["out"] == "손절").mean() * 100))
+    return out
+
+
+def verdict(s, h=3):
+    """t값 2 이상 + 앞·뒤 기간 모두 플러스 → 효과 있음"""
+    x = (s or {}).get(f"h{h}")
+    if not x or x["t"] is None:
+        return "판단 보류"
+    if x["t"] >= 2:
+        return "효과 있음"
+    if x["t"] <= -2:
+        return "역효과"
+    return "효과 불분명"
+
+
+def backtest(P, I, market, mcap, names, asof=None, demo=False):
+    """과거 매 거래일마다 '그날 이 프로그램이 골랐을 전략별 1~3위'를 다시 계산해 이후 성적을 확인.
+    진입 = 다음 날 시가 · 수익 = 1/3/5거래일 뒤 종가 · 왕복 비용 차감 · 시장 대비 = 같은 시장(코스피/코스닥) 종목 중간값과 비교.
+    한계: 지금 상장된 종목만으로 계산(그 사이 상장폐지된 종목 빠짐 → 결과가 실제보다 조금 좋게 나올 수 있음), 과거 수급·실적 자료 없음."""
+    cache = os.path.join(HIST_DIR, "backtest_cache.json")
+    if not demo and asof and os.path.exists(cache):
+        try:
+            cj = json.load(open(cache, encoding="utf-8"))
+            if cj.get("asof") == asof and cj.get("ver") == 2:
+                print("  과거 성적: 오늘 계산해 둔 결과 재사용", flush=True)
+                stat("과거 성적 검증", True, f"{cj['res']['n_days']}거래일 · {cj['res']['start']}~{cj['res']['end']} (재사용)")
+                return cj["res"]
+        except Exception:
+            pass
+    dates = P["c"].index
+    n = len(dates)
+    cost = CFG["cost"]
+    mk = pd.Series([market.get(x, "") for x in P["c"].columns], index=P["c"].columns)
+    okname = pd.Series([x.endswith("0") and (x in market) and "스팩" not in str(names.get(x, "")) for x in P["c"].columns], index=P["c"].columns)
+    mc_ok = mcap.reindex(P["c"].columns).fillna(np.inf) >= CFG["min_mcap"]
+    VB = CFG["vb_filter"]
+    rows, grid = [], []
+    start = CFG["min_history"] + 5
+    if demo:
+        start = max(start, n - 80)
+    for t in range(start, n - 1):
+        Pt = {k: v.iloc[:t + 1] for k, v in P.items()}
+        It = {k: v.iloc[:t + 1] for k, v in I.items()}
+        try:
+            ev = evaluate(Pt, It, market, light=True)
+        except Exception:
+            continue
+        c = Pt["c"].iloc[-1]
+        ok = (Pt["c"].iloc[-CFG["min_history"]:].notna().sum() >= CFG["min_history"]) & (Pt["a"].iloc[-1] >= CFG["min_amount"]) \
+            & (c >= CFG["min_price"]) & (Pt["v"].iloc[-1] > 0) & okname & mc_ok
+        uni = c.index[ok]
+        if len(uni) < 30:
+            continue
+        regime = "강세" if float((c[uni] > It["ma20"].iloc[-1][uni]).mean()) >= 0.5 else "약세"
+        o1 = P["o"].iloc[t + 1]
+        fut = {h: (P["c"].iloc[t + h] if t + h < n else None) for h in H_LIST}
+        bench = {}
+        for h in H_LIST:
+            if fut[h] is None:
+                continue
+            rr = (fut[h][uni] / o1[uni] - 1) * 100
+            bench[h] = rr.groupby(mk[uni]).median().to_dict()
+        m_ = ev["m"]
+        h_last = Pt["h"].iloc[-1]
+        H10, L10 = P["h"].iloc[t + 1:t + 11], P["l"].iloc[t + 1:t + 11]
+        for k in (1, 2, 3):
+            sc = (ev["scores"][f"s{k}"][uni] + sum(d[uni] for _, d, _ in ev["aux"][k])).sort_values(ascending=False)
+            t1s, _, sts = ev["tg"][k]
+
+            def rec(tk, rank):
+                e = float(o1[tk])
+                if not (e > 0):
+                    return None
+                c0, atr = float(c[tk]), float(m_["atr"][tk])
+                atr = atr if np.isfinite(atr) and atr > 0 else c0 * 0.03
+                tgt, stp = float(t1s[tk]), float(sts[tk])
+                if not (np.isfinite(stp) and stp < c0 * 0.995):
+                    stp = c0 - 1.5 * atr
+                if not (np.isfinite(tgt) and tgt > c0 * 1.01):
+                    tgt = c0 + 1.5 * atr
+                out = "진행" if t + 10 >= n else "없음"
+                for hh, ll in zip(H10[tk].to_numpy(float), L10[tk].to_numpy(float)):
+                    if ll <= stp:
+                        out = "손절"
+                        break
+                    if hh >= tgt:
+                        out = "목표"
+                        break
+                r = dict(date=dates[t].strftime("%Y-%m-%d"), k=k, rank=rank, regime=regime, out=out,
+                         vr=float(m_["vr"][tk]), chg=float(m_["chg"][tk]), cth=float(c0 / h_last[tk]) if h_last[tk] > 0 else np.nan)
+                for h in H_LIST:
+                    if fut[h] is None or not (fut[h][tk] > 0):
+                        r[f"r{h}"] = r[f"ex{h}"] = np.nan
+                        continue
+                    g = (float(fut[h][tk]) / e - 1) * 100
+                    r[f"r{h}"] = g - cost
+                    r[f"ex{h}"] = g - cost - bench[h].get(mk[tk], 0.0)
+                if k == 2:
+                    r["vb_pass"] = bool(r["chg"] <= VB["max_day_change"] and r["cth"] >= VB["min_close_to_high"] and r["vr"] >= VB["min_vol_ratio"])
+                return r
+            for rank, tk in enumerate(sc.index[:3], 1):
+                x = rec(tk, rank)
+                if x:
+                    rows.append(x)
+            if k == 2 and 3 in fut and fut[3] is not None:      # 거래량 돌파 기준값 격자 비교 (그날 후보 30개 안에서 다시 고르기)
+                cand = list(sc.index[:30])
+                for vmin in (2.0, 2.5, 3.0, 4.0):
+                    for cmax in (10.0, 15.0, 30.0):
+                        pk = [x for x in cand if m_["vr"][x] >= vmin and m_["chg"][x] <= cmax][:3]
+                        for tk in pk:
+                            x = rec(tk, 0)
+                            if x and x["ex3"] == x["ex3"]:
+                                grid.append(dict(date=x["date"], vmin=vmin, cmax=cmax, ex3=x["ex3"], r3=x["r3"]))
+    if not rows:
+        stat("과거 성적 검증", False, "기간 부족")
+        return None
+    A = pd.DataFrame(rows)
+    days_ = sorted(A["date"].unique())
+    mid = days_[len(days_) // 2]
+    res = dict(start=days_[0], end=days_[-1], n_days=len(days_), cost=cost, strat={}, regime={}, half={})
+    for k in (1, 2, 3):
+        rk = [r for r in rows if r["k"] == k]
+        s = summarize_rows(rk)
+        s["verdict"] = verdict(s)
+        res["strat"][str(k)] = s
+        res["regime"][str(k)] = {g: summarize_rows([r for r in rk if r["regime"] == g]) for g in ("강세", "약세")}
+        h1 = summarize_rows([r for r in rk if r["date"] < mid])
+        h2 = summarize_rows([r for r in rk if r["date"] >= mid])
+        res["half"][str(k)] = dict(a=h1, b=h2, first=f"{days_[0]}~{mid}", second=f"{mid}~{days_[-1]}")
+        if s["verdict"] == "효과 있음" and not ((h1 or {}).get("h3", {}).get("ex", -1) > 0 and (h2 or {}).get("h3", {}).get("ex", -1) > 0):
+            s["verdict"] = "효과 불분명"     # 한쪽 기간에서만 좋았다면 우연일 수 있음
+    vb = [r for r in rows if r["k"] == 2]
+    res["vb_shadow"] = dict(pass_=summarize_rows([r for r in vb if r.get("vb_pass")]), fail=summarize_rows([r for r in vb if not r.get("vb_pass")]),
+                            rule=VB)
+    if grid:
+        G = pd.DataFrame(grid)
+        gt = []
+        for (vmin, cmax), g in G.groupby(["vmin", "cmax"]):
+            daily = g.groupby("date")["ex3"].mean()
+            gt.append(dict(vmin=vmin, cmax=cmax, n=len(g), ex3=round(float(g.ex3.mean()), 2), win=round(float((g.r3 > 0).mean() * 100)),
+                           t=(round(_tstat(daily.values), 2) if _tstat(daily.values) is not None else None),
+                           ex3_a=round(float(g[g.date < mid].ex3.mean()), 2) if (g.date < mid).any() else None,
+                           ex3_b=round(float(g[g.date >= mid].ex3.mean()), 2) if (g.date >= mid).any() else None))
+        res["vb_grid"] = gt
+    stat("과거 성적 검증", True, f"{len(days_)}거래일 · {days_[0]}~{days_[-1]} · {len(rows)}건")
+    print("  과거 성적: " + " · ".join(f"{STRATS[k]} 3일 시장 대비 {res['strat'][str(k)]['h3']['ex']:+.2f}%p (t={res['strat'][str(k)]['h3']['t']})"
+                                     for k in (1, 2, 3) if res["strat"][str(k)].get("h3")), flush=True)
+    if not demo and asof:
+        try:
+            os.makedirs(HIST_DIR, exist_ok=True)
+            json.dump(dict(asof=asof, ver=2, res=res), open(cache, "w", encoding="utf-8"), ensure_ascii=False)
+        except Exception:
+            pass
+    return res
 
 
 # ───────────────────────────── 결과 조립 ─────────────────────────────
@@ -1966,6 +2144,13 @@ def build(demo=False, mode="file"):
                         t1p=num(tg["t1p"], 1), t2p=num(tg["t2p"], 1), sp=num(tg["sp"], 1),
                         note=tg["note"], stop_label=tg["stop_label"]),
             )
+            hl = float(P["h"].iloc[-1][t]) if P["h"].iloc[-1][t] > 0 else np.nan
+            vbf = CFG["vb_filter"]
+            e["feat"] = dict(vr=num(m["vr"][t], 2), rsi=num(m["rsi"][t], 1), chg=num(m["chg"][t], 2),
+                             gap20=num((c[t] / m["ma20"][t] - 1) * 100, 2), cth=num(c[t] / hl, 3))
+            if k == 2:
+                e["feat"]["vb_pass"] = bool((e["feat"]["chg"] or 0) <= vbf["max_day_change"] and (e["feat"]["cth"] or 0) >= vbf["min_close_to_high"]
+                                            and (e["feat"]["vr"] or 0) >= vbf["min_vol_ratio"])
             e["prompt"] = ai_prompt(e, asof)
             if rank <= 6:
                 e["series"] = series(t, tg)
@@ -1993,7 +2178,7 @@ def build(demo=False, mode="file"):
 
     print("과거 성적 검증 중…", flush=True)
     try:
-        bt = backtest(P, I, market, mcap, names)
+        bt = backtest(P, I, market, mcap, names, asof=asof, demo=demo)
     except Exception as ex:
         print(f"  과거 성적 검증 실패: {ex}", flush=True)
         bt = None
@@ -2008,13 +2193,13 @@ def build(demo=False, mode="file"):
     try:
         past = demo_history(P, I, market) if demo else load_history(asof)
         if not demo:
-            save_snapshot(make_snapshot(asof, tabs, outlook, risk))
-        rv = review(past, P)
+            save_snapshot(make_snapshot(asof, tabs, outlook, risk, regime=("강세" if (c[uni] > m["ma20"][uni]).mean() >= 0.5 else "약세")))
+        rv = review(past, P, market)
     except Exception as ex:
         print(f"  예측 기록 점검 실패: {ex}", flush=True)
         rv = None
     stat("예측 기록 (저장소 history 폴더)", rv is not None, f"{rv['n_snap']}일치 기록" if rv else "실패")
-    tips = diagnose(rv, STATUS)
+    tips = diagnose(rv, STATUS, bt)
     try:
         brief = build_briefing(risk, outlook, macro, tabs, demo)
     except Exception as ex:
@@ -3131,10 +3316,12 @@ function checkFresh(){
 function renderScore(){
   const box=document.getElementById('score'),bt=D.bt,O=D.outlook,R=D.risk;
   const cards=[];
-  if(bt){const rows=[3,1,2].filter(k=>bt.strat[k]).map(k=>{const v=bt.strat[k],good=v.ex5>0&&v.beat>=50;
-      return `<tr class="tn"><td><span class="tag ${STRAT[k].c}">${STRAT[k].n}</span></td><td class="${v.avg5>=0?'upc':'downc'}">${pctS(v.avg5,2)}</td><td>${v.win5}%</td><td class="${v.ex5>=0?'pos':'neg'}"><b>${pctS(v.ex5,2)}</b></td><td>${v.tgt}% / ${v.stp}%</td><td>${good?'<span class="tr tg">시장보다 나음</span>':'<span class="tr tb">시장보다 못함</span>'}</td></tr>`;}).join('');
-    cards.push(`<div class="sc wide"><h4>추천 종목 과거 성적 <span class="vl">${bt.start} ~ ${bt.end} · ${bt.n_days}개 시점 · 전략별 1~3위</span></h4>
-      <div class="tablewrap flat"><table class="sctbl"><thead><tr><th>전략</th><th>5일 평균</th><th>승률</th><th>시장 대비</th><th>목표 / 손절 도달</th><th>판정</th></tr></thead><tbody>${rows}</tbody></table></div></div>`);}
+  if(bt){const vc=v=>v==='효과 있음'?'tg':v==='역효과'?'tb':'tf';
+    const rows=[3,1,2].filter(k=>bt.strat[k]&&bt.strat[k].h3).map(k=>{const v=bt.strat[k],x=v.h3;
+      return `<tr class="tn"><td><span class="tag ${STRAT[k].c}">${STRAT[k].n}</span></td><td class="${x.ex>=0?'pos':'neg'}"><b>${pctS(x.ex,2)}</b></td><td>${x.win}%</td><td>${x.t==null?'-':x.t}</td><td><span class="tr ${vc(v.verdict)}">${v.verdict}</span></td></tr>`;}).join('');
+    cards.push(`<div class="sc wide"><h4>추천 전략 과거 검증 <span class="vl">${bt.start} ~ ${bt.end} · ${bt.n_days}거래일 · 비용 ${bt.cost}% 차감</span></h4>
+      <div class="tablewrap flat"><table class="sctbl"><thead><tr><th>전략</th><th>3일 시장 대비</th><th>승률</th><th>t값</th><th>판정</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <p class="vl" style="text-align:left;margin:4px 0 0">t값 2 이상이고 앞·뒤 기간 모두 좋아야 '효과 있음'입니다.</p></div>`);}
   if(O){const good=O.hit>O.base+1;
     cards.push(`<div class="sc"><h4>5일 전망 적중률</h4><div class="big2 tn ${good?'pos':'neg'}">${O.hit}%</div><p class="vl" style="text-align:left;margin:0">찍기 ${O.base}% · ${esc(O.model||'')} · ${O.test_from||''}~ 기간</p><p class="verdict2 ${good?'pos':'neg'}">${good?'찍기보다 조금 나음':'찍기와 비슷 · 흔들림 폭만 참고'}</p></div>`);}
   if(R&&R.valid&&R.valid.length){const g=k=>R.valid.find(v=>v.lab===k);const a=g('경계 이상'),b=g('안정');
@@ -3144,19 +3331,34 @@ function renderScore(){
   if(!cards.length){box.hidden=true;return;}
   box.innerHTML=`<div class="bhead"><h2 style="margin:0">📏 이 도구의 성적표 <a class="q" href="#guide-verify" aria-label="자세히">?</a></h2><span class="vl">과거 실제 데이터로 다시 계산한 결과</span></div><div class="scgrid">${cards.join('')}</div>`;
 }
+function btGuide(bt){
+  const hz=(s)=>[1,3,5].map(h=>{const x=s&&s['h'+h];return x?[`${h}일`,x.n+'건',pctS(x.avg,2),pctS(x.med,2),x.win+'%',`<b>${pctS(x.ex,2)}</b>`,pctS(x.worst,1),x.t==null?'-':x.t]:null;}).filter(Boolean);
+  const head=['보유','건수','평균','중앙값','승률','시장 대비','최대 손실','t값'];
+  let h=`<h5>추천 전략 과거 검증 (${bt.start} ~ ${bt.end}, ${bt.n_days}거래일)</h5>
+    <p>그 기간 <b>매 거래일</b>마다 '그날 이 프로그램이 골랐을 전략별 1~3위'를 다시 계산했습니다. 진입은 <b>다음 날 시가</b>, 수익은 1·3·5거래일 뒤 종가 기준이며 <b>왕복 비용 ${bt.cost}%</b>를 뺐습니다. 시장 대비는 <b>같은 시장(코스피/코스닥)</b> 종목 중간값과 비교했습니다. t값은 날짜별 평균으로 계산해 같은 날 몰린 결과에 휘둘리지 않게 했고, <b>2 이상</b>이어야 우연이 아닐 가능성이 높습니다.</p>`;
+  [3,1,2].forEach(k=>{const v=bt.strat[k];if(!v)return;const rg=bt.regime[k]||{},hf=bt.half[k]||{};
+    h+=`<h5 class="${STRAT[k].c}">${STRAT[k].n} · ${v.verdict} <span class="vl">목표 도달 ${v.tgt??'-'}% · 손절 도달 ${v.stp??'-'}%</span></h5>${T(hz(v),head)}`;
+    const r3=(o)=>o&&o.h3?`${pctS(o.h3.ex,2)} (${o.h3.n}건, t=${o.h3.t??'-'})`:'-';
+    h+=T([['강세장 (20일선 위 종목 50% 이상)',r3(rg['강세'])],['약세장',r3(rg['약세'])],[`앞 기간 ${hf.first||''}`,r3(hf.a)],[`뒤 기간 ${hf.second||''}`,r3(hf.b)]],['구분','3일 시장 대비']);});
+  const g=bt.vb_grid||[];
+  if(g.length){h+=`<h5>거래량 돌파 · 기준값 바꿔보기 (3일 시장 대비)</h5><p>그날 후보 상위 30개 안에서 기준을 바꿔 다시 고른 결과입니다. 한 칸만 좋고 주변 칸이 나쁘면 우연일 가능성이 큽니다.</p>`+
+    T(g.map(x=>[`${x.vmin}배 이상`,x.cmax>=30?'제한 없음':`+${x.cmax}% 이하`,x.n+'건',`<b>${pctS(x.ex3,2)}</b>`,x.win+'%',x.t??'-',`${x.ex3_a==null?'-':pctS(x.ex3_a,2)} / ${x.ex3_b==null?'-':pctS(x.ex3_b,2)}`]),['거래량','당일 상승','건수','시장 대비','승률','t값','앞 / 뒤 기간']);}
+  const sh=bt.vb_shadow||{};
+  if(sh.pass_||sh.fail){const f=o=>o&&o.h3?`${pctS(o.h3.ex,2)} (${o.h3.n}건)`:'-';
+    h+=`<h5>거래량 돌파 · 그림자 필터</h5><p>당일 +${sh.rule.max_day_change}% 이하 · 종가가 고가의 ${Math.round(sh.rule.min_close_to_high*100)}% 이상 · 거래량 ${sh.rule.min_vol_ratio}배 이상인지 <b>기록만</b> 하고 실제 추천에는 아직 쓰지 않습니다.</p>`+T([['통과',f(sh.pass_)],['미통과',f(sh.fail)]],['','3일 시장 대비']);}
+  h+=`<p class="vl" style="text-align:left">한계: 지금 상장된 종목으로만 계산해서 그 사이 상장폐지된 종목이 빠져 있습니다(결과가 실제보다 조금 좋게 나올 수 있음). 과거 수급·실적·매물대 자료가 없어 그 부분은 빼고 계산했습니다. 뉴스·AI 판단은 과거로 재현할 수 없어 실시간 기록으로만 확인합니다.</p>`;
+  return h;
+}
 function renderGuide(){
   const g=document.getElementById('guideview'),bt=D.bt,O=D.outlook,R=D.risk,S=D.status||{};
   const sec=(id,title,body)=>`<section class="gsec" id="guide-${id}"><h3>${title}</h3>${body}</section>`;
   const st=Object.entries(S).map(([k,v])=>[`${v.ok===null?'➖':v.ok?'✅':'⚠️'} ${esc(k)}`,esc(v.detail)]);
-  const btRows=bt?[3,1,2].filter(k=>bt.strat[k]).map(k=>{const v=bt.strat[k];return [STRAT[k].n,v.n+'건',pctS(v.avg5,2),v.win5+'%',pctS(v.ex5,2),v.beat+'%',pctS(v.avg10,2),v.tgt+'%',v.stp+'%',v.top1_avg5==null?'-':pctS(v.top1_avg5,2)];}):[];
+  const btRows=[];
   const toc=[['verify','성적표 · 팩트 체크'],['data','데이터 수집 상태'],['how','전체 흐름'],['picks','추천 순위'],['rules','전략별 기본 조건'],['aux','보조 지표'],['target','목표가·손절가'],['hold','내 종목 점검'],['signals','시장 방향 신호등'],['macro','글로벌 지표'],['outlook','5일 전망 모델'],['events','다가오는 일정'],['brief','오늘의 브리핑'],['ai','AI 분석·뉴스']];
   g.innerHTML=`<a class="back" href="#">← 대시보드로 돌아가기</a><h2 style="margin-top:12px">📖 상세 설명 · 검증 결과</h2>
     <nav class="gtoc">${toc.map(([id,t])=>`<a href="#guide-${id}">${t}</a>`).join('')}</nav>
     ${sec('verify','📏 성적표 · 팩트 체크',
-      (bt?`<h5>추천 종목 과거 성적 (${bt.start} ~ ${bt.end}, ${bt.n_days}개 시점)</h5>
-       <p>그 기간 5거래일마다 '그날 이 프로그램이 골랐을 전략별 1~3위'를 다시 계산해, <b>다음 날 시가에 샀다고 가정</b>하고 성적을 쟀습니다. 시장 대비 = 같은 기간 필터를 통과한 전 종목 중간값과의 차이(그 기간 시장 5일 평균 ${pctS(bt.bench,2)}). 목표/손절 도달 = 10거래일 안에 1차 목표와 손절가 중 먼저 닿은 쪽.</p>
-       ${T(btRows,['전략','표본','5일 평균','승률','시장 대비','시장 이긴 비율','10일 평균','목표 도달','손절 도달','1위만 5일'])}
-       <p class="vl" style="text-align:left">과거 수급·실적·매물대 자료가 없어 그 부분은 빼고 계산한 단순화 버전입니다. 거래 비용(수수료·세금 약 0.2%)은 빼지 않았습니다. 6개월은 짧은 기간이라 시장 상황이 바뀌면 결과도 달라질 수 있습니다.</p>`:'<p>과거 성적을 계산하지 못했습니다.</p>')+
+      (bt?btGuide(bt):'<p>과거 성적을 계산하지 못했습니다.</p>')+
       (O?`<h5>5일 전망 모델</h5><p>모델 후보 중간 기간 성적: ${Object.entries(O.va||{}).map(([k,v])=>`${esc(k)} ${v}%`).join(' · ')} → <b>${esc(O.model)}</b> 선택. 마지막 기간(${esc(O.test_from)}~) 적중률 <b>${O.hit}%</b>, 찍기 ${O.base}%.</p>
        ${(O.calib||[]).length?T(O.calib.map(c=>[c.lab,c.n+'건',c.up+'%',pctS(c.ret,2)]),['모델이 말한 상승 확률','표본','실제 상승 비율','실제 5일 평균']):''}
        <p class="vl" style="text-align:left">모델이 "55% 이상"이라고 한 구간에서 실제 상승 비율이 더 높고, "45% 미만" 구간에서 더 낮아야 믿을 만한 모델입니다.</p>`:'')+
@@ -3173,7 +3375,8 @@ function renderGuide(){
 const SEV={bad:['🔴','수정 필요'],warn:['🟠','점검 권장'],info:['🔵','참고'],ok:['🟢','양호']};
 function revPrompt(){
   const rv=D.review,ts=D.tips||[];
-  const st=rv?Object.entries(rv.strat).map(([k,v])=>`${STRAT[k].n}: 다음날 ${v.n1}건 평균 ${pctS(v.avg1,2)}, 시장대비 ${pctS(v.ex1,2)}, 승률 ${v.win1}%`+(v.n5?` / 5일 ${v.n5}건 평균 ${pctS(v.avg5,2)}, 시장대비 ${pctS(v.ex5,2)}, 목표 ${v.tgt}%·손절 ${v.stp}%`:'')).join('\n'):'';
+  const bt=D.bt,st=(rv?Object.entries(rv.strat).map(([k,v])=>`[실시간] ${STRAT[k].n}: ${v.n}건·${v.days}일`+[1,3,5].map(h=>v['h'+h]?` / ${h}일 평균 ${pctS(v['h'+h].avg,2)}, 시장대비 ${pctS(v['h'+h].ex,2)}, t=${v['h'+h].t}`:'').join('')).join('\n'):'')+
+    (bt?'\n'+Object.entries(bt.strat).map(([k,v])=>`[과거 ${bt.start}~${bt.end}] ${STRAT[k].n}: ${v.n}건 · 3일 시장대비 ${v.h3?pctS(v.h3.ex,2):'-'}, t=${v.h3?v.h3.t:'-'}, 판정 ${v.verdict}`).join('\n'):'');
   return `내 주식 대시보드(stock_dashboard.py)의 예측 기록과 실제 결과를 비교한 점검 결과야.\n기록 ${rv?rv.n_snap:0}일치 (${rv?rv.first:''}~${rv?rv.last:''})\n${st}\n`+
     (rv&&rv.ol?`5일 전망: ${rv.ol.n}건 적중 ${rv.ol.hit}%, 흔들림 범위 안 ${rv.ol.inband}%\n`:'')+
     `자동 진단:\n${ts.map(t=>`- [${SEV[t.sev][1]}] ${t.title}: ${t.detail}${t.fix?` → 제안: ${t.fix}`:''}`).join('\n')}\n\n`+
@@ -3197,9 +3400,10 @@ function renderReview(){
       ${L.filter(x=>x.rank<=3).map(x=>`<tr class="tn"><td><span class="tag ${STRAT[x.k].c}">${STRAT[x.k].n} ${x.rank}위</span></td><td class="nm"><b>${esc(x.name)}</b><span>${x.code}</span></td>
         <td>${f0(x.t1)} / ${f0(x.stop)}<br><span class="vl">매수가 ${f0(x.entry)}</span></td><td class="${x.r1>=0?'upc':'downc'}"><b>${pctS(x.r1,2)}</b></td><td class="${x.ex1>=0?'pos':'neg'}">${pctS(x.ex1,2)}</td>
         <td class="${x.now>=0?'upc':'downc'}">${pctS(x.now,2)} <span class="vl">(${x.held}일)</span></td><td>${x.out==='목표'?'<span class="tr tg">목표 도달</span>':x.out==='손절'?'<span class="tr tb">손절 도달</span>':'<span class="tr tf">진행 중</span>'}</td></tr>`).join('')}</tbody></table></div>`:'';
-    const S=rv.strat,cum=Object.keys(S).length?`<div class="tablewrap"><table class="revtbl"><thead><tr><th>전략</th><th>다음 날 (건수)</th><th>평균</th><th>승률</th><th>시장 대비</th><th>5일 (건수)</th><th>5일 평균</th><th>시장 대비</th><th>목표 / 손절</th></tr></thead><tbody>
-      ${[3,1,2].filter(k=>S[k]).map(k=>{const v=S[k];return `<tr class="tn"><td><span class="tag ${STRAT[k].c}">${STRAT[k].n}</span></td><td>${v.n1}</td><td class="${v.avg1>=0?'upc':'downc'}">${pctS(v.avg1,2)}</td><td>${v.win1}%</td><td class="${v.ex1>=0?'pos':'neg'}"><b>${pctS(v.ex1,2)}</b></td>
-        <td>${v.n5}</td><td>${v.avg5==null?'-':pctS(v.avg5,2)}</td><td>${v.ex5==null?'-':`<b class="${v.ex5>=0?'pos':'neg'}">${pctS(v.ex5,2)}</b>`}</td><td>${v.tgt==null?'-':v.tgt+'% / '+v.stp+'%'}</td></tr>`;}).join('')}</tbody></table></div>`:'';
+    const S=rv.strat,cum=Object.keys(S).length?`<div class="tablewrap"><table class="revtbl"><thead><tr><th>전략</th><th>건수 · 일수</th><th>1일 시장 대비</th><th>3일 시장 대비</th><th>5일 시장 대비</th><th>3일 중앙값</th><th>최대 손실</th><th>t값 (3일)</th><th>상태</th></tr></thead><tbody>
+      ${[3,1,2].filter(k=>S[k]).map(k=>{const v=S[k],e=h=>v['h'+h]?`<span class="${v['h'+h].ex>=0?'pos':'neg'}">${pctS(v['h'+h].ex,2)}</span>`:'-';
+        return `<tr class="tn"><td><span class="tag ${STRAT[k].c}">${STRAT[k].n}</span></td><td>${v.n}건 · ${v.days}일</td><td>${e(1)}</td><td><b>${e(3)}</b></td><td>${e(5)}</td><td>${v.h3?pctS(v.h3.med,2):'-'}</td><td>${v.h1?pctS(Math.min(v.h1.worst,v.h3?v.h3.worst:99),1):'-'}</td><td>${v.h3&&v.h3.t!=null?v.h3.t:'-'}</td><td>${v.watch?'<span class="tr tf">관찰 중</span>':(v.h3&&v.h3.t>=2?'<span class="tr tg">시장보다 나음</span>':v.h3&&v.h3.t<=-2?'<span class="tr tb">시장보다 못함</span>':'<span class="tr tf">차이 불분명</span>')}</td></tr>`;}).join('')}</tbody></table></div>
+      <p class="vl" style="text-align:left">비용 ${rv.cost}% 차감 · 같은 시장 종목 중간값과 비교 · 전략별 ${'30'}건·${'15'}거래일이 쌓이기 전에는 '관찰 중'으로만 표시합니다.</p>`:'';
     const O=rv.ol,olH=O?`<div class="revkpi tn"><div><span class="vl">검증된 예측</span><b>${O.n}건</b></div><div><span class="vl">방향 적중</span><b class="${O.hit>=50?'pos':'neg'}">${O.hit}%</b></div><div><span class="vl">흔들림 범위 안</span><b>${O.inband}%</b><span class="vl">기대 약 68%</span></div>
       <div><span class="vl">'55% 이상'이라 한 때 실제 상승</span><b>${O.up_hi==null?'-':O.up_hi+'%'}</b><span class="vl">${O.n_hi}건</span></div><div><span class="vl">'45% 미만'이라 한 때 실제 상승</span><b>${O.up_lo==null?'-':O.up_lo+'%'}</b><span class="vl">${O.n_lo}건</span></div></div>
       ${(rv.latest_ol||[]).length?`<div class="tablewrap"><table class="revtbl"><thead><tr><th>대상</th><th>예측 (오를 확률)</th><th>예상 흔들림</th><th>실제 5일</th><th>방향</th><th>범위</th></tr></thead><tbody>${rv.latest_ol.map(x=>`<tr class="tn"><td><b>${esc(x.name)}</b></td><td>${x.p}%</td><td>${pctS(x.er,2)} ± ${x.band}%</td><td class="${x.act>=0?'upc':'downc'}">${pctS(x.act,2)}</td><td>${x.hit?'✅ 맞음':'❌ 틀림'}</td><td>${x.inband?'안':'밖'}</td></tr>`).join('')}</tbody></table></div><p class="vl" style="text-align:left">${esc(rv.latest_ol[0].asof)} 아침 예측 → 5거래일 뒤 결과</p>`:''}`:'<p class="vl" style="text-align:left">5거래일이 지난 예측이 아직 없습니다.</p>';
