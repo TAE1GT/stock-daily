@@ -29,9 +29,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pandas numpy scikit-learn
+      - run: pip install pandas numpy scikit-learn cryptography
       - name: 대시보드 생성
         env:
+          SITE_PASSWORD: ${{ secrets.SITE_PASSWORD }}           # (선택) 등록하면 비밀번호를 아는 사람만 볼 수 있음
           DART_API_KEY: ${{ secrets.DART_API_KEY }}             # (선택, 무료) 실적·IR 공시 목록
           AI_WORKER_URL: ${{ vars.AI_WORKER_URL }}               # (선택) 버튼 누르면 바로 AI 분석
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # (선택, 유료) 매일 아침 1~3위 미리 분석
