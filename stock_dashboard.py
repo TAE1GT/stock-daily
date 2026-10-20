@@ -47,6 +47,56 @@ CFG = dict(
 
 )
 
+SITE_PASSWORD = os.environ.get("SITE_PASSWORD", "").strip()   # 설정하면 페이지·기록을 비밀번호로 잠금
+PBKDF2_ITER = 200000
+
+
+def _aes():
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    return AESGCM
+
+
+def encrypt_text(text, password):
+    """비밀번호 → PBKDF2(SHA-256, 20만 번) → AES-256-GCM. 브라우저 WebCrypto로 그대로 풀 수 있는 형식"""
+    import base64
+    import hashlib
+    salt, iv = os.urandom(16), os.urandom(12)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITER, 32)
+    ct = _aes()(key).encrypt(iv, text.encode("utf-8"), None)
+    b = lambda x: base64.b64encode(x).decode()
+    return dict(s=b(salt), i=b(iv), c=b(ct), it=PBKDF2_ITER)
+
+
+def decrypt_text(enc, password):
+    import base64
+    import hashlib
+    d = lambda x: base64.b64decode(x)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), d(enc["s"]), int(enc["it"]), 32)
+    return _aes()(key).decrypt(d(enc["i"]), d(enc["c"]), None).decode("utf-8")
+
+
+def save_json(path, obj):
+    """잠금 모드면 저장소(공개)에 남는 기록도 암호화해서 저장"""
+    text = json.dumps(obj, ensure_ascii=False)
+    if SITE_PASSWORD:
+        try:
+            text = json.dumps(dict(enc=encrypt_text(text, SITE_PASSWORD)))
+        except Exception as ex:
+            print(f"  기록 암호화 실패 → 저장 건너뜀: {ex}", flush=True)
+            return
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def load_json(path):
+    obj = json.load(open(path, encoding="utf-8"))
+    if isinstance(obj, dict) and "enc" in obj and len(obj) == 1:
+        if not SITE_PASSWORD:
+            raise ValueError("암호화된 기록인데 비밀번호가 없음")
+        return json.loads(decrypt_text(obj["enc"], SITE_PASSWORD))
+    return obj
+
+
 STATUS = {}   # 데이터 출처별 수집 결과 (상세 설명 페이지에 표시)
 
 
@@ -556,7 +606,7 @@ def evaluate(P, I, market, light=False):
     }
     metrics = dict(c=c, chg=chg, vr=vr, rsi=rsi, pb=pb, a=P["a"].iloc[-1], atr=atr, rs=rs,
                    h0=h0, h1=h1, ma20=ma20, ma60=ma60, ma60_5=ma60_5, bbu=bbu, bbl=bbl,
-                   hi20=hi20, lo20=P["l"].iloc[-20:].min(), hi60=hi60,
+                   hi20=hi20, lo20=P["l"].iloc[-20:].min(), hi60=hi60, lo5=P["l"].iloc[-5:].min(),
                    fhi=fhi, flo=flo, fup=fup, fbig=big,
                    pat=(None if light else pd.Series([pat_txt(t) for t in idx], index=idx)))
     return dict(scores=scores, checks=checks, aux=aux, tg=tg, m=metrics)
@@ -594,6 +644,90 @@ def fib_levels(t, m):
         return None
     hi, lo, up = float(m["fhi"][t]), float(m["flo"][t]), bool(m["fup"][t])
     return [[f"{r * 100:g}%", num(hi - (hi - lo) * r if up else lo + (hi - lo) * r)] for r in (0.382, 0.5, 0.618)]
+
+
+# ───────────────────────────── 매매 포인트 (얼마에 사서 얼마에 팔지) ─────────────────────────────
+def trade_plan(k, c0, atr, ma20, bbl, hi60, lo5, t1, t2, stop):
+    """전략별 지정가 매수 2단계 · 익절 2단계 · 손절 · 추격 금지 가격 (백테스트와 화면이 같은 함수 사용)"""
+    fin = lambda x: x is not None and np.isfinite(x)
+    atr = atr if fin(atr) and atr > 0 else c0 * 0.03
+    if k == 1:          # 추세 눌림목: 20일선 근처에서 받기
+        b1 = min(c0, ma20 * 1.005) if fin(ma20) else c0 - 0.3 * atr
+        b2 = ma20 - 0.5 * atr if fin(ma20) else c0 - 1.0 * atr
+    elif k == 2:        # 거래량 돌파: 뚫은 자리(60일 고가)로 되돌릴 때 받기
+        base = hi60 if fin(hi60) and hi60 < c0 else c0 - 0.8 * atr
+        b1 = min(c0, max(base * 1.005, c0 - 0.5 * atr))
+        b2 = max(base * 0.995, c0 - 1.2 * atr)
+    else:               # 과매도 반등: 볼린저 하단·최근 저점 바로 위에서 받기
+        floor = max(bbl if fin(bbl) else -np.inf, lo5 if fin(lo5) else -np.inf)
+        floor = floor if np.isfinite(floor) else c0 - 1.0 * atr
+        b1 = min(c0, floor + 0.5 * atr)
+        b2 = floor + 0.1 * atr
+    b1 = min(b1, c0)
+    if b2 >= b1 - 0.2 * atr:
+        b2 = b1 - 0.5 * atr
+    if not (stop < b2):
+        b2 = stop + 0.3 * atr
+    if not (b2 < b1):
+        b1 = min(c0, b2 + 0.3 * atr)
+    if not (stop < b2 < b1):            # 손절이 너무 가까우면 현재가 근처 한 번만
+        b1 = b2 = c0
+    t2 = t2 if fin(t2) and t2 > t1 * 1.005 else t1 + atr
+    avg = (b1 + b2) / 2
+    chase = max((t1 + stop) / 2, b1)    # 이 가격 위에서 사면 손익비 1 미만
+    rr = (t1 - avg) / (avg - stop) if avg > stop else np.nan
+    return dict(b1=b1, b2=b2, avg=avg, chase=chase, t1=t1, t2=t2, stop=stop, rr=rr, valid=3, tstop=10)
+
+
+def simulate_plan(pl, O, H, L, C, cost):
+    """다음 날부터 하루씩: 지정가 매수(3거래일 유효) → 손절 / 1차 익절 절반 + 손절을 본전으로 / 2차 익절 / 10거래일 시간 정리.
+    같은 날 손절과 익절이 모두 닿으면 손절로 봄(보수적)."""
+    pos = inv = got = 0.0
+    filled, first, t1hit, stop = {"b1": False, "b2": False}, None, False, pl["stop"]
+    for d in range(len(O)):
+        o, h, l, c = O[d], H[d], L[d], C[d]
+        if not np.isfinite(o):
+            continue
+        if d < pl["valid"]:
+            for key in ("b1", "b2"):
+                if not filled[key] and l <= pl[key]:
+                    px = min(o, pl[key])
+                    pos += 0.5
+                    inv += 0.5 * px
+                    filled[key] = True
+                    first = d if first is None else first
+        if pos <= 0:
+            if d >= pl["valid"] - 1:
+                return dict(filled=False)
+            continue
+        if l <= stop:
+            px = min(o, stop) if d > first else stop
+            got += pos * px
+            return dict(filled=True, ret=(got / inv - 1) * 100 - cost, days=d - first + 1, exit="본전 정리" if t1hit else "손절")
+        if not t1hit and h >= pl["t1"]:
+            sell = pos / 2
+            got += sell * max(o, pl["t1"]) if d > first else sell * pl["t1"]
+            pos -= sell
+            t1hit = True
+            stop = inv / (pos * 2) if pos > 0 else stop          # 남은 물량 손절가 → 평균 매수가
+        if t1hit and h >= pl["t2"]:
+            got += pos * pl["t2"]
+            return dict(filled=True, ret=(got / inv - 1) * 100 - cost, days=d - first + 1, exit="2차 익절")
+        if d - first + 1 >= pl["tstop"]:
+            got += pos * c
+            return dict(filled=True, ret=(got / inv - 1) * 100 - cost, days=d - first + 1, exit="1차 익절 후 시간 정리" if t1hit else "시간 정리")
+    return dict(filled=True, open=True)
+
+
+def plan_for(k, t, ev, tg):
+    m = ev["m"]
+    f = lambda key: float(m[key][t]) if m.get(key) is not None and m[key][t] == m[key][t] else None
+    pl = trade_plan(k, f("c"), f("atr"), f("ma20"), f("bbl"), f("hi60"), f("lo5"), float(tg["t1"]), float(tg["t2"]), float(tg["stop"]))
+    c0 = f("c")
+    out = {key: num(v) for key, v in pl.items() if key in ("b1", "b2", "avg", "chase", "t1", "t2", "stop")}
+    out.update(rr=num(pl["rr"], 2), valid=pl["valid"], tstop=pl["tstop"],
+               b1p=num((pl["b1"] / c0 - 1) * 100, 1), b2p=num((pl["b2"] / c0 - 1) * 100, 1))
+    return out
 
 
 def target_for(k, t, ev, res):
@@ -1723,8 +1857,7 @@ def make_snapshot(asof, tabs, outlook, risk, regime=None):
 def save_snapshot(snap):
     """그날 데이터 기준일 파일 하나 (같은 날 여러 번 돌면 마지막 장전 갱신으로 덮어씀). 150개 넘으면 오래된 것 삭제"""
     os.makedirs(HIST_DIR, exist_ok=True)
-    with open(os.path.join(HIST_DIR, f"{snap['asof']}.json"), "w", encoding="utf-8") as f:
-        json.dump(snap, f, ensure_ascii=False)
+    save_json(os.path.join(HIST_DIR, f"{snap['asof']}.json"), snap)
     files = sorted(x for x in os.listdir(HIST_DIR) if x.endswith(".json"))
     for x in files[:-150]:
         os.remove(os.path.join(HIST_DIR, x))
@@ -1736,8 +1869,8 @@ def load_history(exclude_asof):
     out = []
     for x in sorted(x for x in os.listdir(HIST_DIR) if x.endswith(".json"))[-60:]:
         try:
-            s = json.load(open(os.path.join(HIST_DIR, x), encoding="utf-8"))
-            if s.get("asof") != exclude_asof:
+            s = load_json(os.path.join(HIST_DIR, x))
+            if x != "backtest_cache.json" and s.get("asof") != exclude_asof:
                 out.append(s)
         except Exception:
             pass
@@ -2031,8 +2164,8 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
     cache = os.path.join(HIST_DIR, "backtest_cache.json")
     if not demo and asof and os.path.exists(cache):
         try:
-            cj = json.load(open(cache, encoding="utf-8"))
-            if cj.get("asof") == asof and cj.get("ver") == 2:
+            cj = load_json(cache)
+            if cj.get("asof") == asof and cj.get("ver") == 3:
                 print("  과거 성적: 오늘 계산해 둔 결과 재사용", flush=True)
                 stat("과거 성적 검증", True, f"{cj['res']['n_days']}거래일 · {cj['res']['start']}~{cj['res']['end']} (재사용)")
                 return cj["res"]
@@ -2076,7 +2209,7 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
         H10, L10 = P["h"].iloc[t + 1:t + 11], P["l"].iloc[t + 1:t + 11]
         for k in (1, 2, 3):
             sc = (ev["scores"][f"s{k}"][uni] + sum(d[uni] for _, d, _ in ev["aux"][k])).sort_values(ascending=False)
-            t1s, _, sts = ev["tg"][k]
+            t1s, t2s, sts = ev["tg"][k]
 
             def rec(tk, rank):
                 e = float(o1[tk])
@@ -2108,6 +2241,14 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
                     r[f"ex{h}"] = g - cost - bench[h].get(mk[tk], 0.0)
                 if k == 2:
                     r["vb_pass"] = bool(r["chg"] <= VB["max_day_change"] and r["cth"] >= VB["min_close_to_high"] and r["vr"] >= VB["min_vol_ratio"])
+                if rank and t + 13 < n:                                    # 매매 포인트대로 했다면
+                    g_ = lambda key: float(m_[key][tk]) if m_[key][tk] == m_[key][tk] else None
+                    pl = trade_plan(k, c0, atr, g_("ma20"), g_("bbl"), g_("hi60"), g_("lo5"), tgt, float(t2s[tk]), stp)
+                    sl = slice(t + 1, t + 14)
+                    sim = simulate_plan(pl, *(P[x].iloc[sl][tk].to_numpy(float) for x in "ohlc"), cost)
+                    r["pf"] = sim.get("filled", False)
+                    if sim.get("filled") and not sim.get("open"):
+                        r.update(pr=sim["ret"], pdays=sim["days"], pexit=sim["exit"])
                 return r
             for rank, tk in enumerate(sc.index[:3], 1):
                 x = rec(tk, rank)
@@ -2140,6 +2281,21 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
         res["half"][str(k)] = dict(a=h1, b=h2, first=f"{days_[0]}~{mid}", second=f"{mid}~{days_[-1]}")
         if s["verdict"] == "효과 있음" and not ((h1 or {}).get("h3", {}).get("ex", -1) > 0 and (h2 or {}).get("h3", {}).get("ex", -1) > 0):
             s["verdict"] = "효과 불분명"     # 한쪽 기간에서만 좋았다면 우연일 수 있음
+    res["plan"] = {}
+    for k in (1, 2, 3):
+        rk = [r for r in rows if r["k"] == k and "pf" in r]
+        done = [r for r in rk if "pr" in r]
+        if len(rk) < 10 or not done:
+            continue
+        ex = pd.Series([r["pexit"] for r in done]).value_counts(normalize=True).mul(100).round().astype(int).to_dict()
+        base5 = [r["r5"] for r in rk if r["r5"] == r["r5"]]
+        res["plan"][str(k)] = dict(n=len(rk), fill=round(len(done) / len(rk) * 100), trades=len(done),
+                                   avg=round(float(np.mean([r["pr"] for r in done])), 2), win=round(float(np.mean([r["pr"] > 0 for r in done])) * 100),
+                                   med=round(float(np.median([r["pr"] for r in done])), 2), worst=round(float(min(r["pr"] for r in done)), 1),
+                                   days=round(float(np.mean([r["pdays"] for r in done])), 1), exits=ex,
+                                   base=(round(float(np.mean(base5)), 2) if base5 else None),
+                                   t=(round(_tstat(pd.DataFrame(done).groupby("date")["pr"].mean().values), 2)
+                                      if _tstat(pd.DataFrame(done).groupby("date")["pr"].mean().values) is not None else None))
     vb = [r for r in rows if r["k"] == 2]
     res["vb_shadow"] = dict(pass_=summarize_rows([r for r in vb if r.get("vb_pass")]), fail=summarize_rows([r for r in vb if not r.get("vb_pass")]),
                             rule=VB)
@@ -2159,7 +2315,7 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
     if not demo and asof:
         try:
             os.makedirs(HIST_DIR, exist_ok=True)
-            json.dump(dict(asof=asof, ver=2, res=res), open(cache, "w", encoding="utf-8"), ensure_ascii=False)
+            save_json(cache, dict(asof=asof, ver=3, res=res))
         except Exception:
             pass
     return res
@@ -2270,9 +2426,11 @@ def build(demo=False, mode="file"):
             if k == 2:
                 e["feat"]["vb_pass"] = bool((e["feat"]["chg"] or 0) <= vbf["max_day_change"] and (e["feat"]["cth"] or 0) >= vbf["min_close_to_high"]
                                             and (e["feat"]["vr"] or 0) >= vbf["min_vol_ratio"])
+            e["plan"] = plan_for(k, t, ev, tg)
             e["prompt"] = ai_prompt(e, asof)
             if rank <= 6:
                 e["series"] = series(t, tg)
+                e["series"].update(b1=e["plan"]["b1"], b2=e["plan"]["b2"])
             stocks.append(e)
             picks_of.setdefault(t, f"{STRATS[k]} {rank}위")
         tabs.append(dict(k=k, name=STRATS[k], stocks=stocks, loss=loss))
@@ -2294,6 +2452,8 @@ def build(demo=False, mode="file"):
                  tg=dict(t1=num(tg["t1"]), t2=num(tg["t2"]), stop=num(tg["stop"]), rr=num(tg["rr"], 2), t1p=num(tg["t1p"], 1),
                          t2p=num(tg["t2p"], 1), sp=num(tg["sp"], 1), note=tg["note"], stop_label=tg["stop_label"]),
                  series=series(t, tg), read=chart_read(t, ev))
+        e["plan"] = plan_for(k, t, ev, tg)
+        e["series"].update(b1=e["plan"]["b1"], b2=e["plan"]["b2"])
         e["prompt"] = ai_prompt(e, asof)
         return e
 
@@ -2413,7 +2573,12 @@ def build(demo=False, mode="file"):
 def write_html(data, path):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=lambda o: o.item() if hasattr(o, "item") else str(o)).replace("</", "<\\/")
-    html = TEMPLATE.replace("__DATA__", payload)
+    if SITE_PASSWORD:
+        enc = encrypt_text(payload, SITE_PASSWORD)
+        boot = "const ENC=" + json.dumps(enc) + ";" + LOCK_JS
+    else:
+        boot = "APP(" + payload + ");"
+    html = TEMPLATE.replace("__BOOT__", boot).replace("__LOCKED__", "locked" if SITE_PASSWORD else "")
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
     with open(os.path.join(os.path.dirname(os.path.abspath(path)), "version.json"), "w", encoding="utf-8") as f:
@@ -2485,6 +2650,35 @@ def main():
 
 
 # ───────────────────────────── HTML 템플릿 ─────────────────────────────
+LOCK_JS = r"""
+(function(){
+  const b64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+  async function open_(pw){
+    const base=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveKey']);
+    const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:b64(ENC.s),iterations:ENC.it,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['decrypt']);
+    const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64(ENC.i)},key,b64(ENC.c));
+    return JSON.parse(new TextDecoder().decode(pt));
+  }
+  const lock=document.getElementById('lock'),form=document.getElementById('lockform'),err=document.getElementById('lockerr'),btn=document.getElementById('lockbtn');
+  async function tryOpen(pw,remember){
+    try{const data=await open_(pw);
+      try{if(remember)localStorage.setItem('site-pass',pw);else localStorage.removeItem('site-pass');}catch(_){}
+      lock.hidden=true;document.body.classList.remove('locked');APP(data);return true;}
+    catch(_){return false;}
+  }
+  let saved=null;try{saved=localStorage.getItem('site-pass');}catch(_){}
+  (async()=>{
+    if(saved&&await tryOpen(saved,true))return;
+    try{localStorage.removeItem('site-pass');}catch(_){}
+    lock.hidden=false;document.getElementById('lockpw').focus();
+  })();
+  form.addEventListener('submit',async e=>{e.preventDefault();btn.disabled=true;btn.textContent='여는 중…';err.hidden=true;
+    const ok=await tryOpen(document.getElementById('lockpw').value,document.getElementById('lockrem').checked);
+    if(!ok){err.hidden=false;btn.disabled=false;btn.textContent='열기';document.getElementById('lockpw').select();}});
+})();
+"""
+
+
 TEMPLATE = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -2874,6 +3068,9 @@ svg text{font-family:inherit}
 .chart .fibx{fill:#a16207;font-size:10.5px;font-weight:700}
 @media (prefers-color-scheme: dark){.chart .fib{stroke:#facc15}.chart .fibx{fill:#facc15}}
 .chart .fibx,.chart .tlx,.chart .slx,.chart .poctx{paint-order:stroke;stroke:var(--surface);stroke-width:3.5px;stroke-linejoin:round}
+.chart .bl{stroke:#16a34a;stroke-width:1.4;stroke-dasharray:4 3}
+.chart .blx{fill:#16a34a;font-size:11px;font-weight:800}
+@media (prefers-color-scheme: dark){.chart .bl{stroke:#4ade80}.chart .blx{fill:#4ade80}}
 .chart .tl{stroke:var(--up);stroke-width:1.2;stroke-dasharray:6 4}
 .chart .sl{stroke:var(--down);stroke-width:1.2;stroke-dasharray:6 4}
 .chart .tlx{fill:var(--up);font-size:11px;font-weight:700}
@@ -3048,9 +3245,59 @@ footer{margin:28px 0 0;padding-top:14px;border-top:1px solid var(--line);color:v
 .gno{font-size:28px;font-weight:900;color:var(--line);line-height:1}
 .gcard h4{margin:0;font-size:17px}.gcard .price{font-size:20px;margin:2px 0 6px}
 .glink{display:grid;gap:2px;text-decoration:none;color:var(--ink);font-weight:800}
+
+.plan2{margin:12px 0;padding:12px 14px;border-radius:14px;background:var(--surface);border:2px solid #16a34a}
+@media (prefers-color-scheme: dark){.plan2{border-color:#4ade80}}
+.plan2 .ph{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}.plan2 .ph b{font-size:15px}
+.pgrid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}
+@media(max-width:560px){.pgrid{grid-template-columns:1fr 1fr}.pgrid .stop{grid-column:1/-1}}
+.pb{display:grid;padding:8px 10px;border-radius:10px;background:var(--sunk)}.pb small{font-size:11px;color:var(--muted);font-weight:700}.pb b{font-size:16px}.pb span{font-size:12px;color:var(--muted)}
+.pb.buy b{color:#16a34a}.pb.sell b{color:var(--up)}.pb.stop b{color:var(--down)}
+@media (prefers-color-scheme: dark){.pb.buy b{color:#4ade80}}
+.prules{margin:10px 0 0;padding-left:18px;font-size:13px;display:grid;gap:3px}
+.pstat{margin:10px 0 0;font-size:12.5px;padding-top:8px;border-top:1px dashed var(--line)}
+.buyc{color:#16a34a} @media (prefers-color-scheme: dark){.buyc{color:#4ade80}}
+.prow{grid-template-columns:28px minmax(0,1fr) 72px 62px 58px 58px 64px}
+.card .prow{grid-template-columns:28px minmax(0,1fr) 62px 52px 52px}
+@media(max-width:620px){.prow{grid-template-columns:26px minmax(0,1fr) 60px 50px 50px}.prow .sp,.prow .ps{display:none}}
+@media(max-width:340px){.prow,.card .prow{grid-template-columns:24px minmax(0,1fr) 56px 48px;gap:6px}.prow .pt:last-of-type{display:none}}
+
+.pick .pgrid{grid-template-columns:1fr 1fr}.pick .pgrid .stop{grid-column:1/-1}
+.tabs .tab{flex:none}
+.tabs{scrollbar-width:none}
+
+.tabdots{display:flex;justify-content:center;gap:6px;margin:8px 0 0}
+.tabdots i{width:7px;height:7px;border-radius:50%;background:var(--line);transition:all .2s}
+.tabdots i.on{width:20px;border-radius:4px;background:var(--tc)}
+@media(min-width:900px){.tabdots{display:none}}
+#panel.slide-l{animation:slideL .25s ease-out}#panel.slide-r{animation:slideR .25s ease-out}
+@keyframes slideL{from{opacity:.3;transform:translateX(40px)}to{opacity:1;transform:none}}
+@keyframes slideR{from{opacity:.3;transform:translateX(-40px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion: reduce){#panel.slide-l,#panel.slide-r{animation:none}}
+#v-picks{touch-action:pan-y}
+
+body.locked .wrap{display:none}
+.lock{position:fixed;inset:0;z-index:100;display:grid;place-items:center;padding:20px;background:var(--bg)}
+.lockbox{width:min(360px,100%);display:grid;gap:12px;text-align:center;background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:28px 22px}
+.lockbox h1{font-size:22px;margin:0}.lockbox p{margin:0;color:var(--muted);font-size:14px}
+.lk-i{font-size:40px}
+.lockbox input[type=password]{font:inherit;font-size:16px;padding:12px 14px;border-radius:12px;border:1.5px solid var(--line);background:var(--sunk);color:var(--ink);text-align:center}
+.lk-r{display:flex;gap:6px;justify-content:center;align-items:center;font-size:13px;color:var(--muted)}
+.lk-e{color:var(--bad)!important;font-weight:700}
 </style>
 </head>
-<body>
+<body class="__LOCKED__">
+<div class="lock" id="lock" hidden>
+  <form class="lockbox" id="lockform" autocomplete="off">
+    <div class="lk-i" aria-hidden="true">🔒</div>
+    <h1>오늘의 종목 발굴</h1>
+    <p>비밀번호를 아는 분만 볼 수 있습니다.</p>
+    <input id="lockpw" type="password" placeholder="비밀번호" autocomplete="current-password" required>
+    <label class="lk-r"><input type="checkbox" id="lockrem" checked> 이 기기에서 기억하기</label>
+    <button class="btn" type="submit" id="lockbtn">열기</button>
+    <p class="lk-e" id="lockerr" hidden>비밀번호가 맞지 않습니다.</p>
+  </form>
+</div>
 <div class="wrap">
   <header class="top">
     <a class="brand" href="#home"><b>오늘의 종목 발굴</b><span class="meta tn" id="meta"></span></a>
@@ -3071,6 +3318,7 @@ footer{margin:28px 0 0;padding-top:14px;border-top:1px solid var(--line);color:v
   <section class="view" id="v-picks" hidden>
     <div class="vh"><h2>오늘의 추천 <button class="q" data-help="picks" aria-label="설명 보기">?</button></h2></div>
     <div class="tabs" role="tablist" id="tabs"></div>
+    <div class="tabdots" id="tabdots" aria-hidden="true"></div>
     <p class="tabdesc" id="tabdesc"></p>
     <div id="panel"></div>
   </section>
@@ -3133,7 +3381,8 @@ footer{margin:28px 0 0;padding-top:14px;border-top:1px solid var(--line);color:v
 </div></dialog>
 
 <script>
-const D = __DATA__;
+__BOOT__
+function APP(D){
 const STRAT = {1:{n:'추세 눌림목',c:'s1',v:'--s1',d:'상승 추세 중 20일선까지 쉬어 내려온 종목'},
                2:{n:'거래량 돌파',c:'s2',v:'--s2',d:'거래량과 함께 박스권을 뚫고 나온 종목'},
                3:{n:'과매도 반등',c:'s3',v:'--s3',d:'볼린저 하단을 찍고 반등을 시작한 종목'}};
@@ -3184,7 +3433,7 @@ function drawChart(box,s){
     el('line',{x1:m.l,x2:m.l+pw,y1:y,y2:y,class:'fib'},svg); if(!small)tx(svg,m.l+pw-vpw-6,y-3,'Fib '+lab+' '+f0(v),'fibx','end'); });
   // 목표가 · 손절가
   let prevY=null;
-  [['t2','목표2','tl'],['t1','목표1','tl'],['stop','손절','sl']].forEach(([k,lab,cls])=>{
+  [['t2','목표2','tl'],['t1','목표1','tl'],['b1','매수1','bl'],['b2','매수2','bl'],['stop','손절','sl']].forEach(([k,lab,cls])=>{
     if(!s[k])return;const y=YP(s[k]);
     el('line',{x1:m.l,x2:m.l+pw,y1:y,y2:y,class:cls},svg);
     const ty=(prevY!=null&&y-4-prevY<12)?y+13:y-4; prevY=ty;
@@ -3433,6 +3682,14 @@ const HELP={
       <li><b>실적 발표</b>: 구글 뉴스의 최근 하루 실적 기사${D.brief&&D.brief.dart?' + DART의 잠정실적 공시(최근 1일)와 기업설명회(IR) 개최 공시(최근 10일)':'. DART API 키(무료)를 등록하면 잠정실적·IR 공시 목록도 함께 나옵니다'}</li>
       <li><b>국내·해외 증시 뉴스</b>: 구글 뉴스 최근 하루 기사 제목</li><li><b>섹터</b>: 최근 5일 ±3% 넘게 움직였거나 3일 안에 일정이 있는 섹터의 기사</li></ul>
       <p>뉴스는 제목만 모은 것이며 AI 판단이 아닙니다.</p>`],
+  plan:['매매 포인트 정하는 법',()=>`<p>자동매매 프로그램처럼 <b>얼마에 사고 얼마에 팔지</b>를 미리 정해 둔 규칙입니다. 화면의 숫자와 아래 과거 검증은 <b>같은 계산</b>을 씁니다.</p>
+      ${T([['추세 눌림목','20일선 +0.5% (현재가보다 높으면 현재가)','20일선 − 0.5×ATR'],['거래량 돌파','뚫은 자리(60일 고가) +0.5% 또는 현재가 − 0.5×ATR 중 높은 값','60일 고가 − 0.5% 또는 현재가 − 1.2×ATR'],['과매도 반등','볼린저 하단·5일 저점 중 높은 값 + 0.5×ATR','그 값 + 0.1×ATR']],['전략','매수 1차 (절반)','매수 2차 (절반)'])}
+      <ul><li><b>익절</b>: 1차 목표에서 절반, 2차 목표에서 나머지. 1차 익절 후에는 남은 절반의 손절가를 <b>평균 매수가</b>로 올립니다(본전 지키기).</li>
+      <li><b>손절</b>: 전략별 손절가(목표가 화면과 동일). 시가가 손절가 아래로 갭 하락하면 시가에 정리한 것으로 계산합니다.</li>
+      <li><b>주문 유효 3거래일</b>: 그 안에 매수가까지 안 내려오면 거래하지 않습니다. <b>추격 금지 가격</b> = (1차 목표 + 손절) ÷ 2. 이 위에서 사면 벌 수 있는 폭보다 잃을 수 있는 폭이 커집니다.</li>
+      <li><b>시간 정리</b>: 첫 매수 후 10거래일 안에 2차 목표에 못 가면 남은 물량을 그날 종가에 정리합니다.</li>
+      <li>과거 검증에서는 같은 날 손절가와 목표가가 모두 닿으면 <b>손절로</b> 계산했습니다(보수적).</li></ul>
+      <p><b>자동 주문</b>: 증권사 공식 API(예: 한국투자증권 Open API, 모의투자 지원)로 이 가격대로 실제 주문을 넣는 것도 가능합니다. 다만 계좌 정보가 필요해 이 공개 페이지에서는 하지 않고, 하더라도 모의투자로 몇 주 확인한 뒤 시작하는 것을 권합니다.</p>`],
   yt:['유튜브 언급 종목 분석',()=>`<p>${esc((D.yt||{channel:{}}).channel.name||'')} 채널의 최근 영상 15개를 매일 아침 유튜브 공개 RSS로 받아, <b>영상 제목과 설명란</b>에 나온 종목명을 찾아 우리 방식으로 분석합니다.</p>
       <ul><li><b>우리 판정</b>: 차트 추세(20·60일선), 과열(RSI 70 이상·볼린저 상단 돌파), 세력 이탈 패턴으로 '우리 방식도 긍정적 / 관망 / 추격 주의 / 주의'를 붙입니다. 종목을 누르면 세 전략 중 가장 잘 맞는 전략의 점수·목표가·손절가·차트가 열립니다.</li>
       <li><b>영상 이후 수익</b>: 영상 공개 후 첫 장 시가에 샀다고 가정하고 지금까지(비용 ${D.cfg&&D.bt?D.bt.cost:0.25}% 차감) 계산합니다. 시장 대비는 같은 시장 종목 중간값과 비교합니다.</li>
@@ -3459,6 +3716,24 @@ document.getElementById('helpMore').onclick=()=>helpDlg.close();
 helpDlg.addEventListener('click',e=>{if(e.target===helpDlg)helpDlg.close();});
 
 
+
+/* ───── 매매 포인트 ───── */
+function planStat(k){const P_=D.bt&&D.bt.plan&&D.bt.plan[k];if(!P_)return '';
+  return `<p class="pstat tn">과거 ${D.bt.start}~${D.bt.end}에 이 규칙대로 했다면: 체결 ${P_.fill}% · 거래당 평균 <b class="${P_.avg>=0?'pos':'neg'}">${pctS(P_.avg,2)}</b> · 승률 ${P_.win}% · 평균 ${P_.days}일 보유 <span class="vl">(비용 차감 · 그냥 다음 날 시가에 사서 5일 보유 ${P_.base==null?'-':pctS(P_.base,2)})</span></p>`;}
+function planHTML(x){const p=x.plan;if(!p)return '';const pc=v=>pctS((v/x.close-1)*100,1);
+  return `<div class="plan2"><div class="ph"><b>📍 매매 포인트</b><button class="q" data-help="plan" aria-label="설명 보기">?</button></div>
+    <div class="pgrid tn">
+      <div class="pb buy"><small>매수 1차 · 절반</small><b>${f0(p.b1)}</b><span>${pc(p.b1)}</span></div>
+      <div class="pb buy"><small>매수 2차 · 절반</small><b>${f0(p.b2)}</b><span>${pc(p.b2)}</span></div>
+      <div class="pb sell"><small>1차 익절 · 절반</small><b>${f0(p.t1)}</b><span>${pc(p.t1)}</span></div>
+      <div class="pb sell"><small>2차 익절 · 나머지</small><b>${f0(p.t2)}</b><span>${pc(p.t2)}</span></div>
+      <div class="pb stop"><small>손절</small><b>${f0(p.stop)}</b><span>${pc(p.stop)}</span></div>
+    </div>
+    <ul class="prules"><li>지정가 주문 · <b>${p.valid}거래일</b> 동안만 유효 (체결 안 되면 취소)</li>
+      <li><b>${f0(p.chase)}원</b> 위로는 따라 사지 않기 (손익비 1 미만)</li>
+      <li>1차 익절 후 남은 절반의 손절가를 평균 매수가 <b>${f0(p.avg)}원</b>으로 올리기</li>
+      <li><b>${p.tstop}거래일</b> 안에 2차 익절이 안 되면 남은 물량 정리 · 계획 손익비 1 : ${p.rr==null?'-':p.rr.toFixed(1)}</li></ul>
+    ${planStat(x.strat)}</div>`;}
 /* ───── 읽기 쉬운 결론 (확인된 근거 · 해석 · 확인할 것) ───── */
 function storyHTML(x){
   const ok=x.checks.filter(k=>k.s>=.99),miss=x.checks.filter(k=>k.s<.99),plus=x.aux.filter(a=>a.d>0),minus=x.aux.filter(a=>a.d<0);
@@ -3645,6 +3920,11 @@ function btGuide(bt){
   const sh=bt.vb_shadow||{};
   if(sh.pass_||sh.fail){const f=o=>o&&o.h3?`${pctS(o.h3.ex,2)} (${o.h3.n}건)`:'-';
     h+=`<h5>거래량 돌파 · 그림자 필터</h5><p>당일 +${sh.rule.max_day_change}% 이하 · 종가가 고가의 ${Math.round(sh.rule.min_close_to_high*100)}% 이상 · 거래량 ${sh.rule.min_vol_ratio}배 이상인지 <b>기록만</b> 하고 실제 추천에는 아직 쓰지 않습니다.</p>`+T([['통과',f(sh.pass_)],['미통과',f(sh.fail)]],['','3일 시장 대비']);}
+  const PL=bt.plan||{};
+  if(Object.keys(PL).length){h+=`<h5>매매 포인트대로 했다면 (거래당, 비용 차감)</h5>`+
+    T([3,1,2].filter(k=>PL[k]).map(k=>{const v=PL[k];return [STRAT[k].n,v.n+'건',v.fill+'%',`<b>${pctS(v.avg,2)}</b>`,pctS(v.med,2),v.win+'%',pctS(v.worst,1),v.days+'일',v.t??'-',v.base==null?'-':pctS(v.base,2),Object.entries(v.exits).map(([a,b])=>`${a} ${b}%`).join(' · ')];}),
+      ['전략','신호','체결률','평균','중앙값','승률','최대 손실','보유','t값','비교: 시가 매수 5일 보유','청산 방식'])+
+    `<p>'비교'보다 평균이 높으면 매매 포인트(지정가 분할 매수·분할 익절·본전 손절)가 단순 보유보다 나았다는 뜻입니다.</p>`;}
   h+=`<p class="vl" style="text-align:left">한계: 지금 상장된 종목으로만 계산해서 그 사이 상장폐지된 종목이 빠져 있습니다(결과가 실제보다 조금 좋게 나올 수 있음). 과거 수급·실적·매물대 자료가 없어 그 부분은 빼고 계산했습니다. 뉴스·AI 판단은 과거로 재현할 수 없어 실시간 기록으로만 확인합니다.</p>`;
   return h;
 }
@@ -3764,8 +4044,25 @@ function renderPulse(){
 let current=D.default_tab;
 function renderTabs(){
   document.getElementById('tabs').innerHTML=D.tabs.map(t=>`<button class="tab" role="tab" style="--tc:var(${STRAT[t.k].v})" aria-selected="${t.k===current}" data-k="${t.k}">${t.name}${t.k===D.default_tab?'<span class="rec">오늘 추천</span>':''}</button>`).join('')+(D.yt&&D.yt.videos.length?`<a class="tab ytab" href="#yt">📺 유튜브</a>`:'');
-  document.querySelectorAll('.tab[data-k]').forEach(b=>b.onclick=()=>{current=+b.dataset.k;renderTabs();renderPanel();});
+  document.querySelectorAll('.tab[data-k]').forEach(b=>b.onclick=()=>switchTab(+b.dataset.k,0));
+  const on=document.querySelector('.tab[aria-selected="true"]');if(on)on.scrollIntoView({block:'nearest',inline:'center'});
+  const idx=D.tabs.findIndex(t=>t.k===current);
+  document.getElementById('tabdots').innerHTML=D.tabs.map((t,i)=>`<i class="${i===idx?'on':''}" style="--tc:var(${STRAT[t.k].v})"></i>`).join('');
 }
+/* 좌우로 밀어서 전략 바꾸기 (휴대폰) · 키보드 ← → (PC) */
+function switchTab(k,dir){
+  if(k===current)return;current=k;renderTabs();renderPanel();
+  const p=document.getElementById('panel');if(dir){p.classList.remove('slide-l','slide-r');void p.offsetWidth;p.classList.add(dir>0?'slide-l':'slide-r');}
+}
+function stepTab(dir){const i=D.tabs.findIndex(t=>t.k===current),j=(i+dir+D.tabs.length)%D.tabs.length;switchTab(D.tabs[j].k,dir);}
+(function(){
+  const area=document.getElementById('v-picks');let x0=null,y0=null,t0=0;
+  area.addEventListener('touchstart',e=>{if(e.touches.length!==1)return;x0=e.touches[0].clientX;y0=e.touches[0].clientY;t0=Date.now();},{passive:true});
+  area.addEventListener('touchend',e=>{if(x0==null)return;const t=e.changedTouches[0],dx=t.clientX-x0,dy=t.clientY-y0;x0=null;
+    if(Math.abs(dx)>=60&&Math.abs(dx)>Math.abs(dy)*1.5&&Date.now()-t0<800)stepTab(dx<0?1:-1);},{passive:true});
+  addEventListener('keydown',e=>{if(document.getElementById('v-picks').hidden||sheet.open||/INPUT|TEXTAREA/.test(document.activeElement.tagName))return;
+    if(e.key==='ArrowRight')stepTab(1);else if(e.key==='ArrowLeft')stepTab(-1);});
+})();
 
 function scoreHTML(x){
   return `<div class="score ${STRAT[x.strat].c}"><div class="bar"><i style="width:${x.score}%"></i></div><b class="tn">${x.score}</b></div>
@@ -3787,6 +4084,7 @@ function pickCard(x){
         <span class="tag ${STRAT[x.strat].c}">${STRAT[x.strat].n}${x.rank?' '+x.rank+'위':''}</span>
         <div class="name">${esc(x.name)} <span class="code tn">${x.code} ${x.market}</span></div>
         <div class="price tn">${f0(x.close)}<span>${pct(x.chg)}</span></div>
+        ${planHTML(x)}
         ${storyHTML(x)}
         ${scoreHTML(x)}
         ${tgHTML(x)}
@@ -3821,6 +4119,7 @@ function renderPanel(){
       <span class="rk tn">${x.rank}</span>
       <span class="pn"><b>${esc(x.name)}</b><small class="tn">${f0(x.close)} ${pct(x.chg)}</small></span>
       ${x.series?`<span class="sp">${miniSpark(x.series.c.slice(-40))}</span>`:'<span class="sp"></span>'}
+      <span class="pt tn"><small>매수</small><b class="buyc">${x.plan?f0(x.plan.b1):'-'}</b></span>
       <span class="pt tn"><small>목표</small><b class="upc">${pctS(x.tg.t1p)}</b></span>
       <span class="pt tn"><small>손절</small><b class="downc">${pctS(x.tg.sp)}</b></span>
       <span class="ps tn"><i style="width:${x.score}%"></i><b>${x.score}</b></span></button>`;
@@ -4008,7 +4307,7 @@ function renderHome(){
       ${q.length?`<div class="card strip tn">${q.map(x=>`<div><small>${esc(x.n)}</small><b class="${x.chg>=0?'upc':'downc'}">${pctS(x.chg,2)}</b></div>`).join('')}</div>`:''}
       <div class="card">
         <div class="ch"><h3>오늘의 TOP 3</h3>${tab?`<span class="tag ${STRAT[tab.k].c}">${tab.name}</span>`:''}</div>
-        ${top.length?`<div class="plist">${top.map((x,i)=>`<button class="prow top" data-pick="${tab.k}:${i}"><span class="rk tn">${i+1}</span><span class="pn"><b>${esc(x.name)}</b><small class="tn">${f0(x.close)} ${pct(x.chg)}</small></span><span class="pt tn"><small>목표</small><b class="upc">${pctS(x.tg.t1p)}</b></span><span class="pt tn"><small>손절</small><b class="downc">${pctS(x.tg.sp)}</b></span></button>`).join('')}</div>`:'<p class="vl" style="text-align:left">오늘은 추천 종목이 없습니다.</p>'}
+        ${top.length?`<div class="plist">${top.map((x,i)=>`<button class="prow top" data-pick="${tab.k}:${i}"><span class="rk tn">${i+1}</span><span class="pn"><b>${esc(x.name)}</b><small class="tn">${f0(x.close)} ${pct(x.chg)}</small></span><span class="pt tn"><small>매수</small><b class="buyc">${x.plan?f0(x.plan.b1):'-'}</b></span><span class="pt tn"><small>목표</small><b class="upc">${pctS(x.tg.t1p)}</b></span><span class="pt tn"><small>손절</small><b class="downc">${pctS(x.tg.sp)}</b></span></button>`).join('')}</div>`:'<p class="vl" style="text-align:left">오늘은 추천 종목이 없습니다.</p>'}
         <a class="more" href="#picks">전략별 추천 전체 →</a>
       </div>
       <div class="card">
@@ -4076,6 +4375,7 @@ document.getElementById('refresh').onclick=()=>location.reload();
 renderBrief();renderScore();renderRevLink();checkFresh();setInterval(checkFresh,10*60*1000);renderRisk();renderMacro();renderOutlook();renderEvents();
 renderGainers();renderTabs();renderPanel();initHolds();route();
 let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(drawAll,150);});
+}
 </script>
 </body>
 </html>
