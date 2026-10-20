@@ -2018,6 +2018,28 @@ FIX = {
 }
 
 
+def weak_strats(bt, regime):
+    """지금 시장 국면에서 과거 3일 시장 대비가 −0.5%p 미만이던 전략 (표본 30건 이상)"""
+    out = []
+    for k_, rg in ((bt or {}).get("regime") or {}).items():
+        x = ((rg or {}).get(regime) or {}).get("h3")
+        if x and x["n"] >= 30 and x["ex"] < -0.5:
+            out.append(int(k_))
+    return out
+
+
+def pick_default(bt, regime, above20, risk):
+    """과거 검증에서 지금 국면(강세/약세)에 3일 시장 대비가 가장 좋았던 전략. 자료가 없으면 예전 규칙"""
+    best, bv = None, -9
+    for k_, rg in ((bt or {}).get("regime") or {}).items():
+        x = ((rg or {}).get(regime) or {}).get("h3")
+        if x and x["n"] >= 30 and x["ex"] > bv:
+            best, bv = int(k_), x["ex"]
+    if best:
+        return best
+    return 3 if above20 < 45 or (risk or {}).get("score", 0) >= 50 else 1
+
+
 def diagnose_bt(bt, add):
     """1년 반 과거 검증(표본 수백 건) 기반 진단 — 지금 바로 믿을 수 있는 쪽"""
     if not bt:
@@ -2036,11 +2058,20 @@ def diagnose_bt(bt, add):
         rg = bt["regime"].get(k_, {})
         w, s_ = (rg.get("약세") or {}).get("h3"), (rg.get("강세") or {}).get("h3")
         if w and s_ and w["n"] >= 30 and w["ex"] < -0.5 and s_["ex"] > 0:
-            add("warn", f"{nm}: 약세장에서만 성적이 나쁨", f"강세장 {s_['ex']:+.2f}%p ({s_['n']}건) · 약세장 {w['ex']:+.2f}%p ({w['n']}건)",
-                "시장 날씨가 비·폭풍일 때 이 전략을 홈 TOP 3과 추천에서 빼는 수정")
-        if v.get("stp") is not None and v["stp"] >= 50 and v["stp"] > v.get("tgt", 0):
-            add("warn", f"{nm}: 손절이 목표보다 먼저 닿는 경우가 많음", f"10일 안에 손절 {v['stp']}% · 목표 {v['tgt']}%",
-                "손절가를 ATR 1.5배→2배로 넓히거나, 손익비 2 이상인 종목만 추천하는 수정")
+            add("info", f"{nm}: 약세장에서 성적이 나쁨 → 반영 완료", f"강세장 {s_['ex']:+.2f}%p ({s_['n']}건) · 약세장 {w['ex']:+.2f}%p ({w['n']}건)",
+                "약세장인 날에는 이 전략을 '오늘 추천'과 홈 TOP 3에서 자동으로 빼고, 탭에 경고를 띄웁니다")
+        sg = (bt.get("sgrid") or {}).get(k_) or []
+        base_ = next((x for x in sg if x["smul"] == 0 and x["rmin"] == 0), None)
+        good_ = [x for x in sg if x["n"] >= 100 and (x["t"] or 0) >= 2 and (x["a"] or -1) > 0 and (x["b"] or -1) > 0]
+        best_ = max(good_, key=lambda x: x["avg"]) if good_ else None
+        lab = lambda x: ("지금 손절 규칙" if x["smul"] == 0 else f"손절을 현재가 − {x['smul']:g}×ATR 이하로") + (f" · 손익비 {x['rmin']:g} 이상만" if x["rmin"] else "")
+        if base_ and best_ and best_["avg"] - base_["avg"] >= 0.3 and not (best_["smul"] == 0 and best_["rmin"] == 0):
+            add("warn", f"{nm}: 손절 폭·손익비 기준을 바꾸면 과거 성적이 좋아짐",
+                f"지금 거래당 {base_['avg']:+.2f}% ({base_['n']}건) → {lab(best_)}: {best_['avg']:+.2f}% ({best_['n']}건, t={best_['t']}, 앞·뒤 기간 모두 플러스)",
+                f"{nm}의 기본값을 '{lab(best_)}'로 바꾸는 수정")
+        elif v.get("stp") is not None and v["stp"] >= 50 and v["stp"] > v.get("tgt", 0) and sg:
+            add("info", f"{nm}: 손절이 자주 닿지만, 손절을 넓혀도 나아지지 않음",
+                f"10일 안에 손절 {v['stp']}% · 목표 {v['tgt']}% · 손절 폭·손익비 기준 9가지를 비교했지만 뚜렷하게 나은 조합이 없음", "현재 손절 규칙 유지")
     g = bt.get("vb_grid") or []
     base = next((x for x in g if x["vmin"] == 2.0 and x["cmax"] == 30.0), None)
     good = [x for x in g if x["n"] >= 60 and (x["t"] or 0) >= 2 and (x["ex3_a"] or -1) > 0 and (x["ex3_b"] or -1) > 0]
@@ -2114,6 +2145,8 @@ def diagnose(rv, status, bt=None):
 
 # ───────────────────────────── 과거 성적 검증 (백테스트, 약 1년 반 · 매 거래일) ─────────────────────────────
 H_LIST = (1, 3, 5)
+STOP_GRID = (None, 2.0, 2.5)    # None = 지금 손절 규칙, 2.0 = '현재가 − 2×ATR'보다 깊게, 2.5 = 2.5×ATR
+RR_GRID = (0.0, 1.5, 2.0)       # 계획 손익비가 이 값 이상인 종목만
 
 
 def _tstat(vals):
@@ -2165,7 +2198,7 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
     if not demo and asof and os.path.exists(cache):
         try:
             cj = load_json(cache)
-            if cj.get("asof") == asof and cj.get("ver") == 3:
+            if cj.get("asof") == asof and cj.get("ver") == 4:
                 print("  과거 성적: 오늘 계산해 둔 결과 재사용", flush=True)
                 stat("과거 성적 검증", True, f"{cj['res']['n_days']}거래일 · {cj['res']['start']}~{cj['res']['end']} (재사용)")
                 return cj["res"]
@@ -2178,7 +2211,7 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
     okname = pd.Series([x.endswith("0") and (x in market) and "스팩" not in str(names.get(x, "")) for x in P["c"].columns], index=P["c"].columns)
     mc_ok = mcap.reindex(P["c"].columns).fillna(np.inf) >= CFG["min_mcap"]
     VB = CFG["vb_filter"]
-    rows, grid = [], []
+    rows, grid, sgrid = [], [], []
     start = CFG["min_history"] + 5
     if demo:
         start = max(start, n - 80)
@@ -2254,6 +2287,27 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
                 x = rec(tk, rank)
                 if x:
                     rows.append(x)
+            if t + 13 < n:                                       # 손절 폭 × 손익비 기준 비교 (그날 후보 30개 안에서 다시 고르기)
+                cand30 = list(sc.index[:30])
+                sl13 = slice(t + 1, t + 14)
+                plans = {}
+                for tk in cand30:
+                    c0_, a_ = float(c[tk]), float(m_["atr"][tk])
+                    a_ = a_ if np.isfinite(a_) and a_ > 0 else c0_ * 0.03
+                    tg_, st_ = float(t1s[tk]), float(sts[tk])
+                    st_ = st_ if np.isfinite(st_) and st_ < c0_ * 0.995 else c0_ - 1.5 * a_
+                    tg_ = tg_ if np.isfinite(tg_) and tg_ > c0_ * 1.01 else c0_ + 1.5 * a_
+                    gg = lambda key: float(m_[key][tk]) if m_[key][tk] == m_[key][tk] else None
+                    for smul in STOP_GRID:
+                        st2 = st_ if smul is None else min(st_, c0_ - smul * a_)
+                        plans[(tk, smul)] = trade_plan(k, c0_, a_, gg("ma20"), gg("bbl"), gg("hi60"), gg("lo5"), tg_, float(t2s[tk]), st2)
+                for smul in STOP_GRID:
+                    for rmin in RR_GRID:
+                        pk = [tk for tk in cand30 if (plans[(tk, smul)]["rr"] or 0) >= rmin][:3]
+                        for tk in pk:
+                            sim = simulate_plan(plans[(tk, smul)], *(P[x].iloc[sl13][tk].to_numpy(float) for x in "ohlc"), cost)
+                            if sim.get("filled") and not sim.get("open"):
+                                sgrid.append(dict(date=dates[t].strftime("%Y-%m-%d"), k=k, smul=smul, rmin=rmin, pr=sim["ret"]))
             if k == 2 and 3 in fut and fut[3] is not None:      # 거래량 돌파 기준값 격자 비교 (그날 후보 30개 안에서 다시 고르기)
                 cand = list(sc.index[:30])
                 for vmin in (2.0, 2.5, 3.0, 4.0):
@@ -2281,6 +2335,21 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
         res["half"][str(k)] = dict(a=h1, b=h2, first=f"{days_[0]}~{mid}", second=f"{mid}~{days_[-1]}")
         if s["verdict"] == "효과 있음" and not ((h1 or {}).get("h3", {}).get("ex", -1) > 0 and (h2 or {}).get("h3", {}).get("ex", -1) > 0):
             s["verdict"] = "효과 불분명"     # 한쪽 기간에서만 좋았다면 우연일 수 있음
+    res["sgrid"] = {}
+    if sgrid:
+        SG = pd.DataFrame(sgrid)
+        SG["smul"] = SG["smul"].fillna(0)
+        for k in (1, 2, 3):
+            gk = SG[SG.k == k]
+            out_ = []
+            for (smul, rmin), g in gk.groupby(["smul", "rmin"]):
+                daily = g.groupby("date")["pr"].mean()
+                out_.append(dict(smul=float(smul), rmin=float(rmin), n=int(len(g)), avg=round(float(g.pr.mean()), 2),
+                                 win=round(float((g.pr > 0).mean() * 100)), t=(round(_tstat(daily.values), 2) if _tstat(daily.values) is not None else None),
+                                 a=(round(float(g[g.date < mid].pr.mean()), 2) if (g.date < mid).any() else None),
+                                 b=(round(float(g[g.date >= mid].pr.mean()), 2) if (g.date >= mid).any() else None)))
+            if out_:
+                res["sgrid"][str(k)] = out_
     res["plan"] = {}
     for k in (1, 2, 3):
         rk = [r for r in rows if r["k"] == k and "pf" in r]
@@ -2315,7 +2384,7 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
     if not demo and asof:
         try:
             os.makedirs(HIST_DIR, exist_ok=True)
-            save_json(cache, dict(asof=asof, ver=3, res=res))
+            save_json(cache, dict(asof=asof, ver=4, res=res))
         except Exception:
             pass
     return res
@@ -2552,6 +2621,7 @@ def build(demo=False, mode="file"):
         print(f"  브리핑 생성 실패: {ex}", flush=True)
         brief = None
     above20 = (c[uni] > m["ma20"][uni]).mean() * 100
+    regime_now = "강세" if above20 >= 50 else "약세"
     above60 = (c[uni] > m["ma60"][uni]).mean() * 100
     rising = (m["chg"][uni] > 0).mean() * 100
     return dict(
@@ -2561,7 +2631,8 @@ def build(demo=False, mode="file"):
         rules={k: [[lb, w] for lb, w, _, _ in ev["checks"][k]] for k in (1, 2, 3)},
         targets={k: list(TARGET_RULE[k]) + [STOP_LABEL[k]] for k in (1, 2, 3)},
         breadth=dict(above20=num(above20, 1), above60=num(above60, 1), rising=num(rising, 1)),
-        default_tab=(3 if above20 < 45 or risk["score"] >= 50 else 1),
+        default_tab=pick_default(bt, regime_now, above20, risk),
+        regime_now=regime_now, weak={k_: True for k_ in weak_strats(bt, regime_now)},
         risk=risk, outlook=outlook, macro=macro,
         bt=bt, status=STATUS, review=rv, tips=tips, brief=brief, gen_iso=datetime.now().strftime("%Y-%m-%dT%H:%M"),
         tabs=tabs, all=allstk, news=news, yt=yt, gainers=gainers,
@@ -2578,7 +2649,10 @@ def write_html(data, path):
         boot = "const ENC=" + json.dumps(enc) + ";" + LOCK_JS
     else:
         boot = "APP(" + payload + ");"
-    html = TEMPLATE.replace("__BOOT__", boot).replace("__LOCKED__", "locked" if SITE_PASSWORD else "")
+    gc = re.sub(r"[^a-z0-9-]", "", os.environ.get("GOATCOUNTER_CODE", "").strip().lower())
+    analytics = (f'<script data-goatcounter="https://{gc}.goatcounter.com/count" data-goatcounter-settings=\'{{"no_onload":true}}\' '
+                 f'async src="https://gc.zgo.at/count.js"></script><script>window.GC_CODE="{gc}";</script>') if gc else ""
+    html = TEMPLATE.replace("__BOOT__", boot).replace("__LOCKED__", "locked" if SITE_PASSWORD else "").replace("__ANALYTICS__", analytics)
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
     with open(os.path.join(os.path.dirname(os.path.abspath(path)), "version.json"), "w", encoding="utf-8") as f:
@@ -2686,6 +2760,7 @@ TEMPLATE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>오늘의 종목 발굴</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+__ANALYTICS__
 <style>
 :root{
   --bg:#eceff3; --surface:#ffffff; --sunk:#f5f7f9; --line:#dde2e8; --ink:#16202a; --muted:#5d6874; --faint:#9aa4af;
@@ -3284,6 +3359,11 @@ body.locked .wrap{display:none}
 .lockbox input[type=password]{font:inherit;font-size:16px;padding:12px 14px;border-radius:12px;border:1.5px solid var(--line);background:var(--sunk);color:var(--ink);text-align:center}
 .lk-r{display:flex;gap:6px;justify-content:center;align-items:center;font-size:13px;color:var(--muted)}
 .lk-e{color:var(--bad)!important;font-weight:700}
+
+.visits{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:16px 20px;margin-bottom:12px}
+.vgrid{display:flex;gap:24px;margin-top:10px}.vgrid>div{display:grid}.vgrid small{color:var(--muted);font-weight:700;font-size:12px}.vgrid b{font-size:26px;font-weight:900}
+
+.tab .wk{color:var(--bad);font-size:13px}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -3350,6 +3430,7 @@ body.locked .wrap{display:none}
   <section class="view" id="v-more" hidden>
     <section class="scoreboard" id="score"></section>
     <section class="revlink" id="revlink"></section>
+    <section class="visits" id="visits" hidden></section>
     <a class="morelink" href="#yt">📺 한균수의 주식사용설명서 · 언급 종목 분석 →</a>
     <a class="morelink" href="#guide">📖 상세 설명 · 계산 방법 보기 →</a>
   </section>
@@ -3925,6 +4006,9 @@ function btGuide(bt){
     T([3,1,2].filter(k=>PL[k]).map(k=>{const v=PL[k];return [STRAT[k].n,v.n+'건',v.fill+'%',`<b>${pctS(v.avg,2)}</b>`,pctS(v.med,2),v.win+'%',pctS(v.worst,1),v.days+'일',v.t??'-',v.base==null?'-':pctS(v.base,2),Object.entries(v.exits).map(([a,b])=>`${a} ${b}%`).join(' · ')];}),
       ['전략','신호','체결률','평균','중앙값','승률','최대 손실','보유','t값','비교: 시가 매수 5일 보유','청산 방식'])+
     `<p>'비교'보다 평균이 높으면 매매 포인트(지정가 분할 매수·분할 익절·본전 손절)가 단순 보유보다 나았다는 뜻입니다.</p>`;}
+  const SGt=bt.sgrid||{};
+  if(Object.keys(SGt).length){h+=`<h5>손절 폭 × 손익비 기준 비교 (매매 포인트대로 했을 때 거래당, 비용 차감)</h5><p>그날 후보 30개 안에서 기준에 맞는 상위 3개를 다시 골라, 매매 포인트 규칙 그대로 시뮬레이션했습니다. 진단은 표본 100건 이상 · t값 2 이상 · 앞·뒤 기간 모두 플러스이면서 지금보다 0.3%p 이상 나을 때만 '바꾸세요'라고 합니다.</p>`;
+    [3,1,2].filter(k=>SGt[k]).forEach(k=>{h+=`<h5 class="${STRAT[k].c}">${STRAT[k].n}</h5>`+T(SGt[k].map(x=>[x.smul?`현재가 − ${x.smul}×ATR 이하`:'<b>지금 규칙</b>',x.rmin?`${x.rmin} 이상`:'제한 없음',x.n+'건',`<b>${pctS(x.avg,2)}</b>`,x.win+'%',x.t??'-',`${x.a==null?'-':pctS(x.a,2)} / ${x.b==null?'-':pctS(x.b,2)}`]),['손절','손익비','거래','거래당 평균','승률','t값','앞 / 뒤 기간']);});}
   h+=`<p class="vl" style="text-align:left">한계: 지금 상장된 종목으로만 계산해서 그 사이 상장폐지된 종목이 빠져 있습니다(결과가 실제보다 조금 좋게 나올 수 있음). 과거 수급·실적·매물대 자료가 없어 그 부분은 빼고 계산했습니다. 뉴스·AI 판단은 과거로 재현할 수 없어 실시간 기록으로만 확인합니다.</p>`;
   return h;
 }
@@ -3960,6 +4044,16 @@ function revPrompt(){
     (rv&&rv.ol?`5일 전망: ${rv.ol.n}건 적중 ${rv.ol.hit}%, 흔들림 범위 안 ${rv.ol.inband}%\n`:'')+
     `자동 진단:\n${ts.map(t=>`- [${SEV[t.sev][1]}] ${t.title}: ${t.detail}${t.fix?` → 제안: ${t.fix}`:''}`).join('\n')}\n\n`+
     `이 결과를 보고 프로그램에서 무엇을 어떻게 고치면 좋을지 우선순위대로 정리해 주고, stock_dashboard.py에서 바꿔야 할 부분(조건 기준값, 점수, 함수)을 구체적으로 알려줘.`;
+}
+function renderVisits(){
+  const box=document.getElementById('visits');if(!window.GC_CODE)return;
+  const url=c=>`https://${window.GC_CODE}.goatcounter.com/counter/${c}.json`;
+  Promise.all(['TOTAL','/home'].map(c=>fetch(url(encodeURIComponent(c))).then(r=>r.ok?r.json():null).catch(()=>null))).then(([t,h])=>{
+    if(!t)return;box.hidden=false;
+    box.innerHTML=`<div class="bhead"><h2 style="margin:0">👀 방문 현황</h2><a class="more" href="https://${window.GC_CODE}.goatcounter.com" target="_blank" rel="noopener">자세히 ↗</a></div>
+      <div class="vgrid tn"><div><small>누적 방문</small><b>${esc(t.count)}</b></div>${h?`<div><small>홈 화면 방문</small><b>${esc(h.count)}</b></div>`:''}</div>
+      <p class="vl" style="text-align:left;margin:6px 0 0">날짜별·기기별·시간대별 방문은 '자세히'에서 볼 수 있습니다. 누가 왔는지(이름)는 알 수 없습니다.</p>`;
+  });
 }
 function renderRevLink(){
   const rv=D.review,ts=D.tips||[],box=document.getElementById('revlink');
@@ -4043,7 +4137,7 @@ function renderPulse(){
 }
 let current=D.default_tab;
 function renderTabs(){
-  document.getElementById('tabs').innerHTML=D.tabs.map(t=>`<button class="tab" role="tab" style="--tc:var(${STRAT[t.k].v})" aria-selected="${t.k===current}" data-k="${t.k}">${t.name}${t.k===D.default_tab?'<span class="rec">오늘 추천</span>':''}</button>`).join('')+(D.yt&&D.yt.videos.length?`<a class="tab ytab" href="#yt">📺 유튜브</a>`:'');
+  document.getElementById('tabs').innerHTML=D.tabs.map(t=>`<button class="tab" role="tab" style="--tc:var(${STRAT[t.k].v})" aria-selected="${t.k===current}" data-k="${t.k}">${t.name}${t.k===D.default_tab?'<span class="rec">오늘 추천</span>':''}${D.weak&&D.weak[t.k]?' <span class="wk" title="지금 시장에서 과거 성적이 약했던 전략">⚠</span>':''}</button>`).join('')+(D.yt&&D.yt.videos.length?`<a class="tab ytab" href="#yt">📺 유튜브</a>`:'');
   document.querySelectorAll('.tab[data-k]').forEach(b=>b.onclick=()=>switchTab(+b.dataset.k,0));
   const on=document.querySelector('.tab[aria-selected="true"]');if(on)on.scrollIntoView({block:'nearest',inline:'center'});
   const idx=D.tabs.findIndex(t=>t.k===current);
@@ -4113,7 +4207,8 @@ function openPick(k,i){
 }
 function renderPanel(){
   const tab=D.tabs.find(t=>t.k===current),st=tab.stocks;
-  document.getElementById('tabdesc').innerHTML=(D.risk&&D.risk.score>=50?`<span class="rwarn">⚠️ 시장 위험 '${D.risk.level}' · 매수 금액을 크게 줄이세요</span><br>`:'')+esc(STRAT[current].d);
+  const wk=D.weak&&D.weak[current],rg=D.bt&&D.bt.regime&&D.bt.regime[current]&&D.bt.regime[current][D.regime_now];
+  document.getElementById('tabdesc').innerHTML=(wk&&rg&&rg.h3?`<span class="rwarn">⚠️ 지금 같은 ${D.regime_now}장에서 이 전략은 과거에 시장보다 평균 ${pctS(rg.h3.ex,2)}였습니다 (${rg.h3.n}건) · 오늘은 참고만</span><br>`:'')+(D.risk&&D.risk.score>=50?`<span class="rwarn">⚠️ 시장 위험 '${D.risk.level}' · 매수 금액을 크게 줄이세요</span><br>`:'')+esc(STRAT[current].d);
   if(!st.length){document.getElementById('panel').innerHTML='<div class="empty">오늘은 이 전략에 맞는 종목이 없습니다.</div>';return;}
   const row=(x,i)=>`<button class="prow ${i<3?'top':''}" data-pick="${tab.k}:${i}">
       <span class="rk tn">${x.rank}</span>
@@ -4307,6 +4402,7 @@ function renderHome(){
       ${q.length?`<div class="card strip tn">${q.map(x=>`<div><small>${esc(x.n)}</small><b class="${x.chg>=0?'upc':'downc'}">${pctS(x.chg,2)}</b></div>`).join('')}</div>`:''}
       <div class="card">
         <div class="ch"><h3>오늘의 TOP 3</h3>${tab?`<span class="tag ${STRAT[tab.k].c}">${tab.name}</span>`:''}</div>
+        ${tab&&D.weak&&D.weak[tab.k]?`<p class="rwarn" style="margin:0 0 8px;font-size:13px">⚠️ 지금 같은 ${D.regime_now}장에서는 세 전략 모두 과거 성적이 약했습니다 · 매수는 아주 조금만</p>`:''}
         ${top.length?`<div class="plist">${top.map((x,i)=>`<button class="prow top" data-pick="${tab.k}:${i}"><span class="rk tn">${i+1}</span><span class="pn"><b>${esc(x.name)}</b><small class="tn">${f0(x.close)} ${pct(x.chg)}</small></span><span class="pt tn"><small>매수</small><b class="buyc">${x.plan?f0(x.plan.b1):'-'}</b></span><span class="pt tn"><small>목표</small><b class="upc">${pctS(x.tg.t1p)}</b></span><span class="pt tn"><small>손절</small><b class="downc">${pctS(x.tg.sp)}</b></span></button>`).join('')}</div>`:'<p class="vl" style="text-align:left">오늘은 추천 종목이 없습니다.</p>'}
         <a class="more" href="#picks">전략별 추천 전체 →</a>
       </div>
@@ -4326,8 +4422,14 @@ function renderHome(){
       </div>`:''}
     </div>`;
 }
+function track(h){
+  if(!window.GC_CODE)return;
+  const go=()=>{if(window.goatcounter&&window.goatcounter.count)window.goatcounter.count({path:'/'+(h.replace('#','')||'home'),title:document.title});else setTimeout(go,800);};
+  go();
+}
 function route(){
   let h=location.hash||'#home';if(h==='#my')h='#mine';
+  track(h.startsWith('#guide')?'#guide':h);
   const views={'#home':'v-home','#picks':'v-picks','#mine':'v-mine','#market':'v-market','#more':'v-more','#review':'reviewview','#yt':'v-yt'};
   const id=h.startsWith('#guide')?'guideview':(views[h]||'v-home');
   document.querySelectorAll('.view').forEach(v=>v.hidden=v.id!==id);
@@ -4372,7 +4474,7 @@ function initHolds(){
 document.getElementById('meta').textContent=`${D.asof} 종가 · ${D.generated.slice(5)} 갱신`;
 document.getElementById('demo').hidden=!D.demo;
 document.getElementById('refresh').onclick=()=>location.reload();
-renderBrief();renderScore();renderRevLink();checkFresh();setInterval(checkFresh,10*60*1000);renderRisk();renderMacro();renderOutlook();renderEvents();
+renderBrief();renderScore();renderRevLink();renderVisits();checkFresh();setInterval(checkFresh,10*60*1000);renderRisk();renderMacro();renderOutlook();renderEvents();
 renderGainers();renderTabs();renderPanel();initHolds();route();
 let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(drawAll,150);});
 }
