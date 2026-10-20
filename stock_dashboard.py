@@ -1316,6 +1316,125 @@ def safe_fetch(code, count):
         return None, None
 
 
+# ───────────────────────────── 유튜브 채널 · 급등주 해부 ─────────────────────────────
+YT_CHANNEL = dict(name="한균수의 주식사용설명서", id="UCadSWH0pDXxEatvLHEHCWlg",
+                  url="https://www.youtube.com/@%ED%95%9C%EA%B7%A0%EC%88%98%EC%9D%98%EC%A3%BC%EC%8B%9D%EC%82%AC%EC%9A%A9%EC%84%A4%EB%AA%85")
+NAME_ALIAS = {"삼전": "삼성전자", "하닉": "SK하이닉스", "하이닉스": "SK하이닉스", "현차": "현대차", "엘전": "LG전자", "엔솔": "LG에너지솔루션",
+              "삼바": "삼성바이오로직스", "한화에어로": "한화에어로스페이스", "두산에너빌": "두산에너빌리티", "포스코홀딩스": "POSCO홀딩스",
+              "카뱅": "카카오뱅크", "에코비엠": "에코프로비엠", "현대로템": "현대로템", "HD현중": "HD현대중공업"}
+NAME_STOP = {"대상", "한국", "미래", "동방", "선진", "대원", "국보", "진도", "광명", "세방", "부국", "서울", "신라", "조선", "성안", "상신",
+             "대성", "동성", "한일", "태양", "우진", "일진", "대교", "남성", "사조", "다우", "효성", "이월", "체시스", "유진", "삼일", "현대"}
+
+
+def fetch_youtube(n=15):
+    import html as _h
+    xml = http_get(f"https://www.youtube.com/feeds/videos.xml?channel_id={YT_CHANNEL['id']}", retries=2)
+    out = []
+    for e in re.findall(r"<entry>(.*?)</entry>", xml, re.S)[:n]:
+        g = lambda pat: (re.search(pat, e, re.S) or [None, ""])[1]
+        try:
+            pub = datetime.fromisoformat(g(r"<published>(.*?)</published>").strip()).astimezone()
+        except Exception:
+            continue
+        out.append(dict(vid=g(r"<yt:videoId>(.*?)</yt:videoId>").strip(), title=_h.unescape(g(r"<title>(.*?)</title>")).strip(),
+                        desc=_h.unescape(g(r"<media:description>(.*?)</media:description>")), pub=pub,
+                        views=int(g(r'<media:statistics views="(\d+)"') or 0)))
+    return out
+
+
+def demo_videos(names):
+    nm = [v for k, v in names.items() if k.endswith("0")][:12]
+    now = datetime.now().astimezone()
+    return [dict(vid="dQw4w9WgXcQ", title=f"[공개방송] {nm[i]}·{nm[i + 1]} 지금 사도 될까? 시장 점검", desc=f"00:00 시황\n05:10 {nm[i]}\n12:30 {nm[i + 1]}",
+                 pub=now - timedelta(days=i * 2 + 1), views=10000 + i * 1000) for i in range(0, 10, 2)]
+
+
+def find_mentions(text, name2code):
+    """제목·설명에서 종목명 찾기 (긴 이름 먼저, 짧은 이름은 앞뒤가 글자가 아닐 때만)"""
+    found, used = [], []
+    for alias, real in NAME_ALIAS.items():
+        if alias in text and real in name2code:
+            found.append(name2code[real])
+    for nm in sorted(name2code, key=len, reverse=True):
+        if len(nm) < 2 or nm in NAME_STOP:
+            continue
+        j = text.find(nm)
+        while j >= 0:
+            a, b = j, j + len(nm)
+            if not any(x <= a < y or x < b <= y for x, y in used):
+                if len(nm) <= 2:
+                    pre, post = text[a - 1:a] or " ", text[b:b + 1] or " "
+                    if re.match(r"[가-힣A-Za-z0-9]", pre) or re.match(r"[가-힣A-Za-z0-9]", post):
+                        j = text.find(nm, j + 1)
+                        continue
+                used.append((a, b))
+                found.append(name2code[nm])
+            j = text.find(nm, j + 1)
+    return list(dict.fromkeys(found))[:12]
+
+
+def perf_since(P, t, pub, market):
+    """영상 공개 후 첫 장 시가에 샀다면: 지금까지 · 5거래일 뒤 수익 (비용 차감, 같은 시장 중간값과 비교)"""
+    dates = P["c"].index
+    d0 = pd.Timestamp(pub.date())
+    j = dates.searchsorted(d0, side="left" if pub.hour < 9 else "right")
+    n = len(dates)
+    if j >= n or not (P["o"].iloc[j][t] > 0):
+        return None
+    e = float(P["o"].iloc[j][t])
+    liq = (P["a"].iloc[j] >= CFG["min_amount"]) & (P["o"].iloc[j] > 0)
+    mk = pd.Series([market.get(x, "") for x in P["c"].columns], index=P["c"].columns)
+
+    def ret(k):
+        r = (float(P["c"].iloc[k][t]) / e - 1) * 100 - CFG["cost"]
+        b = ((P["c"].iloc[k][liq] / P["o"].iloc[j][liq] - 1) * 100).groupby(mk[liq]).median().get(market.get(t, ""), 0.0)
+        return round(r, 2), round(r - float(b), 2)
+    now, now_ex = ret(n - 1)
+    out = dict(entry=num(e), from_=dates[j].strftime("%m/%d"), days=int(n - j), now=now, now_ex=now_ex)
+    if j + 4 < n:
+        out["r5"], out["ex5"] = ret(j + 4)
+    return out
+
+
+def chart_read(t, ev):
+    """차트만 보고 내린 짧은 판정 (유튜브 언급·급등주용)"""
+    m = ev["m"]
+    c, ma20, ma60, ma60_5 = (float(m[k][t]) for k in ("c", "ma20", "ma60", "ma60_5"))
+    rsi, pb = float(m["rsi"][t]), float(m["pb"][t])
+    trend = "상승 추세" if c > ma20 > ma60 and ma60 > ma60_5 else "하락 추세" if c < ma60 and ma60 < ma60_5 else "혼조"
+    hot = rsi >= 70 or pb >= 1
+    pat = str(m["pat"][t]) if m.get("pat") is not None else ""
+    if trend == "하락 추세" or "이탈" in pat:
+        op = ("주의", "bad")
+    elif hot:
+        op = ("추격 주의 · 눌림 기다리기", "mid")
+    elif trend == "상승 추세":
+        op = ("우리 방식도 긍정적", "ok")
+    else:
+        op = ("관망", "mid")
+    return dict(trend=trend, hot=bool(hot), rsi=num(rsi, 1), pat=pat, op=op[0], tone=op[1])
+
+
+def gainer_stats(P, I):
+    """과거 2년: 하루 +25% 이상(상한가급) / +15~25% 급등 다음 날·5일 뒤 평균"""
+    c, o, a = P["c"].to_numpy(float), P["o"].to_numpy(float), P["a"].to_numpy(float)
+    ch = I["chg"].to_numpy(float)
+    out = {}
+    for lab, lo, hi in (("상한가급 (+25% 이상)", 25, 999), ("급등 (+15~25%)", 15, 25)):
+        with np.errstate(invalid="ignore"):
+            mask = (ch[:-5] >= lo) & (ch[:-5] < hi) & (a[:-5] >= 10e8)
+        ii, jj = np.nonzero(mask)
+        if len(ii) < 20:
+            continue
+        gap = (o[ii + 1, jj] / c[ii, jj] - 1) * 100
+        d1 = (c[ii + 1, jj] / c[ii, jj] - 1) * 100
+        d5 = (c[ii + 5, jj] / c[ii, jj] - 1) * 100
+        ok = np.isfinite(gap) & np.isfinite(d1) & np.isfinite(d5)
+        out[lab] = dict(n=int(ok.sum()), gap=round(float(np.mean(gap[ok])), 2), d1=round(float(np.mean(d1[ok])), 2),
+                        up1=round(float(np.mean(d1[ok] > 0)) * 100), d5=round(float(np.mean(d5[ok])), 2), up5=round(float(np.mean(d5[ok] > 0)) * 100))
+    return out
+
+
 # ───────────────────────────── 뉴스 ─────────────────────────────
 def _rss(url, days=31):
     import html as _h
@@ -2158,6 +2277,73 @@ def build(demo=False, mode="file"):
             picks_of.setdefault(t, f"{STRATS[k]} {rank}위")
         tabs.append(dict(k=k, name=STRATS[k], stocks=stocks, loss=loss))
 
+    # ── 유튜브 언급 종목 · 어제의 급등주를 우리 방식으로 분석 ──
+    def light_entry(t, k=None):
+        if k is None:
+            sc_ = {kk: float(ev["scores"].loc[t, f"s{kk}"]) + sum(float(d[t]) for _, d, _ in ev["aux"][kk]) for kk in (1, 2, 3)}
+            k = max(sc_, key=sc_.get)
+        tg = target_for(k, t, ev, vp.get(t, (None, None))[0])
+        aux = [dict(label=lb, v=safe(fn, t), d=int(d[t])) for lb, d, fn in ev["aux"][k]]
+        aux.append(dict(label="손익비", v=f"1 : {tg['rr']:.1f}" if np.isfinite(tg["rr"]) else "-", d=rr_delta(tg["rr"])))
+        base = float(ev["scores"].loc[t, f"s{k}"])
+        adj = sum(a_["d"] for a_ in aux)
+        e = dict(rank=0, code=t, name=names[t], market=market.get(t, ""), strat=k, close=num(c[t]), chg=num(m["chg"][t], 2),
+                 amount=num(m["a"][t]), mcap=num(mcap.get(t)), vr=num(m["vr"][t], 2), rsi=num(m["rsi"][t], 1), pb=num(m["pb"][t], 2),
+                 base=num(base), adj=int(adj), score=num(max(0.0, min(100.0, base + adj))),
+                 checks=[dict(label=lb, s=num(s_[t], 2), v=safe(fn, t)) for lb, _, s_, fn in ev["checks"][k]], aux=aux,
+                 tg=dict(t1=num(tg["t1"]), t2=num(tg["t2"]), stop=num(tg["stop"]), rr=num(tg["rr"], 2), t1p=num(tg["t1p"], 1),
+                         t2p=num(tg["t2p"], 1), sp=num(tg["sp"], 1), note=tg["note"], stop_label=tg["stop_label"]),
+                 series=series(t, tg), read=chart_read(t, ev))
+        e["prompt"] = ai_prompt(e, asof)
+        return e
+
+    yt = None
+    try:
+        vids = demo_videos(names) if demo else fetch_youtube()
+        name2code = {str(v_): k_ for k_, v_ in names.items() if k_.endswith("0") and k_ in P["c"].columns}
+        ystocks, vlist, perf_rows = {}, [], []
+        for v_ in vids:
+            codes_ = [t for t in find_mentions(v_["title"] + "\n" + v_["desc"], name2code) if c.get(t, np.nan) == c.get(t, np.nan)]
+            ments = []
+            for t in codes_:
+                if t not in ystocks:
+                    ystocks[t] = light_entry(t)
+                pf = perf_since(P, t, v_["pub"], market)
+                ments.append(dict(code=t, perf=pf))
+                if pf:
+                    perf_rows.append(pf)
+            vlist.append(dict(vid=v_["vid"], title=v_["title"], date=v_["pub"].strftime("%m/%d %H:%M"), views=v_["views"],
+                              desc=v_["desc"][:300], ments=ments))
+        summ = None
+        if perf_rows:
+            summ = dict(n=len(perf_rows), now_ex=round(float(np.mean([x["now_ex"] for x in perf_rows])), 2),
+                        win=round(float(np.mean([x["now"] > 0 for x in perf_rows])) * 100),
+                        n5=sum(1 for x in perf_rows if "ex5" in x),
+                        ex5=(round(float(np.mean([x["ex5"] for x in perf_rows if "ex5" in x])), 2) if any("ex5" in x for x in perf_rows) else None))
+        yt = dict(channel=YT_CHANNEL, videos=vlist, stocks=ystocks, summ=summ)
+        stat("유튜브 채널 (RSS)", bool(vlist), f"영상 {len(vlist)}개 · 언급 종목 {len(ystocks)}개")
+    except Exception as ex:
+        print(f"  유튜브 읽기 실패: {ex}", flush=True)
+        stat("유튜브 채널 (RSS)", False, str(ex)[:80])
+
+    gainers = None
+    try:
+        lastchg = m["chg"]
+        gl = [t for t in lastchg[(lastchg >= 15) & (m["a"] >= 10e8)].sort_values(ascending=False).index if t.endswith("0")][:5]
+        if demo and not gl:
+            gl = list(lastchg.dropna().sort_values(ascending=False).index[:3])
+        gstats = gainer_stats(P, I)
+        gitems = []
+        for t in gl:
+            e = light_entry(t)
+            e["news"] = [] if demo else gnews(f'"{names[t]}"', "ko", 2, 3, must=[names[t]])
+            if demo:
+                e["news"] = [dict(t=f"{names[t]} 예시 기사 제목", u="https://example.com", s="예시", d="10/16 14:00", en=0)]
+            gitems.append(e)
+        gainers = dict(items=gitems, stats=gstats)
+    except Exception as ex:
+        print(f"  급등주 분석 실패: {ex}", flush=True)
+
     uniq = list({e["code"]: e for tab in tabs for e in tab["stocks"]}.values())
     news = collect_news(uniq, demo)
     ai_mode = "button" if demo else run_ai(tabs, asof)
@@ -2218,7 +2404,7 @@ def build(demo=False, mode="file"):
         default_tab=(3 if above20 < 45 or risk["score"] >= 50 else 1),
         risk=risk, outlook=outlook, macro=macro,
         bt=bt, status=STATUS, review=rv, tips=tips, brief=brief, gen_iso=datetime.now().strftime("%Y-%m-%dT%H:%M"),
-        tabs=tabs, all=allstk, news=news,
+        tabs=tabs, all=allstk, news=news, yt=yt, gainers=gainers,
         names={t: str(n) for t, n in getattr(namefn, "__self__", {}).items()},
         worker=os.environ.get("AI_WORKER_URL", "").strip(),
     )
@@ -2226,7 +2412,7 @@ def build(demo=False, mode="file"):
 
 def write_html(data, path):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=lambda o: o.item() if hasattr(o, "item") else str(o)).replace("</", "<\\/")
     html = TEMPLATE.replace("__DATA__", payload)
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -2833,6 +3019,35 @@ footer{margin:28px 0 0;padding-top:14px;border-top:1px solid var(--line);color:v
   .revkpi,.olk-idx .op{grid-template-columns:1fr 1fr}
 }
 @media(min-width:900px){.wrap{padding-bottom:40px}}
+
+/* 읽기 쉬운 결론 */
+.story{margin:12px 0;padding:12px 14px;border-radius:14px;background:var(--surface);border:1px solid var(--line)}
+.shead{margin:0 0 8px;font-weight:800;font-size:15px;line-height:1.45}
+.sblk{margin-top:8px}.sblk>b{display:block;font-size:12.5px;color:var(--muted);margin-bottom:3px}
+.sblk ul{margin:0;padding-left:18px;font-size:13.5px;display:grid;gap:2px}.sblk p{margin:0;font-size:13.5px}
+.sblk.warn>b{color:var(--bad)}
+.story .src{margin:10px 0 0;font-size:11.5px;color:var(--faint)}
+/* 유튜브 */
+.ytrow{display:grid;grid-template-columns:120px 1fr;gap:10px;align-items:center;width:100%;text-align:left;font:inherit;color:var(--ink);background:none;border:0;padding:0;cursor:pointer}
+.ytrow img{width:120px;aspect-ratio:16/9;object-fit:cover;border-radius:10px;background:var(--sunk)}
+.ytrow b{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:14px;line-height:1.35}
+.ytrow small{display:block;margin-top:2px;font-size:12px}
+.ychips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.ych{display:inline-flex;gap:6px;align-items:baseline;font:inherit;font-size:12.5px;padding:4px 10px;border-radius:999px;border:1px solid var(--line);background:var(--sunk);color:var(--ink);cursor:pointer}
+.ych small{font-size:11px;font-weight:800}.ych.ok small{color:var(--ok)}.ych.mid small{color:var(--mid)}.ych.bad small{color:var(--bad)}
+.ylist{display:grid;gap:10px;margin-top:12px}
+.ysum{display:flex;gap:24px;flex-wrap:wrap}.ysum>div{display:grid}.ysum small{color:var(--muted);font-weight:700;font-size:12px}.ysum b{font-size:24px}
+.yframe{position:relative;width:100%;aspect-ratio:16/9;border-radius:14px;overflow:hidden;background:#000}
+.yframe iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+.ytv h3{margin:12px 0 2px;font-size:17px}
+.ytab{text-decoration:none;color:var(--muted)}
+/* 급등주 */
+.gstat{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:8px;margin-bottom:12px}
+.gstat>div{display:grid;padding:10px 12px;border-radius:12px;background:var(--sunk)}.gstat small{color:var(--muted);font-weight:700;font-size:12px}.gstat b{font-size:20px}
+.gcard{display:grid;grid-template-columns:44px 1fr;gap:10px;padding:14px 0;border-top:1px solid var(--line)}
+.gno{font-size:28px;font-weight:900;color:var(--line);line-height:1}
+.gcard h4{margin:0;font-size:17px}.gcard .price{font-size:20px;margin:2px 0 6px}
+.glink{display:grid;gap:2px;text-decoration:none;color:var(--ink);font-weight:800}
 </style>
 </head>
 <body>
@@ -2878,12 +3093,16 @@ footer{margin:28px 0 0;padding-top:14px;border-top:1px solid var(--line);color:v
     <details class="fold"><summary>🔮 5일 전망 · 섹터 <button class="q" data-help="outlook" aria-label="설명 보기">?</button></summary><section id="outlook"></section></details>
     <details class="fold"><summary>🗓 다가오는 일정 <button class="q" data-help="events" aria-label="설명 보기">?</button></summary><section id="events"></section></details>
     <details class="fold"><summary>🌎 글로벌 지표 <button class="q" data-help="macro" aria-label="설명 보기">?</button></summary><section id="macro"></section></details>
+    <details class="fold"><summary>🚀 어제의 급등주 해부 <button class="q" data-help="gainers" aria-label="설명 보기">?</button></summary><section id="gainers"></section></details>
     <details class="fold"><summary>📰 오늘의 뉴스 <button class="q" data-help="brief" aria-label="설명 보기">?</button></summary><section id="brief"></section></details>
   </section>
+
+  <section class="view" id="v-yt" hidden></section>
 
   <section class="view" id="v-more" hidden>
     <section class="scoreboard" id="score"></section>
     <section class="revlink" id="revlink"></section>
+    <a class="morelink" href="#yt">📺 한균수의 주식사용설명서 · 언급 종목 분석 →</a>
     <a class="morelink" href="#guide">📖 상세 설명 · 계산 방법 보기 →</a>
   </section>
 
@@ -3214,6 +3433,15 @@ const HELP={
       <li><b>실적 발표</b>: 구글 뉴스의 최근 하루 실적 기사${D.brief&&D.brief.dart?' + DART의 잠정실적 공시(최근 1일)와 기업설명회(IR) 개최 공시(최근 10일)':'. DART API 키(무료)를 등록하면 잠정실적·IR 공시 목록도 함께 나옵니다'}</li>
       <li><b>국내·해외 증시 뉴스</b>: 구글 뉴스 최근 하루 기사 제목</li><li><b>섹터</b>: 최근 5일 ±3% 넘게 움직였거나 3일 안에 일정이 있는 섹터의 기사</li></ul>
       <p>뉴스는 제목만 모은 것이며 AI 판단이 아닙니다.</p>`],
+  yt:['유튜브 언급 종목 분석',()=>`<p>${esc((D.yt||{channel:{}}).channel.name||'')} 채널의 최근 영상 15개를 매일 아침 유튜브 공개 RSS로 받아, <b>영상 제목과 설명란</b>에 나온 종목명을 찾아 우리 방식으로 분석합니다.</p>
+      <ul><li><b>우리 판정</b>: 차트 추세(20·60일선), 과열(RSI 70 이상·볼린저 상단 돌파), 세력 이탈 패턴으로 '우리 방식도 긍정적 / 관망 / 추격 주의 / 주의'를 붙입니다. 종목을 누르면 세 전략 중 가장 잘 맞는 전략의 점수·목표가·손절가·차트가 열립니다.</li>
+      <li><b>영상 이후 수익</b>: 영상 공개 후 첫 장 시가에 샀다고 가정하고 지금까지(비용 ${D.cfg&&D.bt?D.bt.cost:0.25}% 차감) 계산합니다. 시장 대비는 같은 시장 종목 중간값과 비교합니다.</li>
+      <li><b>한계</b>: 영상 안에서 말로만 언급한 종목은 찾지 못합니다(자막을 읽지 않음). 그런 종목은 '내 종목' 탭에서 직접 점검하세요. 짧은 이름(예: 두 글자)은 다른 단어와 헷갈릴 수 있어 일부는 제외합니다.</li></ul>
+      <p>이 기능은 채널의 의견을 평가하려는 것이 아니라, 같은 종목을 우리 기준으로 한 번 더 확인하는 참고용입니다.</p>`],
+  gainers:['어제의 급등주 해부',()=>`<p>전 거래일 <b>+15% 이상</b> 오르고 거래대금 10억 원 이상인 종목을 최대 5개 보여줍니다.</p>
+      <ul><li><b>확인된 재료</b>: 최근 이틀 구글 뉴스 중 종목명이 제목에 들어간 기사. 없으면 테마성 상승일 수 있다고 표시합니다.</li>
+      <li><b>차트 판정</b>: 추세·과열·패턴으로 붙인 우리 의견.</li>
+      <li><b>과거 2년 통계</b>: 같은 크기로 급등한 종목들이 <b>다음 날</b> 시가·종가 기준으로 평균 얼마였고 몇 %가 올랐는지, 5일 뒤는 어땠는지(거래대금 10억 이상만). 급등 다음 날 추격 매수가 평균적으로 유리한지 판단하는 근거입니다.</li></ul>`],
   events:['다가오는 일정',()=>`<p>앞으로 45일 안의 일정을 보여줍니다. D-5 이내는 회색 배경으로 강조합니다.</p>
       <h5>일정 출처</h5><ul>
       <li><b>검색해서 넣은 일정</b>: 바이오 학회(JP모건 헬스케어·AACR·ASCO·ESMO·ASH), IT·반도체 행사(CES·엔비디아 GTC·컴퓨텍스·삼성 언팩·애플 발표), 미국 FOMC, 한국은행 금통위. '예상 날짜'는 주최 측 공식 발표 전 관례 날짜입니다.</li>
@@ -3230,6 +3458,77 @@ document.getElementById('helpClose').onclick=()=>helpDlg.close();
 document.getElementById('helpMore').onclick=()=>helpDlg.close();
 helpDlg.addEventListener('click',e=>{if(e.target===helpDlg)helpDlg.close();});
 
+
+/* ───── 읽기 쉬운 결론 (확인된 근거 · 해석 · 확인할 것) ───── */
+function storyHTML(x){
+  const ok=x.checks.filter(k=>k.s>=.99),miss=x.checks.filter(k=>k.s<.99),plus=x.aux.filter(a=>a.d>0),minus=x.aux.filter(a=>a.d<0);
+  const rr=x.tg.rr,R=D.risk;
+  const head=ok.length>=4&&rr!=null&&rr>=1.5?`${STRAT[x.strat].n} 조건이 잘 맞고, 목표까지 여지가 손실 폭보다 큽니다`:
+    ok.length>=4?`${STRAT[x.strat].n} 조건은 맞지만, 손익비는 ${rr==null?'-':'1:'+rr.toFixed(1)}로 크지 않습니다`:
+    `${STRAT[x.strat].n} 조건 ${ok.length}/${x.checks.length}개만 충족 · 나머지 조건 확인이 필요합니다`;
+  const facts=[...ok.map(k=>`${k.label} <span class="vl">${esc(k.v)}</span>`),...plus.map(a=>`${a.label} <span class="vl">${esc(a.v)}</span>`)].slice(0,6);
+  const reading=[`${STRAT[x.strat].d}.`,`1차 목표 ${f0(x.tg.t1)}원(${pctS(x.tg.t1p)})까지 오를 여지, 손절 ${f0(x.tg.stop)}원(${pctS(x.tg.sp)})이면 ${rr==null?'':'손익비 1:'+rr.toFixed(1)}.`];
+  if(x.read)reading.push(`차트 판정: ${x.read.trend}${x.read.hot?' · 단기 과열':''}.`);
+  const check=[...miss.map(k=>`${k.label} <span class="vl">${esc(k.v)}</span>`),...minus.map(a=>`${a.label} <span class="vl">${esc(a.v)}</span>`)];
+  if(x.tg.note)check.push(esc(x.tg.note));
+  if(R&&R.score>=50)check.push(`시장 위험 '${R.level}' 단계 · 매수 금액 줄이기`);
+  check.push('관리종목·투자경고 여부와 최근 공시');
+  return `<div class="story"><p class="shead">${head}</p>
+    <div class="sblk"><b>확인된 근거</b><ul>${facts.length?facts.map(f=>`<li>${f}</li>`).join(''):'<li class="vl">뚜렷한 근거 없음</li>'}</ul></div>
+    <div class="sblk"><b>해석</b><p>${reading.join(' ')}</p></div>
+    <div class="sblk warn"><b>확인할 것</b><ul>${check.slice(0,6).map(f=>`<li>${f}</li>`).join('')}</ul></div>
+    <p class="src tn">기준: ${D.asof} 정규장 종가 · 데이터 네이버 금융 · ${esc(D.generated)} 계산</p></div>`;
+}
+
+/* ───── 유튜브 ───── */
+const YT=D.yt||null;
+const ytStock=code=>YT&&YT.stocks[code];
+function mentChips(v){return v.ments.length?v.ments.map(mn=>{const s=ytStock(mn.code);if(!s)return '';const pf=mn.perf;
+  return `<button class="ych ${s.read.tone}" data-yts="${mn.code}"><b>${esc(s.name)}</b>${pf?`<span class="tn ${pf.now>=0?'upc':'downc'}">${pctS(pf.now,1)}</span>`:''}<small>${esc(s.read.op)}</small></button>`;}).join(''):'<span class="vl">제목·설명에서 찾은 종목 없음</span>';}
+function openVideo(i){
+  const v=YT.videos[i];
+  const prompt=`한균수의 주식사용설명서 유튜브 영상 "${v.title}" (${v.date}, https://youtu.be/${v.vid})에서 언급된 종목: ${v.ments.map(m=>(ytStock(m.code)||{}).name).filter(Boolean).join(', ')||'없음'}.\n`+
+    v.ments.map(m=>{const s=ytStock(m.code);return s?`- ${s.name}: 우리 차트 판정 ${s.read.op}(${s.read.trend}, RSI ${s.read.rsi}), ${STRAT[s.strat].n} ${s.score}점, 목표 ${f0(s.tg.t1)}원·손절 ${f0(s.tg.stop)}원`+(m.perf?`, 영상 이후 ${pctS(m.perf.now,1)}`:''):'';}).join('\n')+
+    `\n\n이 종목들의 최근 한 달 국내·해외 뉴스와 공시를 검색해서, 영상이 다룬 투자 포인트가 여전히 유효한지 우리 차트 판정과 비교해줘. 종목별로 매수/관망/주의 의견, 근거 3가지, 리스크, 기사 링크를 알려줘.`;
+  openSheet(`<div class="ytv"><div class="yframe"><iframe src="https://www.youtube-nocookie.com/embed/${esc(v.vid)}" title="${esc(v.title)}" allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture" allowfullscreen loading="lazy"></iframe></div>
+    <h3>${esc(v.title)}</h3><p class="vl tn" style="text-align:left">${v.date} · 조회 ${f0(v.views)}회 · <a href="https://youtu.be/${esc(v.vid)}" target="_blank" rel="noopener">유튜브에서 보기</a></p>
+    <div class="lbl">언급 종목 · 우리 방식 판정</div><div class="ychips">${mentChips(v)}</div>
+    <div class="aibox aibtn" style="margin-top:12px"><p><b style="color:var(--ink)">🤖 영상 종목 AI 점검</b><br>영상 제목과 우리 분석이 입력된 채로 Claude가 열립니다. Enter만 누르세요.</p><a class="btn ai" href="${claudeURL(prompt,null)}" target="_blank" rel="noopener">🤖 Claude에서 점검</a></div></div>`);
+}
+function openYtStock(code){const x=ytStock(code)||(D.gainers&&D.gainers.items.find(g=>g.code===code));if(!x)return;
+  openSheet(pickCard(x),()=>{const b=sheet.querySelector('.chartbox');if(b&&x.series)drawChart(b,x.series);});}
+function ytCardHTML(){
+  if(!YT||!YT.videos.length)return '';
+  const v=YT.videos[0];
+  return `<div class="card yt"><div class="ch"><h3>📺 ${esc(YT.channel.name)}</h3><a class="more" href="#yt">전체 →</a></div>
+    <button class="ytrow" data-vid="0"><img src="https://i.ytimg.com/vi/${esc(v.vid)}/mqdefault.jpg" alt="" loading="lazy"><span><b>${esc(v.title)}</b><small class="vl">${v.date}</small></span></button>
+    <div class="ychips">${mentChips(v)}</div></div>`;
+}
+function renderYt(){
+  const box=document.getElementById('v-yt');
+  if(!YT){box.innerHTML='<div class="empty">오늘은 유튜브 영상을 받지 못했습니다.</div>';return;}
+  const S=YT.summ;
+  box.innerHTML=`<div class="vh"><h2>📺 ${esc(YT.channel.name)} <button class="q" data-help="yt" aria-label="설명 보기">?</button></h2><a class="more" href="${esc(YT.channel.url)}" target="_blank" rel="noopener">채널 열기 ↗</a></div>
+    ${S?`<div class="card ysum tn"><div><small>언급 종목 성적 (영상 다음 장 시가 매수 가정)</small><b class="${S.now_ex>=0?'pos':'neg'}">${pctS(S.now_ex,2)}</b><span class="vl">시장 대비 · ${S.n}건 · 오른 비율 ${S.win}%</span></div>
+      ${S.ex5!=null?`<div><small>5거래일 뒤</small><b class="${S.ex5>=0?'pos':'neg'}">${pctS(S.ex5,2)}</b><span class="vl">시장 대비 · ${S.n5}건</span></div>`:''}</div>`:''}
+    <div class="ylist">${YT.videos.map((v,i)=>`<div class="card yv"><button class="ytrow" data-vid="${i}"><img src="https://i.ytimg.com/vi/${esc(v.vid)}/mqdefault.jpg" alt="" loading="lazy"><span><b>${esc(v.title)}</b><small class="vl">${v.date} · 조회 ${f0(v.views)}</small></span></button><div class="ychips">${mentChips(v)}</div></div>`).join('')}</div>`;
+}
+
+/* ───── 어제의 급등주 해부 ───── */
+function renderGainers(){
+  const G=D.gainers,box=document.getElementById('gainers');
+  if(!G||!G.items.length){box.innerHTML='<div class="empty">어제는 +15% 넘게 오른 종목이 없습니다.</div>';return;}
+  const st=Object.entries(G.stats||{});
+  box.innerHTML=(st.length?`<div class="gstat">${st.map(([k,v])=>`<div><small>과거 2년 ${esc(k)} 다음 날</small><b class="tn ${v.d1>=0?'upc':'downc'}">${pctS(v.d1,2)}</b><span class="vl tn">시가 ${pctS(v.gap,2)} · 오른 비율 ${v.up1}% · 5일 뒤 ${pctS(v.d5,1)} · ${f0(v.n)}건</span></div>`).join('')}</div>`:'')+
+  G.items.map((x,i)=>`<article class="gcard">
+      <div class="gno tn">${String(i+1).padStart(2,'0')}</div>
+      <div class="gbody"><h4>${esc(x.name)} <span class="code tn">${x.code}</span></h4>
+        <div class="price tn">${f0(x.close)}<span>${pct(x.chg)}</span><small class="vl"> 거래대금 ${won(x.amount)}</small></div>
+        <p class="shead">${x.read.trend}${x.read.hot?' · 단기 과열':''} → <span class="chip ${x.read.tone}">${esc(x.read.op)}</span></p>
+        <div class="sblk"><b>확인된 재료 (뉴스 제목)</b>${x.news&&x.news.length?`<ul>${x.news.map(n=>`<li><a href="${esc(n.u)}" target="_blank" rel="noopener">${esc(n.t)}</a> <span class="vl">${esc(n.s||'')} ${esc(n.d||'')}</span></li>`).join('')}</ul>`:'<p class="vl" style="text-align:left">최근 이틀 뉴스에서 재료를 찾지 못했습니다 → 테마성 상승일 수 있음</p>'}</div>
+        <div class="sblk warn"><b>확인할 것</b><ul><li>공시로 확인된 계약·실적인지, 기대감인지</li><li>관리종목·투자경고·거래정지 여부</li><li>다음 날 시가 갭과 거래대금 유지 여부</li></ul></div>
+        <button class="btn ghost sm" data-yts="${x.code}">차트·조건 자세히</button></div></article>`).join('');
+}
 /* ───── 시장 · 탭 ───── */
 const RLV={'안정':['ok','신규 매수 가능. 평소대로 전략을 쓰세요.'],
   '주의':['mid','경고 신호가 하나둘 켜졌습니다. 신규 매수 금액을 평소보다 줄이고, 손절가를 꼭 지키세요.'],
@@ -3464,8 +3763,8 @@ function renderPulse(){
 }
 let current=D.default_tab;
 function renderTabs(){
-  document.getElementById('tabs').innerHTML=D.tabs.map(t=>`<button class="tab" role="tab" style="--tc:var(${STRAT[t.k].v})" aria-selected="${t.k===current}" data-k="${t.k}">${t.name}${t.k===D.default_tab?'<span class="rec">오늘 추천</span>':''}</button>`).join('');
-  document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{current=+b.dataset.k;renderTabs();renderPanel();});
+  document.getElementById('tabs').innerHTML=D.tabs.map(t=>`<button class="tab" role="tab" style="--tc:var(${STRAT[t.k].v})" aria-selected="${t.k===current}" data-k="${t.k}">${t.name}${t.k===D.default_tab?'<span class="rec">오늘 추천</span>':''}</button>`).join('')+(D.yt&&D.yt.videos.length?`<a class="tab ytab" href="#yt">📺 유튜브</a>`:'');
+  document.querySelectorAll('.tab[data-k]').forEach(b=>b.onclick=()=>{current=+b.dataset.k;renderTabs();renderPanel();});
 }
 
 function scoreHTML(x){
@@ -3485,12 +3784,13 @@ function aiHTML(x){
 function pickCard(x){
   return `<article class="pick">
       <div class="info">
-        <span class="tag ${STRAT[x.strat].c}">${STRAT[x.strat].n} ${x.rank}위</span>
+        <span class="tag ${STRAT[x.strat].c}">${STRAT[x.strat].n}${x.rank?' '+x.rank+'위':''}</span>
         <div class="name">${esc(x.name)} <span class="code tn">${x.code} ${x.market}</span></div>
         <div class="price tn">${f0(x.close)}<span>${pct(x.chg)}</span></div>
+        ${storyHTML(x)}
         ${scoreHTML(x)}
         ${tgHTML(x)}
-        <details class="mini-fold"><summary>기본 조건 · 보조 지표 보기</summary>
+        <details class="mini-fold"><summary>점수 계산 자세히 (기본 조건 · 보조 지표)</summary>
           <div class="lbl">기본 조건 <button class="q" data-help="rules${x.strat}" aria-label="설명 보기">?</button></div>${checksHTML(x.checks)}
           <div class="lbl">보조 지표 가감점 <button class="q" data-help="aux" aria-label="설명 보기">?</button></div>${auxHTML(x.aux)}
           <dl class="kv tn"><div><dt>거래대금</dt><dd>${won(x.amount)}</dd></div><div><dt>시가총액</dt><dd>${won(x.mcap)}</dd></div><div><dt>거래량</dt><dd>${x.vr==null?'-':x.vr.toFixed(1)+'배'}</dd></div></dl>
@@ -3719,6 +4019,8 @@ function renderHome(){
         <div class="ch"><h3>이번 주 일정</h3><a class="more" href="#market">전체 →</a></div>
         ${evs.length?`<ul class="evl">${evs.map(e=>`<li><span class="dd tn">${e.dday===0?'오늘':'D-'+e.dday}</span><b>${esc(e.name)}</b><span class="vl">${esc(e.secs[0]||'')}</span></li>`).join('')}</ul>`:'<p class="vl" style="text-align:left;margin:0">이번 주 큰 일정이 없습니다.</p>'}
       </div>
+      ${ytCardHTML()}
+      ${D.gainers&&D.gainers.items.length?`<a class="card glink" href="#market"><span>🚀 어제 급등주 ${D.gainers.items.length}종목 해부</span><span class="vl">${D.gainers.items.slice(0,3).map(g=>esc(g.name)+' '+pctS(g.chg,1)).join(' · ')}</span></a>`:''}
       ${secs.length?`<div class="card wide">
         <div class="ch"><h3>섹터 지도 <small class="vl">최근 5일</small></h3><a class="more" href="#market">5일 전망 →</a></div>
         <div class="heat">${secs.slice().sort((a,b)=>(b.r5||0)-(a.r5||0)).map(x=>`<div class="ht2" style="background:${heat(x)}"><b>${esc(x.name)}</b><span class="tn">${pctS(x.r5,1)}</span></div>`).join('')}</div>
@@ -3727,20 +4029,23 @@ function renderHome(){
 }
 function route(){
   let h=location.hash||'#home';if(h==='#my')h='#mine';
-  const views={'#home':'v-home','#picks':'v-picks','#mine':'v-mine','#market':'v-market','#more':'v-more','#review':'reviewview'};
+  const views={'#home':'v-home','#picks':'v-picks','#mine':'v-mine','#market':'v-market','#more':'v-more','#review':'reviewview','#yt':'v-yt'};
   const id=h.startsWith('#guide')?'guideview':(views[h]||'v-home');
   document.querySelectorAll('.view').forEach(v=>v.hidden=v.id!==id);
-  const tabKey=id==='guideview'||id==='reviewview'?'more':id.replace('v-','');
+  const tabKey=id==='guideview'||id==='reviewview'?'more':id==='v-yt'?'picks':id.replace('v-','');
   document.querySelectorAll('#tabbar a').forEach(a=>a.classList.toggle('on',a.dataset.v===tabKey));
   if(sheet.open)sheet.close();
   if(id==='v-home')renderHome();
   else if(id==='v-mine')renderMine();
+  else if(id==='v-yt')renderYt();
   else if(id==='reviewview')renderReview();
   else if(id==='guideview'){renderGuide();const t=h.length>6&&document.getElementById(h.slice(1));if(t){t.scrollIntoView();return;}}
   scrollTo(0,0);
 }
 addEventListener('hashchange',route);
 document.addEventListener('click',e=>{
+  const yv=e.target.closest('[data-vid]');if(yv){openVideo(+yv.dataset.vid);return;}
+  const ys=e.target.closest('[data-yts]');if(ys){openYtStock(ys.dataset.yts);return;}
   const pk=e.target.closest('[data-pick]');if(pk){const [k,i]=pk.dataset.pick.split(':').map(Number);openPick(k,i);return;}
   const hd=e.target.closest('[data-hold]');if(hd){const h=loadH().find(x=>x.code===hd.dataset.hold);if(h)openHold(h);return;}
   const rm=e.target.closest('[data-rm]');
@@ -3769,7 +4074,7 @@ document.getElementById('meta').textContent=`${D.asof} 종가 · ${D.generated.s
 document.getElementById('demo').hidden=!D.demo;
 document.getElementById('refresh').onclick=()=>location.reload();
 renderBrief();renderScore();renderRevLink();checkFresh();setInterval(checkFresh,10*60*1000);renderRisk();renderMacro();renderOutlook();renderEvents();
-renderTabs();renderPanel();initHolds();route();
+renderGainers();renderTabs();renderPanel();initHolds();route();
 let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(drawAll,150);});
 </script>
 </body>
