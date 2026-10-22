@@ -2,7 +2,10 @@ name: 매일 종목 발굴
 
 on:
   schedule:
-    # 한국시간 평일(월~금) 오전 6:20 · 7:05 · 7:30 세 번 갱신 (GitHub 지연 대비)
+    # GitHub 예약 실행은 아침에 2~3시간씩 밀리는 일이 많아서 새벽에 미리 출발하고, 6시 15분까지 기다렸다가 계산합니다.
+    # 한국시간 평일(월~금): 03:30 · 04:30 (미리 출발) / 06:20 · 07:05 · 07:30 (예비)
+    - cron: "30 18 * * 0-4"
+    - cron: "30 19 * * 0-4"
     - cron: "20 21 * * 0-4"
     - cron: "5 22 * * 0-4"
     - cron: "30 22 * * 0-4"
@@ -23,13 +26,20 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 240           # 새벽에 일찍 출발해 기다리는 시간 포함
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install pandas numpy scikit-learn cryptography
+      - name: 미국장 마감 반영 대기 (일찍 출발한 경우 6시 15분까지)
+        if: github.event_name == 'schedule'
+        run: |
+          now=$(date +%s); target=$(date -d "today 06:15" +%s)
+          if [ "$(date +%H)" -lt 6 ] || { [ "$(date +%H)" -eq 6 ] && [ "$(date +%M)" -lt 15 ]; }; then
+            echo "지금 $(date +%H:%M) → 미국장 마감 자료를 기다려 $(( (target-now)/60 ))분 뒤 시작"; sleep $((target-now))
+          fi
       - name: 대시보드 생성
         env:
           SITE_PASSWORD: ${{ secrets.SITE_PASSWORD }}           # (선택) 등록하면 비밀번호를 아는 사람만 볼 수 있음
