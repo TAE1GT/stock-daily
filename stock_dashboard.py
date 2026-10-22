@@ -884,7 +884,7 @@ def fetch_index_naver(sym, count):
         return None
     df = pd.DataFrame(recs, columns=["d", "o", "h", "l", "c", "v"])
     df.index = pd.to_datetime(df.pop("d"), format="%Y%m%d")
-    return df.astype(float)[["c", "v"]]
+    return df.astype(float)[["o", "c", "v"]]
 
 
 def fetch_yahoo(sym):
@@ -1055,6 +1055,114 @@ def market_risk(P, I, uni, demo):
                 vperiod=f"{dates[65]:%Y-%m-%d}~{dates[n - 6]:%Y-%m-%d}" if n > 71 else "")
 
 
+# ───────────────────────────── 오늘 장 예보 (밤사이 해외시장 → 오늘 코스피·코스닥) ─────────────────────────────
+INDEX_OHLC = {}
+FC_FEATS = [("ewy", "한국 ETF EWY (미국 상장)"), ("spx", "S&P 500"), ("nasdaq", "나스닥"), ("sox", "반도체 지수"),
+            ("vix", "공포지수 VIX"), ("krw", "원·달러 환율"), ("nikkei", "닛케이")]
+
+
+def today_forecast(demo, dates):
+    """오늘 아침까지 확인된 것(어젯밤 미국장·환율·VIX, 어제 코스피)으로 오늘 '시가 갭'과 '종가 방향'을 추정.
+    과거 6년 매일을 같은 방식으로 학습 → 마지막 30% 기간으로 적중률 검증."""
+    ext = load_external(demo, dates)
+    out = {}
+    for name in ("KOSPI", "KOSDAQ"):
+        if demo:
+            rng = np.random.default_rng(21 if name == "KOSPI" else 22)
+            dd = pd.bdate_range(end=dates[-1], periods=1400)
+            c = 2500 * np.exp(np.cumsum(rng.normal(0.0002, 0.01, len(dd))))
+            us = ext.get("spx")
+            gap = 0.5 * np.nan_to_num(us.pct_change().reindex(dd - pd.Timedelta(days=1), method="ffill").to_numpy()) if us is not None else 0
+            o = np.r_[c[0], c[:-1]] * (1 + gap + rng.normal(0, 0.003, len(dd)))
+            df = pd.DataFrame(dict(o=o, c=c), index=dd)
+        else:
+            try:
+                raw = fetch_index_naver(name, 1500)
+                df = raw[["o", "c"]] if raw is not None else None
+            except Exception:
+                df = None
+        if df is None or len(df) < 300:
+            continue
+        INDEX_OHLC[name] = df
+        idx = df.index
+        prev_day = idx - pd.Timedelta(days=1)
+        X = pd.DataFrame(index=idx)
+        for k, _ in FC_FEATS:
+            s = ext.get(k)
+            if s is None:
+                continue
+            s = s.sort_index()
+            ch = (s.diff() if k == "vix" else s.pct_change() * 100)
+            X[k] = ch.reindex(prev_day, method="ffill").to_numpy()          # 이 날 장 시작 전에 끝난 해외 세션의 변화
+        cc = df["c"]
+        X["r1"] = (cc.shift(1) / cc.shift(2) - 1).to_numpy() * 100            # 어제 지수 등락
+        X["d20"] = (cc.shift(1) / cc.shift(1).rolling(20).mean() - 1).to_numpy() * 100
+        gap = (df["o"] / cc.shift(1) - 1) * 100
+        day = (cc / cc.shift(1) - 1) * 100
+        A = X.assign(gap=gap, day=day).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(A) < 300:
+            continue
+        cols = [x for x in X.columns]
+        cut = int(len(A) * 0.7)
+        tr, te = A.iloc[:cut], A.iloc[cut:]
+
+        def lin_fit(D_):
+            Z = np.c_[np.ones(len(D_)), D_[cols].to_numpy(float)]
+            w, *_ = np.linalg.lstsq(Z, D_["gap"].to_numpy(float), rcond=None)
+            return w
+        lin = lambda w, D_: np.c_[np.ones(len(D_)), D_[cols].to_numpy(float)] @ w
+        w_te = lin_fit(tr)
+        g_pred = lin(w_te, te)
+        g_act = te["gap"].to_numpy(float)
+        big = np.abs(g_act) >= 0.2
+        lg = fit_logit(tr[cols].to_numpy(float), (tr["day"] > 0).to_numpy(float))
+        p_te = logit_pred(lg, te[cols].to_numpy(float))
+        y_te = (te["day"] > 0).to_numpy(float)
+        res = dict(gap_hit=round(float(np.mean(np.sign(g_pred[big]) == np.sign(g_act[big])) * 100), 1) if big.any() else None,
+                   gap_mae=round(float(np.mean(np.abs(g_pred - g_act))), 2),
+                   day_hit=round(float(np.mean((p_te > 0.5) == (y_te > 0.5)) * 100), 1),
+                   day_base=round(float(max(y_te.mean(), 1 - y_te.mean()) * 100), 1),
+                   n_test=int(len(te)), since=A.index[0].strftime("%Y-%m"), test_from=te.index[0].strftime("%Y-%m"))
+        conf = (p_te >= 0.6) | (p_te <= 0.4)
+        res["day_hit_conf"] = round(float(np.mean((p_te[conf] > 0.5) == (y_te[conf] > 0.5)) * 100), 1) if conf.sum() >= 30 else None
+        # 오늘 값: 오늘 날짜 기준으로 '어젯밤까지' 해외 변화 + 어제 지수
+        now = datetime.now()
+        dT = pd.Timestamp(now.date())
+        if now.hour >= 16 or dT.weekday() >= 5:                              # 장 마감 후·주말이면 다음 거래일 예보
+            dT = (dT + pd.offsets.BDay(1)).normalize()
+        xt = {}
+        for k, _ in FC_FEATS:
+            s = ext.get(k)
+            if s is None or k not in cols:
+                continue
+            s = s.sort_index()
+            ch = (s.diff() if k == "vix" else s.pct_change() * 100)
+            v = ch[ch.index <= dT - pd.Timedelta(days=1)]
+            xt[k] = float(v.iloc[-1]) if len(v) else np.nan
+            xt[k + "_d"] = v.index[-1].strftime("%m/%d") if len(v) else ""
+        last = cc[cc.index < dT]
+        xt["r1"] = float((last.iloc[-1] / last.iloc[-2] - 1) * 100)
+        xt["d20"] = float((last.iloc[-1] / last.iloc[-20:].mean() - 1) * 100)
+        xv = np.array([[xt.get(k, np.nan) for k in cols]], float)
+        if np.isnan(xv).any():
+            continue
+        w_all = lin_fit(A)
+        lg_all = fit_logit(A[cols].to_numpy(float), (A["day"] > 0).to_numpy(float))
+        g_today = float(np.r_[1, xv[0]] @ w_all)
+        p_today = float(logit_pred(lg_all, xv)[0])
+        res.update(date=dT.strftime("%m/%d"), dow="월화수목금토일"[dT.weekday()], gap=round(g_today, 2), p=round(p_today * 100),
+                   inputs=[dict(k=k, n=nm, v=round(xt[k], 2), d=xt.get(k + "_d", "")) for k, nm in FC_FEATS if k in xt],
+                   last_close=num(last.iloc[-1], 2))
+        out[name] = res
+    if out:
+        k0 = out.get("KOSPI") or next(iter(out.values()))
+        stat("오늘 장 예보 (밤사이 해외시장)", True, " · ".join(f"{n} 시가 {v['gap']:+.2f}% / 상승 마감 {v['p']}%" for n, v in out.items()))
+        print(f"  오늘 예보: " + " · ".join(f"{n} 시가 {v['gap']:+.2f}%, 상승 확률 {v['p']}% (검증 시가 방향 {v['gap_hit']}%, 마감 방향 {v['day_hit']}%)" for n, v in out.items()), flush=True)
+    else:
+        stat("오늘 장 예보 (밤사이 해외시장)", False, "지수 또는 해외 자료 부족")
+    return out or None
+
+
 # ───────────────────────────── 5일 전망 (확률 모델) ─────────────────────────────
 SECTOR_ETF = [("반도체", "091160"), ("2차전지", "305720"), ("자동차", "091180"), ("바이오", "244580"),
               ("헬스케어", "266420"), ("IT", "266370"), ("소프트웨어", "157490"), ("은행", "091170"),
@@ -1082,6 +1190,7 @@ MACRO = {
     "taiwan": ("대만 가권", "^TWII", True, 5.0),
     "btc": ("비트코인 (위험 선호)", "BTC-USD", True, 15.0),
     "irx": ("미국 3개월 금리", "^IRX", False, 10.0),
+    "ewy": ("한국 ETF EWY (미국 상장)", "EWY", True, 4.0),
 }
 
 
@@ -1116,7 +1225,7 @@ def load_external(demo, dates):
         rng = np.random.default_rng(5)
         dd = pd.bdate_range(end=dates[-1], periods=1500)
         base = dict(vix=18, krw=1300, dxy=100, us10y=4, oil=75, gold=2000, copper=4, hyg=77, spx=4500, nasdaq=14000,
-                    sox=4000, nikkei=33000, china=3100, taiwan=17000, btc=40000, irx=4.5)
+                    sox=4000, nikkei=33000, china=3100, taiwan=17000, btc=40000, irx=4.5, ewy=60)
         for k in MACRO:
             vol = 0.03 if k in ("vix", "btc") else 0.012
             ext[k] = pd.Series(base[k] * np.exp(np.cumsum(rng.normal(0.0002, vol, len(dd)))), index=dd)
@@ -1845,12 +1954,13 @@ HIST_DIR = os.path.join(BASE, "history")
 SERIES = {}     # 5일 전망에 쓴 지수·섹터 시세 (점검 때 실제 결과 확인용)
 
 
-def make_snapshot(asof, tabs, outlook, risk, regime=None):
+def make_snapshot(asof, tabs, outlook, risk, regime=None, fc=None):
     picks = [dict(k=tab["k"], rank=e["rank"], code=e["code"], name=e["name"], market=e.get("market", ""), close=e["close"], score=e["score"],
                   t1=e["tg"]["t1"], stop=e["tg"]["stop"], feat=e.get("feat", {})) for tab in tabs for e in tab["stocks"][:6]]
     ol = (outlook or {})
     outs = [dict(name=o["name"], p=o["p"], er=o["er"], band=o["band"]) for o in ol.get("idx", []) + ol.get("sec", [])]
-    return dict(asof=asof, made=datetime.now().strftime("%Y-%m-%d %H:%M"), picks=picks, outlook=outs, regime=regime,
+    fcs = {n: dict(date=v["date"], gap=v["gap"], p=v["p"]) for n, v in (fc or {}).items()}
+    return dict(asof=asof, made=datetime.now().strftime("%Y-%m-%d %H:%M"), picks=picks, outlook=outs, regime=regime, fc=fcs,
                 risk=(dict(score=risk["score"], up=risk["up"], level=risk["level"]) if risk else None))
 
 
@@ -2006,7 +2116,24 @@ def review(hist, P, market=None):
     last = hist[-1]["asof"] if hist else None
     latest = [x for x in recs if x["asof"] == (daylog[-1]["asof"] if daylog else None)]
     latest_ol = [x for x in oev if x["asof"] == (oev[-1]["asof"] if oev else None)]
-    return dict(n_snap=len(hist), first=(hist[0]["asof"] if hist else None), last=last, daylog=daylog[-20:], strat=strat,
+    fcl = []
+    for s in hist:
+        for nm, f in (s.get("fc") or {}).items():
+            df = INDEX_OHLC.get(nm)
+            if df is None:
+                continue
+            j = df.index.searchsorted(pd.Timestamp(s["asof"]), side="right")      # 예보 대상 = 기준일 다음 거래일
+            if j >= len(df) or j < 1:
+                continue
+            ag = (df["o"].iloc[j] / df["c"].iloc[j - 1] - 1) * 100
+            ad = (df["c"].iloc[j] / df["c"].iloc[j - 1] - 1) * 100
+            fcl.append(dict(day=df.index[j].strftime("%m/%d"), name=nm, gap=f["gap"], p=f["p"], ag=round(float(ag), 2), ad=round(float(ad), 2),
+                            gh=bool(np.sign(f["gap"]) == np.sign(ag)), dh=bool((f["p"] >= 50) == (ad > 0))))
+    fcsum = None
+    if fcl:
+        fcsum = dict(n=len(fcl), gh=round(float(np.mean([x["gh"] for x in fcl])) * 100), dh=round(float(np.mean([x["dh"] for x in fcl])) * 100),
+                     recent=fcl[-10:])
+    return dict(n_snap=len(hist), first=(hist[0]["asof"] if hist else None), last=last, daylog=daylog[-20:], strat=strat, fc=fcsum,
                 regime=regime_live, vb=vb_live, cost=CFG["cost"],
                 ol=ol, rk=rk, latest=latest, latest_ol=latest_ol, recent=recs[-60:])
 
@@ -2603,12 +2730,21 @@ def build(demo=False, mode="file"):
     except Exception as ex:
         print(f"  5일 전망 계산 실패: {ex}", flush=True)
         outlook = None
+    try:
+        fc = today_forecast(demo, P["c"].index)
+    except Exception as ex:
+        print(f"  오늘 예보 계산 실패: {ex}", flush=True)
+        fc = None
     macro = macro_panel(load_external(demo, P["c"].index))
     # 예측 기록 저장 + 지난 기록과 실제 결과 비교
     try:
         past = demo_history(P, I, market) if demo else load_history(asof)
-        if not demo:
-            save_snapshot(make_snapshot(asof, tabs, outlook, risk, regime=("강세" if (c[uni] > m["ma20"][uni]).mean() >= 0.5 else "약세")))
+        snap_path = os.path.join(HIST_DIR, f"{asof}.json")
+        late = datetime.now().hour * 60 + datetime.now().minute >= 8 * 60 + 55
+        if not demo and late and os.path.exists(snap_path):
+            print("  장 시작 무렵 이후 실행 → 오늘 아침(장전) 예측 기록은 그대로 둡니다", flush=True)
+        elif not demo:
+            save_snapshot(make_snapshot(asof, tabs, outlook, risk, regime=("강세" if (c[uni] > m["ma20"][uni]).mean() >= 0.5 else "약세"), fc=fc))
         rv = review(past, P, market)
     except Exception as ex:
         print(f"  예측 기록 점검 실패: {ex}", flush=True)
@@ -2634,7 +2770,7 @@ def build(demo=False, mode="file"):
         default_tab=pick_default(bt, regime_now, above20, risk),
         regime_now=regime_now, weak={k_: True for k_ in weak_strats(bt, regime_now)},
         risk=risk, outlook=outlook, macro=macro,
-        bt=bt, status=STATUS, review=rv, tips=tips, brief=brief, gen_iso=datetime.now().strftime("%Y-%m-%dT%H:%M"),
+        bt=bt, fc=fc, status=STATUS, review=rv, tips=tips, brief=brief, gen_iso=datetime.now().strftime("%Y-%m-%dT%H:%M"),
         tabs=tabs, all=allstk, news=news, yt=yt, gainers=gainers,
         names={t: str(n) for t, n in getattr(namefn, "__self__", {}).items()},
         worker=os.environ.get("AI_WORKER_URL", "").strip(),
@@ -3193,8 +3329,9 @@ footer{margin:28px 0 0;padding-top:14px;border-top:1px solid var(--line);color:v
 .wx.ok{border-color:var(--ok)} .wx.mid{border-color:var(--mid)} .wx.bad{border-color:var(--bad)}
 .wxi{font-size:clamp(40px,11vw,60px);line-height:1}
 .wxb{display:grid;gap:2px} .wxb small{color:var(--muted);font-weight:700;font-size:12px}
-.wxb b{font-size:clamp(22px,6vw,30px);font-weight:900;letter-spacing:-.02em} .wxb span{font-size:14px;font-weight:600}
-.wx.ok .wxb b{color:var(--ok)} .wx.mid .wxb b{color:var(--mid)} .wx.bad .wxb b{color:var(--bad)}
+.wxb>b{font-size:clamp(22px,6vw,30px);font-weight:900;letter-spacing:-.02em} .wxb span{font-size:14px;font-weight:600}
+.wx.ok .wxb>b{color:var(--ok)} .wx.mid .wxb>b{color:var(--mid)} .wx.bad .wxb>b{color:var(--bad)}
+.wxf b{font-size:15px}
 .wxs{display:grid;grid-template-columns:auto auto;gap:0 8px;align-items:baseline;font-size:12px;color:var(--muted)} .wxs b{font-size:18px;color:var(--ink);text-align:right}
 @media(max-width:420px){.wx{grid-template-columns:auto 1fr}.wxs{grid-column:1/-1;grid-template-columns:repeat(4,auto);justify-content:start}}
 .strip{display:flex;gap:8px;overflow-x:auto;padding:10px 12px;scrollbar-width:none}
@@ -3364,6 +3501,10 @@ body.locked .wrap{display:none}
 .vgrid{display:flex;gap:24px;margin-top:10px}.vgrid>div{display:grid}.vgrid small{color:var(--muted);font-weight:700;font-size:12px}.vgrid b{font-size:26px;font-weight:900}
 
 .tab .wk{color:var(--bad);font-size:13px}
+
+.wxf{display:block;margin-top:4px;font-size:13px;font-weight:600}
+.wxs{grid-template-columns:1fr!important;text-align:right}.wxs b{font-size:15px!important}
+@media(max-width:420px){.wxs{grid-template-columns:auto auto!important;text-align:left}}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -3763,6 +3904,15 @@ const HELP={
       <li><b>실적 발표</b>: 구글 뉴스의 최근 하루 실적 기사${D.brief&&D.brief.dart?' + DART의 잠정실적 공시(최근 1일)와 기업설명회(IR) 개최 공시(최근 10일)':'. DART API 키(무료)를 등록하면 잠정실적·IR 공시 목록도 함께 나옵니다'}</li>
       <li><b>국내·해외 증시 뉴스</b>: 구글 뉴스 최근 하루 기사 제목</li><li><b>섹터</b>: 최근 5일 ±3% 넘게 움직였거나 3일 안에 일정이 있는 섹터의 기사</li></ul>
       <p>뉴스는 제목만 모은 것이며 AI 판단이 아닙니다.</p>`],
+  weather:['오늘 장 예보 · 날씨',()=>{const F=D.fc||{};const one=(n,v)=>v?`<h5>${n} (${v.date} ${v.dow})</h5>
+      <p>시가 예상 <b>${pctS(v.gap,2)}</b> · 상승 마감 확률 <b>${v.p}%</b> · 어제 종가 ${f0(v.last_close)}</p>
+      ${T(v.inputs.map(x=>[esc(x.n),x.k==='vix'?(x.v>0?'+':'')+x.v.toFixed(2)+'p':pctS(x.v,2),esc(x.d)]),['밤사이 확인된 것','변화','날짜'])}
+      <p>과거 검증 (${esc(v.test_from)}~, ${v.n_test}일): 시가 방향 적중 <b>${v.gap_hit??'-'}%</b>(0.2% 넘게 움직인 날) · 시가 평균 오차 ±${v.gap_mae}%p · 마감 방향 적중 <b>${v.day_hit}%</b> (찍기 ${v.day_base}%)${v.day_hit_conf!=null?` · 확률이 60% 이상·40% 이하로 뚜렷한 날만 ${v.day_hit_conf}%`:''}</p>`:'';
+    return `<p><b>날씨 = 오늘 예보</b>입니다. 장 시작 전에 이미 끝난 <b>어젯밤 미국장</b>(한국 ETF EWY, S&P500, 나스닥, 반도체 지수), 공포지수, 원·달러 환율, 닛케이와 <b>어제 지수</b>를 넣어서, 과거 약 6년간 '이런 밤 다음 날 코스피가 어떻게 열리고 닫혔나'를 학습한 모델로 오늘을 추정합니다.</p>
+      <p>☀️ 맑음: 상승 마감 확률 60% 이상(최근 흐름도 괜찮을 때) · 🌤️ 55% 이상 · ⛅ 45~55% · 🌧️ 40~45% · ⛈️ 40% 미만</p>
+      ${one('코스피',F.KOSPI)}${one('코스닥',F.KOSDAQ)}
+      <p><b>어제까지 흐름</b>(오른쪽 작은 글씨)은 시장 신호등 점수로, 최근 며칠~몇 주의 상태입니다. 예보가 맑아도 흐름이 '비·폭풍'이면 하루 반등일 수 있으니 조금만 사세요.</p>
+      <p>밤사이 미국장은 오늘 <b>시가</b>를 꽤 잘 설명하지만, <b>종가</b>까지 맞히는 건 훨씬 어렵습니다. 위 적중률을 같이 보세요.</p>`;}],
   plan:['매매 포인트 정하는 법',()=>`<p>자동매매 프로그램처럼 <b>얼마에 사고 얼마에 팔지</b>를 미리 정해 둔 규칙입니다. 화면의 숫자와 아래 과거 검증은 <b>같은 계산</b>을 씁니다.</p>
       ${T([['추세 눌림목','20일선 +0.5% (현재가보다 높으면 현재가)','20일선 − 0.5×ATR'],['거래량 돌파','뚫은 자리(60일 고가) +0.5% 또는 현재가 − 0.5×ATR 중 높은 값','60일 고가 − 0.5% 또는 현재가 − 1.2×ATR'],['과매도 반등','볼린저 하단·5일 저점 중 높은 값 + 0.5×ATR','그 값 + 0.1×ATR']],['전략','매수 1차 (절반)','매수 2차 (절반)'])}
       <ul><li><b>익절</b>: 1차 목표에서 절반, 2차 목표에서 나머지. 1차 익절 후에는 남은 절반의 손절가를 <b>평균 매수가</b>로 올립니다(본전 지키기).</li>
@@ -4080,11 +4230,13 @@ function renderReview(){
     const O=rv.ol,olH=O?`<div class="revkpi tn"><div><span class="vl">검증된 예측</span><b>${O.n}건</b></div><div><span class="vl">방향 적중</span><b class="${O.hit>=50?'pos':'neg'}">${O.hit}%</b></div><div><span class="vl">흔들림 범위 안</span><b>${O.inband}%</b><span class="vl">기대 약 68%</span></div>
       <div><span class="vl">'55% 이상'이라 한 때 실제 상승</span><b>${O.up_hi==null?'-':O.up_hi+'%'}</b><span class="vl">${O.n_hi}건</span></div><div><span class="vl">'45% 미만'이라 한 때 실제 상승</span><b>${O.up_lo==null?'-':O.up_lo+'%'}</b><span class="vl">${O.n_lo}건</span></div></div>
       ${(rv.latest_ol||[]).length?`<div class="tablewrap"><table class="revtbl"><thead><tr><th>대상</th><th>예측 (오를 확률)</th><th>예상 흔들림</th><th>실제 5일</th><th>방향</th><th>범위</th></tr></thead><tbody>${rv.latest_ol.map(x=>`<tr class="tn"><td><b>${esc(x.name)}</b></td><td>${x.p}%</td><td>${pctS(x.er,2)} ± ${x.band}%</td><td class="${x.act>=0?'upc':'downc'}">${pctS(x.act,2)}</td><td>${x.hit?'✅ 맞음':'❌ 틀림'}</td><td>${x.inband?'안':'밖'}</td></tr>`).join('')}</tbody></table></div><p class="vl" style="text-align:left">${esc(rv.latest_ol[0].asof)} 아침 예측 → 5거래일 뒤 결과</p>`:''}`:'<p class="vl" style="text-align:left">5거래일이 지난 예측이 아직 없습니다.</p>';
+    const FCv=rv.fc,fcH=FCv?`<p>오늘 장 예보 ${FCv.n}건: 시가 방향 적중 <b>${FCv.gh}%</b> · 마감 방향 적중 <b>${FCv.dh}%</b></p>`+T(FCv.recent.slice().reverse().map(x=>[x.day,x.name,`${pctS(x.gap,2)} / ${x.p}%`,`${pctS(x.ag,2)} / ${pctS(x.ad,2)}`,`${x.gh?'✅':'❌'} / ${x.dh?'✅':'❌'}`]),['날짜','지수','예보 (시가 / 상승 확률)','실제 (시가 / 종가)','맞음 (시가 / 마감)']):'<p class="vl" style="text-align:left">예보 기록이 아직 없습니다.</p>';
     const R=rv.rk,rkH=R?`<p>위험 50점 이상이던 날(${R.n_hi}일) 다음 5일 코스피 ${R.hi==null?'-':pctS(R.hi,2)} · 25점 미만이던 날(${R.n_lo}일) ${R.lo==null?'-':pctS(R.lo,2)}</p>`:'<p class="vl" style="text-align:left">5거래일이 지난 기록이 아직 없습니다.</p>';
     const log=`<div class="tablewrap"><table class="revtbl"><thead><tr><th>예측한 날 (기준일)</th><th>결과 날</th><th>추천 1~3위 평균</th><th>승률</th><th>시장</th></tr></thead><tbody>${rv.daylog.slice().reverse().map(d=>`<tr class="tn"><td>${d.asof}</td><td>${d.day}</td><td class="${(d.avg1||0)>=0?'upc':'downc'}"><b>${d.avg1==null?'-':pctS(d.avg1,2)}</b></td><td>${d.win1==null?'-':d.win1+'%'}</td><td>${pctS(d.b1,2)}</td></tr>`).join('')}</tbody></table></div>`;
     body=`${ld?`<section class="gsec"><h3>어제 예측 vs 실제 <span class="vl">${ld.asof} 아침 추천 → ${ld.day} 결과</span></h3>${latestH}</section>`:''}
       <section class="gsec"><h3>추천 종목 누적 성적 <span class="vl">${rv.first} ~ ${rv.last} · ${rv.n_snap}일치</span></h3>${cum}</section>
       <section class="gsec"><h3>5일 전망 검증</h3>${olH}</section>
+      <section class="gsec"><h3>오늘 장 예보 검증</h3>${fcH}</section>
       <section class="gsec"><h3>시장 신호등 검증</h3>${rkH}</section>
       <section class="gsec"><h3>날짜별 기록</h3>${log}</section>`;
   }
@@ -4380,13 +4532,25 @@ function renderMine(){
     <p class="vl" style="text-align:left;margin-top:6px">종목을 누르면 자세한 점검이 열리고, ✕를 누르면 목록에서 지워집니다.</p>`;
 }
 function rerender(){renderMine();if(location.hash==='#home'||location.hash==='')renderHome();}
-function weather(){const R=D.risk;if(!R)return ['🌫️','정보 없음','신호등 자료를 받지 못했습니다','mid'];const s=R.score,u=R.up;
-  if(s>=75)return ['⛈️','폭풍','신규 매수는 쉬고 현금을 늘리세요','bad'];
-  if(s>=50)return u>=35?['🌦️','비 그칠 조짐','바닥 신호가 보여요 · 아주 조금씩만','mid']:['🌧️','비','신규 매수는 평소의 절반 이하로','bad'];
-  if(s>=25)return ['⛅','구름','조금만 사고 손절가는 꼭 지키기','mid'];
-  return u>=35?['☀️','맑음','매수하기 좋은 날','ok']:['🌤️','대체로 맑음','평소처럼 해도 괜찮아요','ok'];}
+function stateWeather(){const R=D.risk;if(!R)return null;const s=R.score,u=R.up;
+  if(s>=75)return ['⛈️','폭풍','bad'];if(s>=50)return u>=35?['🌦️','비 그칠 조짐','mid']:['🌧️','비','bad'];if(s>=25)return ['⛅','구름','mid'];return u>=35?['☀️','맑음','ok']:['🌤️','대체로 맑음','ok'];}
+/* 오늘 예보 = 밤사이 해외시장으로 본 '오늘' · 상태 = 어제까지 며칠간의 흐름 */
+function weather(){
+  const F=D.fc&&(D.fc.KOSPI||D.fc.KOSDAQ),R=D.risk;
+  if(!F){const w=stateWeather()||['🌫️','정보 없음','mid'];const act={'폭풍':'신규 매수는 쉬고 현금을 늘리세요','비':'신규 매수는 평소의 절반 이하로','비 그칠 조짐':'바닥 신호가 보여요 · 아주 조금씩만','구름':'조금만 사고 손절가는 꼭 지키기','맑음':'매수하기 좋은 날','대체로 맑음':'평소처럼 해도 괜찮아요'}[w[1]]||'';return [w[0],w[1],act,w[2]];}
+  const p=F.p,hi=R&&R.score>=50;
+  const tw=F.gap<=-0.3&&p>=55?' · 약하게 출발한 뒤 반등할 가능성':F.gap>=0.3&&p<=45?' · 강하게 출발해도 밀릴 가능성':'';
+  const W_=weather0(p,hi);W_[2]+=tw;return W_;
+}
+function weather0(p,hi){
+  if(p>=60&&!hi)return ['☀️','맑음','오늘은 오를 가능성이 높아요','ok'];
+  if(p>=55)return ['🌤️','대체로 맑음',hi?'오늘은 반등 가능성 · 다만 최근 흐름이 약해 조금만':'평소처럼 해도 괜찮아요','ok'];
+  if(p>45)return ['⛅','흐림','방향이 뚜렷하지 않아요 · 조금만 사고 손절가 지키기','mid'];
+  if(p>40)return ['🌧️','비','약세가 예상돼요 · 신규 매수는 줄이기','bad'];
+  return ['⛈️','폭풍','하락 가능성이 높아요 · 오늘은 쉬어가기','bad'];
+}
 function renderHome(){
-  const box=document.getElementById('v-home'),W=weather(),R=D.risk||{},q=(D.brief&&D.brief.quick)||[];
+  const box=document.getElementById('v-home'),W=weather(),R=D.risk||{},q=(D.brief&&D.brief.quick)||[],FC=D.fc&&(D.fc.KOSPI||D.fc.KOSDAQ),SW=stateWeather();
   const tab=D.tabs.find(t=>t.k===D.default_tab)||D.tabs[0],top=(tab?tab.stocks:[]).slice(0,3);
   const saved=loadH(),evs=((D.outlook&&D.outlook.events)||[]).filter(e=>e.dday<=7).slice(0,4),secs=(D.outlook&&D.outlook.sec)||[];
   const heat=x=>{const v=Math.max(-8,Math.min(8,x.r5||0)),a=(Math.abs(v)/8*.55+.08).toFixed(2);return v>=0?`rgba(212,42,60,${a})`:`rgba(29,91,216,${a})`;};
@@ -4394,10 +4558,11 @@ function renderHome(){
     const r=analyzeHolding(h.code,h.qty,h.avg);return `<button class="hrow" data-hold="${h.code}"><b>${esc(r.name)}</b><span class="tn ${r.pl>=0?'upc':'downc'}">${pctS(r.pl,1)}</span><span class="chip ${r.tone}">${r.v}</span></button>`;}).join('');
   box.innerHTML=`
     <div class="hgrid">
-      <a class="card wx ${W[3]}" href="#market">
+      <a class="card wx ${W[3]}" href="#market" data-help="weather">
         <span class="wxi" aria-hidden="true">${W[0]}</span>
-        <span class="wxb"><small>오늘 시장 날씨</small><b>${W[1]}</b><span>${W[2]}</span></span>
-        <span class="wxs tn"><small>하락 위험</small><b>${R.score??'-'}</b><small>상승 신호</small><b>${R.up??'-'}</b></span>
+        <span class="wxb"><small>${FC?`오늘(${FC.date} ${FC.dow}) 장 예보`:'오늘 시장 날씨'}</small><b>${W[1]}</b><span>${W[2]}</span>
+          ${FC?`<span class="wxf tn">코스피 시가 <b class="${FC.gap>=0?'upc':'downc'}">${pctS(FC.gap,2)}</b> 예상 · 상승 마감 확률 <b>${FC.p}%</b></span>`:''}</span>
+        <span class="wxs tn"><small>어제까지 흐름</small><b>${SW?SW[0]+' '+SW[1]:'-'}</b><small>위험 ${R.score??'-'} · 상승 신호 ${R.up??'-'}</small></span>
       </a>
       ${q.length?`<div class="card strip tn">${q.map(x=>`<div><small>${esc(x.n)}</small><b class="${x.chg>=0?'upc':'downc'}">${pctS(x.chg,2)}</b></div>`).join('')}</div>`:''}
       <div class="card">
