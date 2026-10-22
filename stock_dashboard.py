@@ -3560,6 +3560,33 @@ button.ht2:active{transform:scale(.97)}
 @media(max-width:400px){.prow.sct{grid-template-columns:24px minmax(0,1fr) 50px auto}.prow.sct .pt:nth-of-type(2){display:none}}
 .secpop h3{margin:0 0 4px;font-size:18px;display:flex;gap:8px;align-items:center}
 tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
+
+.mine1 .ch h3{display:flex;gap:8px;align-items:center}
+.abadge{font-size:12px;font-weight:800;padding:2px 8px;border-radius:999px;background:var(--bad);color:#fff}
+.alist{display:grid;gap:6px;margin-bottom:10px}
+.alrow{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;text-align:left;font:inherit;font-size:13.5px;color:var(--ink);border:0;border-radius:12px;padding:10px 12px;cursor:pointer;border-left:4px solid var(--line);background:var(--sunk)}
+.alrow.ok{border-left-color:var(--ok);background:rgba(15,118,110,.08)} .alrow.warn{border-left-color:var(--mid);background:rgba(183,121,31,.1)} .alrow.bad{border-left-color:var(--bad);background:rgba(194,65,12,.1)}
+.alrow b{font-size:14.5px}
+.mmain.hold2{grid-template-columns:minmax(0,1fr) auto auto}
+.hfull{grid-column:1/-1;display:grid;gap:4px}
+.pgb{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;font-size:12.5px}
+.pgb.none{grid-template-columns:1fr}
+.pgt{position:relative;height:8px;border-radius:4px;background:var(--sunk);overflow:visible}
+.pgt i{position:absolute;left:0;top:0;bottom:0;border-radius:4px;background:var(--faint)}
+.pgt i.hot{background:var(--ok)} .pgt i.neg{background:var(--down)}
+.pgt s{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--ink);opacity:.5}
+.hlv{font-size:12px;color:var(--muted)}
+.alrt{display:inline-block;font-size:12.5px;font-weight:700;padding:2px 8px;border-radius:8px;justify-self:start}
+.alrt.ok{background:rgba(15,118,110,.12);color:var(--ok)} .alrt.warn{background:rgba(183,121,31,.14);color:var(--mid)} .alrt.bad{background:rgba(194,65,12,.14);color:var(--bad)}
+.mmain.al-ok{border-color:var(--ok)} .mmain.al-warn{border-color:var(--mid)} .mmain.al-bad{border-color:var(--bad)}
+.hprog{display:grid;gap:6px;margin-top:12px}
+.cfgbox{margin-top:10px;border:1px dashed var(--line);border-radius:12px;padding:8px 12px}
+.cfgbox summary{cursor:pointer;font-weight:700;font-size:13.5px}
+.cfgrow{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:end;margin-top:8px}
+.cfgrow label{display:grid;gap:4px;font-size:12.5px;color:var(--muted);font-weight:600}
+.cfgrow input{width:72px;font:inherit;font-size:15px;padding:6px 8px;border-radius:8px;border:1.5px solid var(--line);background:var(--sunk);color:var(--ink);margin-right:4px}
+.minecta{display:grid;gap:4px;text-decoration:none;color:var(--ink);border:2px dashed var(--line)}
+@media(max-width:400px){.mmain.hold2{grid-template-columns:minmax(0,1fr) auto}.mmain.hold2 .chip{grid-column:1/-1;justify-self:start}}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -4569,6 +4596,7 @@ function holdCard(h,saved){
         <div><dt>평가손익</dt><dd class="${r.pl>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</dd></div>
         <div><dt>수익률</dt><dd class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,2)}</dd></div>
       </dl>
+      ${(()=>{const st=holdStatus(r);return `<div class="hprog">${progBar(st)}${st.al.map(a=>`<span class="alrt ${a[0]}">${a[1]} ${a[2]}</span>`).join('')}</div>`;})()}
       <div class="hv"><div class="lab">📊 차트 기준 전략 <button class="q" data-help="hold" aria-label="설명 보기">?</button></div><div class="val ${r.tone}">${r.v}</div></div>
       <div class="plan"><b>실행 계획 (예시)</b>${r.plan}${r.tips.map(t=>`<br>· ${t}`).join('')}</div>
       <div style="margin-top:12px">${aiSlot({prompt:holdPrompt(r),code:r.code,kind:'hold',key:`ai:${D.asof}:${r.code}:h${r.qty}:${r.avg}`,tone:r.tone==='no'?'bad':r.tone})}</div>
@@ -4589,23 +4617,14 @@ function openHold(h){
 }
 function renderMine(){
   const list=loadH(),box=document.getElementById('mylist');
-  if(!list.length){box.innerHTML='<div class="empty">저장한 종목이 없습니다. 위에 입력하고 <b>저장</b>을 누르면 매일 자동으로 다시 점검합니다.</div>';return;}
-  let tot=0,cost=0;
-  const rows=list.map(h=>{
-    if(!snapOf(h.code)){if(AI_URL&&!PENDING[h.code])setTimeout(()=>fetchSnap(h.code),0);
-      return `<div class="mrow"><button class="mmain" data-hold="${h.code}"><span class="pn"><b>${esc(NAMES[h.code]||h.code)}</b><small>${f0(h.qty)}주 · 평단 ${f0(h.avg)}</small></span><span class="vl">데이터 없음</span></button><button class="del" data-rm="${h.code}" aria-label="${esc(NAMES[h.code]||h.code)} 삭제">✕</button></div>`;}
-    const r=analyzeHolding(h.code,h.qty,h.avg);tot+=r.val;cost+=r.avg*r.qty;
-    return `<div class="mrow"><button class="mmain" data-hold="${h.code}">
-        <span class="pn"><b>${esc(r.name)}</b><small class="tn">${f0(r.qty)}주 · 평단 ${f0(r.avg)} · 현재 ${f0(r.c)}</small></span>
-        <span class="mpl tn"><b class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,1)}</b><small class="${r.plAmt>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</small></span>
-        <span class="chip ${r.tone}">${r.v}</span></button>
-      <button class="del" data-rm="${h.code}" aria-label="${esc(r.name)} 삭제">✕</button></div>`;
-  }).join('');
+  if(!list.length){box.innerHTML='<div class="empty">저장한 종목이 없습니다. 위에 입력하고 <b>저장</b>을 누르면 매일 자동으로 다시 점검하고, 첫 화면에 목표가 근접 알림을 보여드립니다.</div>'+cfgHTML();return;}
+  let tot=0,cost=0;list.forEach(h=>{if(snapOf(h.code)){const r=analyzeHolding(h.code,h.qty,h.avg);tot+=r.val;cost+=r.avg*r.qty;}else if(AI_URL&&!PENDING[h.code])setTimeout(()=>fetchSnap(h.code),0);});
   const pl=tot-cost;
-  box.innerHTML=`<div class="msum tn"><span>저장 ${list.length}종목</span><span>평가 ${f0(tot)}원</span><b class="${pl>=0?'upc':'downc'}">${pl>=0?'+':''}${f0(pl)}원</b></div><div class="mlist">${rows}</div>
+  box.innerHTML=`<div class="msum tn"><span>저장 ${list.length}종목</span><span>평가 ${f0(tot)}원</span><b class="${pl>=0?'upc':'downc'}">${pl>=0?'+':''}${f0(pl)}원</b></div>
+    <div class="mlist">${list.map(h=>holdRowHTML(h,true)).join('')}</div>${cfgHTML()}
     <p class="vl" style="text-align:left;margin-top:6px">종목을 누르면 자세한 점검이 열리고, ✕를 누르면 목록에서 지워집니다.</p>`;
 }
-function rerender(){renderMine();if(location.hash==='#home'||location.hash==='')renderHome();}
+function rerender(){renderMine();if(location.hash==='#home'||location.hash===''||!location.hash)renderHome();}
 function stateWeather(){const R=D.risk;if(!R)return null;const s=R.score,u=R.up;
   if(s>=75)return ['⛈️','폭풍','bad'];if(s>=50)return u>=35?['🌦️','비 그칠 조짐','mid']:['🌧️','비','bad'];if(s>=25)return ['⛅','구름','mid'];return u>=35?['☀️','맑음','ok']:['🌤️','대체로 맑음','ok'];}
 /* 오늘 예보 = 밤사이 해외시장으로 본 '오늘' · 상태 = 어제까지 며칠간의 흐름 */
@@ -4623,6 +4642,61 @@ function weather0(p,hi){
   if(p>40)return ['🌧️','비','약세가 예상돼요 · 신규 매수는 줄이기','bad'];
   return ['⛈️','폭풍','하락 가능성이 높아요 · 오늘은 쉬어가기','bad'];
 }
+
+/* ───── 내 종목 목표가 근접 알림 (기준은 각자 설정, 이 기기에 저장) ───── */
+const CFGKEY='alert-cfg-v1';
+const loadCfg=()=>{try{return Object.assign({tgt:85,stop:3},JSON.parse(localStorage.getItem(CFGKEY))||{});}catch(_){return {tgt:85,stop:3};}};
+const saveCfg=c=>{try{localStorage.setItem(CFGKEY,JSON.stringify(c));}catch(_){}};
+function holdStatus(r){
+  const cf=loadCfg(),c=r.c;let base=null,lab='1차 목표';
+  if(r.t1>r.avg)base=r.t1;else if(r.t2>r.avg){base=r.t2;lab='2차 목표';}
+  const prog=base?(c-r.avg)/(base-r.avg)*100:null;
+  const toT=(r.t1/c-1)*100,toS=(c-r.stop)/c*100;
+  const al=[];
+  if(c<r.stop)al.push(['bad','🚨',`손절가 ${f0(r.stop)}원 아래 · 정리 검토`]);
+  else if(toS<=cf.stop)al.push(['warn','⚠️',`손절가까지 ${toS.toFixed(1)}% 남음`]);
+  if(prog!=null&&prog>=100)al.push(['ok','✅',`${lab} 도달 · 절반 익절 검토`]);
+  else if(prog!=null&&prog>=cf.tgt)al.push(['ok','🎯',`${lab} ${Math.round(prog)}% 근접 · 익절 준비`]);
+  return {prog,lab,base,toT,toS,al,cf};
+}
+function progBar(st){
+  if(st.prog==null)return `<div class="pgb none"><span class="vl">목표가가 평단보다 낮음 · 평단 회복 필요</span></div>`;
+  const v=Math.max(0,Math.min(100,st.prog));
+  return `<div class="pgb"><div class="pgt"><i class="${st.prog>=st.cf.tgt?'hot':st.prog<0?'neg':''}" style="width:${v}%"></i><s style="left:${st.cf.tgt}%" title="알림 기준 ${st.cf.tgt}%"></s></div>
+    <span class="tn">${st.lab} <b>${st.prog<0?'평단 아래':Math.round(st.prog)+'%'}</b></span></div>`;
+}
+function holdRowHTML(h,del){
+  const nm=esc(NAMES[h.code]||h.code);
+  if(!snapOf(h.code))return `<div class="mrow"><button class="mmain" data-hold="${h.code}"><span class="pn"><b>${nm}</b><small>${f0(h.qty)}주 · 평단 ${f0(h.avg)}</small></span><span class="vl">데이터 없음</span></button>${del?`<button class="del" data-rm="${h.code}" aria-label="${nm} 삭제">✕</button>`:''}</div>`;
+  const r=analyzeHolding(h.code,h.qty,h.avg),st=holdStatus(r);
+  return `<div class="mrow"><button class="mmain hold2 ${st.al.length?'al-'+st.al[0][0]:''}" data-hold="${h.code}">
+      <span class="pn"><b>${esc(r.name)}</b><small class="tn">${f0(r.qty)}주 · 평단 ${f0(r.avg)} · 현재 ${f0(r.c)}</small></span>
+      <span class="mpl tn"><b class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,1)}</b><small class="${r.plAmt>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</small></span>
+      <span class="chip ${r.tone}">${r.v}</span>
+      <span class="hfull">${progBar(st)}<span class="hlv tn">목표 <b class="upc">${f0(r.t1)}</b> (${pctS(st.toT,1)}) · 손절 <b class="downc">${f0(r.stop)}</b> (−${st.toS.toFixed(1)}%)</span>
+        ${st.al.map(a=>`<span class="alrt ${a[0]}">${a[1]} ${a[2]}</span>`).join('')}</span></button>
+    ${del?`<button class="del" data-rm="${h.code}" aria-label="${esc(r.name)} 삭제">✕</button>`:''}</div>`;
+}
+function cfgHTML(){const cf=loadCfg();
+  return `<details class="cfgbox"><summary>🔔 알림 기준 설정 <span class="vl">목표 ${cf.tgt}% · 손절 ${cf.stop}% 이내</span></summary>
+    <div class="cfgrow"><label>1차 목표 근접 알림<span><input type="number" class="cfgT" min="50" max="100" step="5" value="${cf.tgt}">% 이상</span></label>
+    <label>손절가 근접 알림<span><input type="number" class="cfgS" min="1" max="15" step="0.5" value="${cf.stop}">% 이내</span></label>
+    <button class="btn sm cfgSave">저장</button></div>
+    <p class="vl" style="text-align:left;margin:6px 0 0">근접률 = (현재가 − 평단) ÷ (1차 목표 − 평단). 목표가는 매일 아침 새로 계산되고, 가격은 전 거래일 종가 기준입니다. 설정은 이 기기에만 저장됩니다.</p></details>`;}
+document.addEventListener('click',e=>{const sv=e.target.closest('.cfgSave');if(!sv)return;const bx=sv.closest('.cfgbox');
+  const t=Math.max(50,Math.min(100,+bx.querySelector('.cfgT').value||85)),s_=Math.max(1,Math.min(15,+bx.querySelector('.cfgS').value||3));
+  saveCfg({tgt:t,stop:s_});rerender();});
+function myHomeHTML(){
+  const saved=loadH();
+  if(!saved.length)return `<a class="card wide minecta" href="#mine"><b>💼 내 종목을 등록해 보세요</b><span class="vl">보유 종목·수량·평단을 넣으면 매일 아침 분석 결과와 목표가 근접 알림을 이 첫 화면에 보여드립니다.</span></a>`;
+  const rows=saved.map(h=>({h,s:snapOf(h.code)?holdStatus(analyzeHolding(h.code,h.qty,h.avg)):null}));
+  const rank=x=>!x.s||!x.s.al.length?9:x.s.al[0][0]==='bad'?0:x.s.al[0][0]==='warn'?1:2;
+  rows.sort((a,b)=>rank(a)-rank(b)||((b.s&&b.s.prog)||-999)-((a.s&&a.s.prog)||-999));
+  const alerts=rows.filter(x=>x.s&&x.s.al.length);
+  return `<div class="card wide mine1"><div class="ch"><h3>💼 내 종목 ${alerts.length?`<span class="abadge">🔔 ${alerts.length}</span>`:''}</h3><a class="more" href="#mine">＋ 추가 · 관리</a></div>
+    ${alerts.length?`<div class="alist">${alerts.map(x=>`<button class="alrow ${x.s.al[0][0]}" data-hold="${x.h.code}"><b>${esc(NAMES[x.h.code]||x.h.code)}</b>${x.s.al.map(a=>`<span>${a[1]} ${a[2]}</span>`).join('')}</button>`).join('')}</div>`:'<p class="vl" style="text-align:left;margin:0 0 8px">지금은 목표가 근접·손절가 근접 종목이 없습니다.</p>'}
+    <div class="mlist">${rows.map(x=>holdRowHTML(x.h,false)).join('')}</div>${cfgHTML()}</div>`;
+}
 function renderHome(){
   const box=document.getElementById('v-home'),W=weather(),R=D.risk||{},q=(D.brief&&D.brief.quick)||[],FC=D.fc&&(D.fc.KOSPI||D.fc.KOSDAQ),SW=stateWeather();
   const tab=D.tabs.find(t=>t.k===D.default_tab)||D.tabs[0],top=(tab?tab.stocks:[]).slice(0,3);
@@ -4632,6 +4706,7 @@ function renderHome(){
     const r=analyzeHolding(h.code,h.qty,h.avg);return `<button class="hrow" data-hold="${h.code}"><b>${esc(r.name)}</b><span class="tn ${r.pl>=0?'upc':'downc'}">${pctS(r.pl,1)}</span><span class="chip ${r.tone}">${r.v}</span></button>`;}).join('');
   box.innerHTML=`
     <div class="hgrid">
+      ${myHomeHTML()}
       <a class="card wx ${W[3]}" href="#market" data-help="weather">
         <span class="wxi" aria-hidden="true">${W[0]}</span>
         <span class="wxb"><small>${FC?`오늘(${FC.date} ${FC.dow}) 장 예보`:'오늘 시장 날씨'}</small><b>${W[1]}</b><span>${W[2]}</span>
@@ -4644,10 +4719,6 @@ function renderHome(){
         ${tab&&D.weak&&D.weak[tab.k]?`<p class="rwarn" style="margin:0 0 8px;font-size:13px">⚠️ 지금 같은 ${D.regime_now}장에서는 세 전략 모두 과거 성적이 약했습니다 · 매수는 아주 조금만</p>`:''}
         ${top.length?`<div class="plist">${top.map((x,i)=>`<button class="prow top" data-pick="${tab.k}:${i}"><span class="rk tn">${i+1}</span><span class="pn"><b>${esc(x.name)}</b><small class="tn">${f0(x.close)} ${pct(x.chg)}</small></span><span class="pt tn"><small>매수</small><b class="buyc">${x.plan?f0(x.plan.b1):'-'}</b></span><span class="pt tn"><small>목표</small><b class="upc">${pctS(x.tg.t1p)}</b></span><span class="pt tn"><small>손절</small><b class="downc">${pctS(x.tg.sp)}</b></span></button>`).join('')}</div>`:'<p class="vl" style="text-align:left">오늘은 추천 종목이 없습니다.</p>'}
         <a class="more" href="#picks">전략별 추천 전체 →</a>
-      </div>
-      <div class="card">
-        <div class="ch"><h3>내 종목</h3><a class="more" href="#mine">${saved.length?'관리 →':'＋ 추가'}</a></div>
-        ${saved.length?`<div class="hlist">${mine}</div>${saved.length>4?`<a class="more" href="#mine">외 ${saved.length-4}종목 →</a>`:''}`:'<p class="vl" style="text-align:left;margin:0">보유 종목을 저장하면 여기서 매일 보유·매도 신호를 보여드려요.</p>'}
       </div>
       <div class="card">
         <div class="ch"><h3>이번 주 일정</h3><a class="more" href="#market">전체 →</a></div>
