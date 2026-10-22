@@ -1559,6 +1559,32 @@ def safe_fetch(code, count):
         return None, None
 
 
+# ───────────────────────────── 섹터별 대장주 후보 (시가총액 순 상위 5개를 보여줌) ─────────────────────────────
+# 대장주는 시장에서 그 섹터를 대표하는 큰 종목들입니다. 이름이 바뀌거나 새 대장주가 생기면 이 목록만 고치면 됩니다.
+SECTOR_LEADERS = {
+    "반도체": ["삼성전자", "SK하이닉스", "한미반도체", "DB하이텍", "리노공업", "ISC", "이오테크닉스", "원익IPS", "하나마이크론", "주성엔지니어링"],
+    "2차전지": ["LG에너지솔루션", "삼성SDI", "에코프로비엠", "에코프로", "포스코퓨처엠", "엘앤에프", "SK이노베이션", "엔켐"],
+    "자동차": ["현대차", "기아", "현대모비스", "HL만도", "현대위아", "한온시스템", "에스엘"],
+    "바이오": ["삼성바이오로직스", "셀트리온", "알테오젠", "SK바이오팜", "HLB", "리가켐바이오", "에이비엘바이오", "유한양행"],
+    "헬스케어": ["삼성바이오로직스", "셀트리온", "유한양행", "한미약품", "클래시스", "파마리서치", "휴젤"],
+    "IT": ["삼성전자", "SK하이닉스", "LG전자", "삼성전기", "LG이노텍", "삼성SDS"],
+    "소프트웨어": ["NAVER", "카카오", "삼성SDS", "크래프톤", "엔씨소프트", "더존비즈온"],
+    "은행": ["KB금융", "신한지주", "하나금융지주", "우리금융지주", "기업은행", "카카오뱅크", "BNK금융지주"],
+    "증권": ["미래에셋증권", "한국금융지주", "NH투자증권", "삼성증권", "키움증권"],
+    "보험": ["삼성생명", "삼성화재", "DB손해보험", "현대해상", "한화생명"],
+    "건설": ["삼성물산", "현대건설", "GS건설", "DL이앤씨", "대우건설", "HDC현대산업개발"],
+    "철강": ["POSCO홀딩스", "고려아연", "현대제철", "동국제강", "세아베스틸지주"],
+    "에너지화학": ["LG화학", "SK이노베이션", "S-Oil", "한화솔루션", "롯데케미칼", "금호석유"],
+    "조선·중공업": ["HD현대중공업", "한화오션", "HD한국조선해양", "삼성중공업", "HD현대미포", "두산에너빌리티"],
+    "운송": ["HMM", "대한항공", "현대글로비스", "CJ대한통운", "팬오션"],
+    "화장품": ["아모레퍼시픽", "LG생활건강", "에이피알", "코스맥스", "한국콜마", "실리콘투"],
+    "미디어·엔터": ["하이브", "JYP Ent.", "에스엠", "CJ ENM", "와이지엔터테인먼트", "스튜디오드래곤"],
+    "방산": ["한화에어로스페이스", "한국항공우주", "LIG넥스원", "현대로템", "한화시스템", "풍산"],
+    "필수소비재": ["KT&G", "CJ제일제당", "삼양식품", "오리온", "농심", "이마트"],
+    "경기소비재": ["현대차", "기아", "호텔신라", "신세계", "F&F", "한섬"],
+}
+
+
 # ───────────────────────────── 유튜브 채널 · 급등주 해부 ─────────────────────────────
 YT_CHANNEL = dict(name="한균수의 주식사용설명서", id="UCadSWH0pDXxEatvLHEHCWlg",
                   url="https://www.youtube.com/@%ED%95%9C%EA%B7%A0%EC%88%98%EC%9D%98%EC%A3%BC%EC%8B%9D%EC%82%AC%EC%9A%A9%EC%84%A4%EB%AA%85")
@@ -2682,6 +2708,28 @@ def build(demo=False, mode="file"):
         print(f"  유튜브 읽기 실패: {ex}", flush=True)
         stat("유튜브 채널 (RSS)", False, str(ex)[:80])
 
+    # ── 섹터 지도: 섹터마다 대장주 5개 (시가총액 순) ──
+    sector_map, sector_stocks = {}, {}
+    try:
+        norm = lambda x: str(x).replace(" ", "").upper()
+        n2c = {norm(v_): k_ for k_, v_ in names.items() if k_ in P["c"].columns}
+        for sec, lst in SECTOR_LEADERS.items():
+            codes_ = [n2c[norm(nm)] for nm in lst if norm(nm) in n2c and c.get(n2c[norm(nm)], np.nan) == c.get(n2c[norm(nm)], np.nan)]
+            if demo and not codes_:                                   # 미리보기: 가상 종목으로 채움
+                codes_ = list(uni[(hash(sec) % 50):(hash(sec) % 50) + 7])
+            codes_ = sorted(dict.fromkeys(codes_), key=lambda t: -(mcap.get(t, 0) or 0))[:5]
+            for t in codes_:
+                if t not in sector_stocks:
+                    e = light_entry(t)
+                    cc_ = P["c"][t]
+                    e["r5"] = num((cc_.iloc[-1] / cc_.iloc[-6] - 1) * 100, 1)
+                    e["r20"] = num((cc_.iloc[-1] / cc_.iloc[-21] - 1) * 100, 1)
+                    sector_stocks[t] = e
+            sector_map[sec] = codes_
+        stat("섹터 대장주", bool(sector_stocks), f"{len(sector_map)}개 섹터 · {len(sector_stocks)}종목")
+    except Exception as ex:
+        print(f"  섹터 대장주 실패: {ex}", flush=True)
+
     gainers = None
     try:
         lastchg = m["chg"]
@@ -2771,7 +2819,7 @@ def build(demo=False, mode="file"):
         regime_now=regime_now, weak={k_: True for k_ in weak_strats(bt, regime_now)},
         risk=risk, outlook=outlook, macro=macro,
         bt=bt, fc=fc, status=STATUS, review=rv, tips=tips, brief=brief, gen_iso=datetime.now().strftime("%Y-%m-%dT%H:%M"),
-        tabs=tabs, all=allstk, news=news, yt=yt, gainers=gainers,
+        tabs=tabs, all=allstk, news=news, yt=yt, gainers=gainers, smap=sector_map, sstocks=sector_stocks,
         names={t: str(n) for t, n in getattr(namefn, "__self__", {}).items()},
         worker=os.environ.get("AI_WORKER_URL", "").strip(),
     )
@@ -3505,6 +3553,13 @@ body.locked .wrap{display:none}
 .wxf{display:block;margin-top:4px;font-size:13px;font-weight:600}
 .wxs{grid-template-columns:1fr!important;text-align:right}.wxs b{font-size:15px!important}
 @media(max-width:420px){.wxs{grid-template-columns:auto auto!important;text-align:left}}
+
+button.ht2{border:0;font:inherit;text-align:left;cursor:pointer}
+button.ht2:active{transform:scale(.97)}
+.prow.sct{grid-template-columns:28px minmax(0,1fr) 54px 54px auto}
+@media(max-width:400px){.prow.sct{grid-template-columns:24px minmax(0,1fr) 50px auto}.prow.sct .pt:nth-of-type(2){display:none}}
+.secpop h3{margin:0 0 4px;font-size:18px;display:flex;gap:8px;align-items:center}
+tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -3937,6 +3992,10 @@ const HELP={
       <h5>과거 패턴 계산</h5><p><b>일정 전 5일</b> = 일정 전날 종가 ÷ 6거래일 전 종가 − 1 · <b>일정 후 5일</b> = 일정 후 4거래일 종가 ÷ 일정 전날 종가 − 1. 관련 섹터 대표 ETF(시장 전체 일정은 코스피)로 과거 약 5년간 같은 일정을 모아 평균과 상승 비율을 냅니다. 표본이 3번 미만이면 표시하지 않습니다.</p>
       <h5>5일 전망 모델에 들어가는 값</h5><p>섹터 일정이 5거래일 안에 있는지, 시장 전체 일정이 5거래일 안에 있는지, 섹터 일정 직후인지, 실적 시즌인지 4가지를 입력으로 넣습니다.</p>
       <h5>일정 추가하기</h5><p>GitHub 저장소에 <b>events.json</b> 파일을 만들고 <code>[{"date":"2027-05-20","name":"행사명","sectors":["반도체"]}]</code> 형식으로 적으면 다음 실행부터 반영됩니다. 섹터 이름은 표의 섹터 이름과 같게 쓰고, 시장 전체 일정은 <code>"*"</code>로 씁니다. 몇 달에 한 번 Claude에게 "일정 업데이트해줘"라고 하시면 다시 검색해서 채워 드립니다.</p>`],
+  sector:['섹터 대장주',()=>`<p>섹터마다 그 업종을 대표하는 큰 종목들 중 <b>시가총액이 큰 순서로 5개</b>를 보여줍니다. 후보 목록은 프로그램 안 SECTOR_LEADERS에 적어 두었고, 바뀌면 그 목록만 고치면 됩니다.</p>
+      <ul><li><b>5일 · 20일</b>: 최근 등락률</li><li><b>판정</b>: 차트 추세·과열·세력 이탈 패턴으로 붙인 우리 의견(긍정적 / 관망 / 추격 주의 / 주의)</li>
+      <li>종목을 누르면 세 전략 중 가장 잘 맞는 전략 기준의 점수·매매 포인트·결론·차트가 열립니다.</li></ul>
+      <p>섹터 지도 색은 <b>섹터 대표 ETF의 최근 5일 등락</b>입니다(빨강 = 오름, 파랑 = 내림).</p>`],
   ai:['🤖 AI 분석 버튼',()=>`<ol><li>버튼을 누르면 Claude가 이 종목의 차트 결과와 오늘 모은 뉴스 제목이 <b>입력된 상태로</b> 열립니다.</li><li><b>Enter</b>만 누르면 Claude가 최근 한 달 국내·해외(영문) 기사와 공시를 검색해 매수/관망/주의 의견을 냅니다.</li><li>입력칸이 비어 있으면 '요청 문장 복사'를 눌러 붙여넣으세요.</li></ol><p>사장님의 Claude 구독 안에서 처리되어 추가 비용이 없습니다.</p>`],
 };
 const helpDlg=document.getElementById('help');
@@ -4001,8 +4060,23 @@ function openVideo(i){
     <div class="lbl">언급 종목 · 우리 방식 판정</div><div class="ychips">${mentChips(v)}</div>
     <div class="aibox aibtn" style="margin-top:12px"><p><b style="color:var(--ink)">🤖 영상 종목 AI 점검</b><br>영상 제목과 우리 분석이 입력된 채로 Claude가 열립니다. Enter만 누르세요.</p><a class="btn ai" href="${claudeURL(prompt,null)}" target="_blank" rel="noopener">🤖 Claude에서 점검</a></div></div>`);
 }
-function openYtStock(code){const x=ytStock(code)||(D.gainers&&D.gainers.items.find(g=>g.code===code));if(!x)return;
+function openYtStock(code){const x=ytStock(code)||(D.sstocks&&D.sstocks[code])||(D.gainers&&D.gainers.items.find(g=>g.code===code));if(!x)return;
   openSheet(pickCard(x),()=>{const b=sheet.querySelector('.chartbox');if(b&&x.series)drawChart(b,x.series);});}
+/* ───── 섹터 지도 → 대장주 팝업 ───── */
+function openSector(name){
+  const codes=(D.smap&&D.smap[name])||[],S=D.sstocks||{},o=((D.outlook&&D.outlook.sec)||[]).find(x=>x.name===name);
+  const seen={},ev=((D.outlook&&D.outlook.events)||[]).filter(e=>e.secs.includes(name)&&!seen[e.name]&&(seen[e.name]=1)).slice(0,2);
+  const rows=codes.map((c,i)=>{const x=S[c];if(!x)return '';return `<button class="prow sct" data-yts="${c}">
+      <span class="rk tn">${i+1}</span>
+      <span class="pn"><b>${esc(x.name)}</b><small class="tn">${f0(x.close)} ${pct(x.chg)} · 시총 ${won(x.mcap)}</small></span>
+      <span class="pt tn"><small>5일</small><b class="${(x.r5||0)>=0?'upc':'downc'}">${pctS(x.r5,1)}</b></span>
+      <span class="pt tn"><small>20일</small><b class="${(x.r20||0)>=0?'upc':'downc'}">${pctS(x.r20,1)}</b></span>
+      <span class="chip ${x.read.tone}">${esc(x.read.op)}</span></button>`;}).join('');
+  openSheet(`<div class="secpop"><h3>${esc(name)} 대장주 <button class="q" data-help="sector" aria-label="설명 보기">?</button></h3>
+    ${o?`<p class="tn" style="margin:2px 0 10px">${esc(o.etf)} · 현재 <span class="tr ${o.trend==='상승'?'tu':o.trend==='하락'?'td':'tf'}">${o.trend} 추세</span> · 5일 ${pct(o.r5,1)} · 20일 ${pct(o.r20,1)} · 5일 뒤 오를 확률 <b>${o.p}%</b></p>`:''}
+    ${ev.length?`<p class="vl" style="text-align:left;margin:0 0 10px">🗓 ${ev.map(e=>`${esc(e.name)} ${e.dday===0?'오늘':'D-'+e.dday}`).join(' · ')}</p>`:''}
+    ${rows?`<div class="plist">${rows}</div><p class="vl" style="text-align:left;margin-top:8px">시가총액 순 · 종목을 누르면 차트·매매 포인트·결론이 열립니다.</p>`:'<p class="vl">대장주 자료가 없습니다.</p>'}</div>`);
+}
 function ytCardHTML(){
   if(!YT||!YT.videos.length)return '';
   const v=YT.videos[0];
@@ -4273,7 +4347,7 @@ function renderOutlook(){
       <div><span class="vl">과거 비슷한 때 평균</span><b>${pctS(o.er,2)}</b></div><div><span class="vl">예상 흔들림 (68%)</span><b>±${o.band}%</b></div></div></div>`).join('')}</div>
     <h3 class="sec">섹터별 추세와 5일 전망</h3>
     <div class="tablewrap"><table class="sectbl"><thead><tr><th>섹터</th><th>최근 60일</th><th>현재 추세</th><th>5일 / 20일</th><th>코스피 대비</th><th>5일 뒤 오를 확률</th><th>예상 흔들림</th><th>다가오는 일정</th></tr></thead><tbody>
-    ${O.sec.map(o=>`<tr class="tn"><td class="nm"><b>${esc(o.name)}</b><span>${esc(o.etf)}</span></td><td>${miniSpark(o.spark)}</td>
+    ${O.sec.map(o=>`<tr class="tn clk" data-sector="${esc(o.name)}"><td class="nm"><b>${esc(o.name)}</b><span>${esc(o.etf)}</span></td><td>${miniSpark(o.spark)}</td>
       <td><span class="tr ${tcls(o.trend)}">${o.trend}</span></td><td>${pct(o.r5,1)} / ${pct(o.r20,1)}</td><td>${o.rs==null?'-':pct(o.rs,1)}</td>
       <td><div class="pcell">${pbar(o.p)}<b class="${o.p>=50?'upc':'downc'}">${o.p}%</b></div></td><td>±${o.band}%</td><td class="vl">${esc(o.next_ev||'')}</td></tr>`).join('')}</tbody></table></div>
 `;
@@ -4583,7 +4657,7 @@ function renderHome(){
       ${D.gainers&&D.gainers.items.length?`<a class="card glink" href="#market"><span>🚀 어제 급등주 ${D.gainers.items.length}종목 해부</span><span class="vl">${D.gainers.items.slice(0,3).map(g=>esc(g.name)+' '+pctS(g.chg,1)).join(' · ')}</span></a>`:''}
       ${secs.length?`<div class="card wide">
         <div class="ch"><h3>섹터 지도 <small class="vl">최근 5일</small></h3><a class="more" href="#market">5일 전망 →</a></div>
-        <div class="heat">${secs.slice().sort((a,b)=>(b.r5||0)-(a.r5||0)).map(x=>`<div class="ht2" style="background:${heat(x)}"><b>${esc(x.name)}</b><span class="tn">${pctS(x.r5,1)}</span></div>`).join('')}</div>
+        <div class="heat">${secs.slice().sort((a,b)=>(b.r5||0)-(a.r5||0)).map(x=>`<button class="ht2" data-sector="${esc(x.name)}" style="background:${heat(x)}"><b>${esc(x.name)}</b><span class="tn">${pctS(x.r5,1)}</span></button>`).join('')}</div>
       </div>`:''}
     </div>`;
 }
@@ -4610,6 +4684,7 @@ function route(){
 }
 addEventListener('hashchange',route);
 document.addEventListener('click',e=>{
+  const sct=e.target.closest('[data-sector]');if(sct){openSector(sct.dataset.sector);return;}
   const yv=e.target.closest('[data-vid]');if(yv){openVideo(+yv.dataset.vid);return;}
   const ys=e.target.closest('[data-yts]');if(ys){openYtStock(ys.dataset.yts);return;}
   const pk=e.target.closest('[data-pick]');if(pk){const [k,i]=pk.dataset.pick.split(':').map(Number);openPick(k,i);return;}
