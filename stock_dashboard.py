@@ -3587,6 +3587,22 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
 .cfgrow input{width:72px;font:inherit;font-size:15px;padding:6px 8px;border-radius:8px;border:1.5px solid var(--line);background:var(--sunk);color:var(--ink);margin-right:4px}
 .minecta{display:grid;gap:4px;text-decoration:none;color:var(--ink);border:2px dashed var(--line)}
 @media(max-width:400px){.mmain.hold2{grid-template-columns:minmax(0,1fr) auto}.mmain.hold2 .chip{grid-column:1/-1;justify-self:start}}
+
+.hold{grid-template-columns:minmax(0,1fr) minmax(0,1.2fr)}
+.hold>div{min-width:0}
+@media(max-width:880px){.hold{grid-template-columns:minmax(0,1fr);padding:14px 14px}}
+.lvwrap{overflow-x:auto;max-width:100%}
+.lvtable{font-size:12.5px}.lvtable td,.lvtable th{white-space:normal;padding:6px 6px}
+.lvbar text{font-size:15px}
+.sheet .hold{border:0;padding:4px 2px;background:transparent}
+.sheet .hold .hdr,.sheet .ytv h3,.sheet .secpop h3{padding-right:46px}
+.hold .hdr{flex-wrap:wrap}
+.pos-grid dd{overflow-wrap:anywhere}
+
+.lvb{margin:4px 0 6px}
+.lvchips{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:12.5px;margin-top:2px}
+.lvchips span{display:inline-flex;align-items:center;gap:4px;color:var(--c)} .lvchips i{width:8px;height:8px;border-radius:50%;background:var(--c)}
+.lvchips span.cur{font-weight:800}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -4555,12 +4571,15 @@ function analyzeHolding(code,qty,avg){
   return {name,mk,c,chg,pl,plAmt,val:c*qty,v,tone,plan,why,tips,stop,stopWhy,t1,t2,qty,avg,code};
 }
 function lvBar(r){
-  const pts=[['손절',r.stop,'var(--down)'],['평단',r.avg,'var(--muted)'],['현재',r.c,'var(--ink)'],['목표1',r.t1,'var(--up)'],['목표2',r.t2,'var(--up)']];
-  const lo=Math.min(...pts.map(p=>p[1])),hi=Math.max(...pts.map(p=>p[1])),W=600,X=v=>20+(v-lo)/((hi-lo)||1)*(W-40);
+  /* 가격 위치: 점은 막대 위에, 이름·가격은 아래 칩으로 (겹치지 않게). 값 차이가 크면 로그 눈금 */
+  const pts=[['손절',r.stop,'var(--down)'],['평단',r.avg,'var(--muted)'],['현재',r.c,'var(--ink)'],['목표1',r.t1,'var(--up)'],['목표2',r.t2,'var(--up)']].filter(p=>p[1]>0);
+  const lo=Math.min(...pts.map(p=>p[1])),hi=Math.max(...pts.map(p=>p[1])),W=600,useLog=hi/lo>2.5;
+  const f=v=>useLog?Math.log(v):v,X=v=>16+(f(v)-f(lo))/((f(hi)-f(lo))||1)*(W-32);
   const sorted=[...pts].sort((a,b)=>a[1]-b[1]);
-  return `<svg class="lvbar" viewBox="0 0 ${W} 80" width="100%" role="img" aria-label="가격 위치"><line class="ax" x1="20" x2="${W-20}" y1="42" y2="42"/>`+
-    sorted.map(([l,v,col],i)=>{const x=X(v),y=i%2?72:20,an=x<90?'start':x>W-90?'end':'middle';
-      return `<circle cx="${x}" cy="42" r="${l==='현재'?7:5}" fill="${col}"/><text x="${x}" y="${y}" text-anchor="${an}" fill="${col}">${l} ${f0(v)}</text>`;}).join('')+'</svg>';
+  return `<div class="lvb"><svg viewBox="0 0 ${W} 28" width="100%" aria-hidden="true"><line class="ax" x1="16" x2="${W-16}" y1="14" y2="14" stroke="var(--line)" stroke-width="3"/>
+    ${sorted.map(([l,v,col])=>`<circle cx="${X(v)}" cy="14" r="${l==='현재'?9:6}" fill="${col}" stroke="var(--surface)" stroke-width="2"/>`).join('')}</svg>
+    <div class="lvchips tn">${sorted.map(([l,v,col])=>`<span style="--c:${col}" class="${l==='현재'?'cur':''}"><i></i>${l} <b>${f0(v)}</b></span>`).join('')}</div>
+    ${useLog?'<p class="vl" style="text-align:left;margin:2px 0 0;font-size:11px">가격 차이가 커서 눈금을 줄여 표시했습니다.</p>':''}</div>`;
 }
 function holdPrompt(r){
   return `한국 주식 ${r.name}(${r.code}, ${r.mk})을 ${f0(r.qty)}주, 평균 ${f0(r.avg)}원에 보유하고 있어.\n`+
@@ -4603,8 +4622,8 @@ function holdCard(h,saved){
     </div>
     <div>
       ${lvBar(r)}
-      <table class="lvtable tn"><thead><tr><th>가격</th><th>원</th><th>현재가 대비</th><th>그때 손익</th></tr></thead><tbody>
-        ${row('2차 목표',r.t2,'')}${row('1차 목표',r.t1,'')}${row('손절 참고',r.stop,r.stopWhy)}</tbody></table>
+      <div class="lvwrap"><table class="lvtable tn"><thead><tr><th>가격</th><th>원</th><th>현재가 대비</th><th>그때 손익</th></tr></thead><tbody>
+        ${row('2차 목표',r.t2,'')}${row('1차 목표',r.t1,'')}${row('손절 참고',r.stop,r.stopWhy)}</tbody></table></div>
       <div class="lbl">판단 근거</div><ul class="why">${r.why.map(w=>`<li>${esc(w)}</li>`).join('')}</ul>
       ${newsHTML(r.code,4)}
     </div></article>`;
@@ -4660,7 +4679,7 @@ function holdStatus(r){
   return {prog,lab,base,toT,toS,al,cf};
 }
 function progBar(st){
-  if(st.prog==null)return `<div class="pgb none"><span class="vl">목표가가 평단보다 낮음 · 평단 회복 필요</span></div>`;
+  if(st.prog==null)return `<div class="pgb none"><span class="vl" style="text-align:left">목표가가 평단보다 낮음 · 평단 회복 필요</span></div>`;
   const v=Math.max(0,Math.min(100,st.prog));
   return `<div class="pgb"><div class="pgt"><i class="${st.prog>=st.cf.tgt?'hot':st.prog<0?'neg':''}" style="width:${v}%"></i><s style="left:${st.cf.tgt}%" title="알림 기준 ${st.cf.tgt}%"></s></div>
     <span class="tn">${st.lab} <b>${st.prog<0?'평단 아래':Math.round(st.prog)+'%'}</b></span></div>`;
