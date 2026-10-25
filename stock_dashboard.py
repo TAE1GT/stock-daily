@@ -183,8 +183,10 @@ def listing_mobile_api():
                 code = str(it.get("itemCode", ""))
                 if not re.fullmatch(r"[0-9A-Z]{6}", code):
                     continue
-                if it.get("stockEndType", "stock") != "stock":
+                if it.get("stockEndType", "stock") not in ("stock", "etf"):
                     continue
+                if it.get("stockEndType") == "etf":
+                    ETF_SET.add(code)
                 eng = it.get("stockNameEng") or next((v for k, v in it.items() if "eng" in k.lower() and isinstance(v, str)), "")
                 ENG[code] = str(eng or "")
                 rows.append(dict(code=code, name=str(it.get("stockName", "")), market=mk,
@@ -292,7 +294,26 @@ def load_naver(days):
     print("종목 목록 받는 중…", flush=True)
     lst = naver_listing()
     # ETF·ETN·스팩 제외 (보유 종목 점검용으로 우선주는 남김. 매수 후보 선정에서는 따로 제외)
-    lst = lst[[not is_excluded_name(n) for n in lst["name"]]]
+    try:
+        etf = listing_etf()
+        if etf is not None and len(etf):
+            ETF_SET.update(etf.index)
+            lst = pd.concat([lst, etf[~etf.index.isin(lst.index)]])
+            print(f"  ETF 목록 {len(etf)}개", flush=True)
+    except Exception as ex:
+        print(f"  ETF 목록 실패: {str(ex)[:80]}", flush=True)
+    for it in load_watchlist():
+        if it.get("type", "kr") == "kr" and it.get("code") and it["code"] not in lst.index:
+            lst.loc[it["code"]] = dict(name=it.get("name", it["code"]), market="ETF" if it.get("etf") else "",
+                                        현재가=np.nan, 거래량=np.nan, 시가총액=np.nan)
+            if it.get("etf"):
+                ETF_SET.add(it["code"])
+    for t, n in zip(lst.index, lst["name"]):
+        if str(n).split()[:1] and str(n).split()[0] in ETF_BRANDS:
+            ETF_SET.add(t)
+    lst = lst[[("ETN" not in str(n)) for n in lst["name"]]]
+    if "market" in lst:
+        lst.loc[lst.index.isin(ETF_SET), "market"] = "ETF"
     print(f"시세 받는 중… ({len(lst)}종목)", flush=True)
 
     data = {}
@@ -1585,6 +1606,151 @@ SECTOR_LEADERS = {
 }
 
 
+# ───────────────────────────── 내 종목 확장: 국내 ETF · 미국 주식 · 코인 (watchlist.json) ─────────────────────────────
+ETF_SET = set()
+
+
+def listing_etf():
+    """네이버 ETF 전체 목록 (국내 ETF도 내 종목 점검에 쓰기 위해)"""
+    j = json.loads(http_get("https://finance.naver.com/api/sise/etfItemList.nhn", retries=2))
+    items = (j.get("result") or {}).get("etfItemList") or []
+    rows = [dict(code=str(x.get("itemcode")), name=str(x.get("itemname")), market="ETF", 현재가=_num(x.get("nowVal", "")),
+                 거래량=_num(x.get("quant", "")), 시가총액=_num(x.get("marketSum", ""))) for x in items if re.fullmatch(r"[0-9A-Z]{6}", str(x.get("itemcode", "")))]
+    return pd.DataFrame(rows).set_index("code") if rows else None
+
+
+def load_watchlist():
+    """저장소의 watchlist.json: 가족이 가진 종목 중 '전 종목 목록'에 없는 것(미국 주식·코인)과 뉴스를 챙길 국내 종목"""
+    path = os.path.join(BASE, "watchlist.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        return load_json(path)
+    except Exception as ex:
+        print(f"  watchlist.json 읽기 실패: {ex}", flush=True)
+        return []
+
+
+def fetch_yahoo_ohlc(sym, rng="2y"):
+    from urllib.parse import quote
+    j = json.loads(http_get(f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(sym)}?range={rng}&interval=1d", retries=2))
+    r = j["chart"]["result"][0]
+    q = r["indicators"]["quote"][0]
+    df = pd.DataFrame(dict(o=q["open"], h=q["high"], l=q["low"], c=q["close"], v=q["volume"]),
+                      index=pd.to_datetime([datetime.utcfromtimestamp(t).date() for t in r["timestamp"]]), dtype=float).dropna(subset=["c"])
+    return df[~df.index.duplicated(keep="last")]
+
+
+def fetch_crypto_ohlc(sym):
+    """빗썸 → 업비트 순서로 원화 일봉"""
+    try:
+        j = json.loads(http_get(f"https://api.bithumb.com/public/candlestick/{sym}_KRW/24h", retries=2))
+        d = j.get("data") or []
+        if d:
+            df = pd.DataFrame(d, columns=["t", "o", "c", "h", "l", "v"]).astype(float)
+            df.index = pd.to_datetime(df.pop("t"), unit="ms").dt.normalize()
+            return df[["o", "h", "l", "c", "v"]].iloc[-520:]
+    except Exception:
+        pass
+    j = json.loads(http_get(f"https://api.upbit.com/v1/candles/days?market=KRW-{sym}&count=200", retries=2))
+    df = pd.DataFrame([dict(d=x["candle_date_time_kst"][:10], o=x["opening_price"], h=x["high_price"], l=x["low_price"], c=x["trade_price"],
+                            v=x["candle_acc_trade_volume"]) for x in j])
+    df.index = pd.to_datetime(df.pop("d"))
+    return df.sort_index().astype(float)
+
+
+def snap_from_ohlc(df, name, market):
+    """내 종목 점검 화면이 쓰는 요약값 (국내 전 종목과 같은 형식)"""
+    o, h, l, c, v = (df[k].astype(float) for k in "ohlcv")
+    if len(c) < 30:
+        return None
+    ma20, ma60 = c.rolling(20).mean(), c.rolling(60).mean()
+    sd = c.rolling(20).std(ddof=0)
+    d = c.diff()
+    au = d.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    ad = (-d.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rsi = 100 - 100 / (1 + au / ad)
+    pc = c.shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    hist = macd - macd.ewm(span=9, adjust=False).mean()
+    res, sup = vp_levels(h.iloc[-100:].to_numpy(float), l.iloc[-100:].to_numpy(float), v.iloc[-100:].fillna(0).to_numpy(float), float(c.iloc[-1]))
+    w120h, w120l = h.iloc[-120:], l.iloc[-120:]
+    fhi, flo = float(w120h.max()), float(w120l.min())
+    fup = int(w120h.values.argmax() > w120l.values.argmin()) if flo > 0 and (fhi / flo - 1) >= 0.15 else None
+    g = lambda s, k=-1: num(s.iloc[k]) if len(s) >= -k and s.iloc[k] == s.iloc[k] else None
+    return [name, market, num(c.iloc[-1], 2), num((c.iloc[-1] / c.iloc[-2] - 1) * 100, 2), g(ma20), g(ma60),
+            (1 if len(ma60.dropna()) > 6 and ma60.iloc[-1] > ma60.iloc[-6] else -1), g(ma20 + 2 * sd), g(ma20 - 2 * sd),
+            num(rsi.iloc[-1], 1), num(atr.iloc[-1], 2), num(hist.iloc[-1], 3), num(hist.iloc[-2], 3),
+            num(h.iloc[-20:].max(), 2), num(l.iloc[-20:].min(), 2), num(h.iloc[-61:-1].max(), 2) if len(h) > 61 else None,
+            num(res, 2), num(sup, 2), "", None, num(fhi, 2), num(flo, 2), fup, ""]
+
+
+NEWS_POS = ["수주", "계약", "흑자", "최대 실적", "호실적", "상향", "신고가", "승인", "허가", "급등", "돌파", "증가", "매수", "기대", "협력", "출시",
+            "beat", "upgrade", "surge", "record", "approval", "raises", "rally", "buy rating", "strong"]
+NEWS_NEG = ["유상증자", "전환사채", "CB 발행", "적자", "손실", "하향", "급락", "소송", "횡령", "배임", "상장폐지", "관리종목", "거래정지", "감자",
+            "리콜", "부진", "매도", "우려", "경고", "조사", "벌금", "해킹", "downgrade", "miss", "plunge", "lawsuit", "probe", "recall", "cut", "sell rating", "warning"]
+
+
+def news_sentiment(items):
+    """제목 키워드로 본 뉴스 분위기 (단순 참고용 · AI 판단 아님)"""
+    pos = neg = 0
+    for x in items:
+        t = x["t"].lower()
+        pos += any(k.lower() in t for k in NEWS_POS)
+        neg += any(k.lower() in t for k in NEWS_NEG)
+    score = pos - neg
+    lab = "긍정" if score >= 2 else "부정" if score <= -2 else "약간 긍정" if score == 1 else "약간 부정" if score == -1 else "중립"
+    return dict(pos=pos, neg=neg, score=score, label=lab)
+
+
+def build_watch(wl, names, market, demo, dates=None):
+    """watchlist 종목: 미국·코인 요약값 + 모든 종목의 최근 2주 뉴스와 분위기"""
+    extra, news, namemap = {}, {}, {}
+    krw = (load_external(demo, dates) if dates is not None else EXT_CACHE.get("data", {})).get("krw")
+    for it in wl:
+        typ = it.get("type", "kr")
+        try:
+            if typ == "us":
+                tk = it["ticker"].upper()
+                key, nm = "US:" + tk, it.get("name") or tk
+                if demo:
+                    continue
+                df = fetch_yahoo_ohlc(tk)
+                if krw is not None and len(krw):
+                    fx = krw.reindex(krw.index.union(df.index)).ffill().reindex(df.index).bfill()
+                    for k in "ohlc":
+                        df[k] = df[k] * fx
+                s = snap_from_ohlc(df, nm, "미국")
+                q_ko, q_en = f'"{nm}" 주가', f'"{tk}" stock'
+            elif typ == "crypto":
+                sym = it["symbol"].upper()
+                key, nm = "CR:" + sym, it.get("name") or sym
+                if demo:
+                    continue
+                s = snap_from_ohlc(fetch_crypto_ohlc(sym), nm, "코인")
+                q_ko, q_en = f'"{nm}" 코인', f'"{sym}" crypto'
+            else:
+                key = it.get("code") or next((k for k, v in names.items() if str(v).replace(" ", "") == str(it.get("name", "")).replace(" ", "")), None)
+                nm = it.get("name") or names.get(key, key)
+                s, q_ko, q_en = None, f'"{nm}"', None
+                if not key:
+                    continue
+            if s:
+                extra[key] = s
+            namemap[key] = nm
+            items = [] if demo else gnews(q_ko, "ko", 14, 6)
+            if q_en and not demo:
+                items += gnews(q_en, "en", 7, 4)
+            news[key] = dict(items=items[:8], senti=news_sentiment(items))
+        except Exception as ex:
+            print(f"  watchlist {it} 실패: {str(ex)[:80]}", flush=True)
+    ok_ = sum(1 for it in wl if it.get("type") in ("us", "crypto"))
+    stat("내 종목 확장 (미국·코인·뉴스)", bool(extra) or not ok_, f"미국·코인 {len(extra)}/{ok_}개 · 뉴스 {len(news)}종목")
+    return extra, news, namemap
+
+
 # ───────────────────────────── 유튜브 채널 · 급등주 해부 ─────────────────────────────
 YT_CHANNEL = dict(name="한균수의 주식사용설명서", id="UCadSWH0pDXxEatvLHEHCWlg",
                   url="https://www.youtube.com/@%ED%95%9C%EA%B7%A0%EC%88%98%EC%9D%98%EC%A3%BC%EC%8B%9D%EC%82%AC%EC%9A%A9%EC%84%A4%EB%AA%85")
@@ -2361,7 +2527,7 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
     n = len(dates)
     cost = CFG["cost"]
     mk = pd.Series([market.get(x, "") for x in P["c"].columns], index=P["c"].columns)
-    okname = pd.Series([x.endswith("0") and (x in market) and "스팩" not in str(names.get(x, "")) for x in P["c"].columns], index=P["c"].columns)
+    okname = pd.Series([x.endswith("0") and market.get(x) in ("KOSPI", "KOSDAQ") and x not in ETF_SET and "스팩" not in str(names.get(x, "")) for x in P["c"].columns], index=P["c"].columns)
     mc_ok = mcap.reindex(P["c"].columns).fillna(np.inf) >= CFG["min_mcap"]
     VB = CFG["vb_filter"]
     rows, grid, sgrid = [], [], []
@@ -2574,7 +2740,7 @@ def build(demo=False, mode="file"):
     names = {t: str(namefn(t) or t) for t in c.index}
     hist = P["c"].iloc[-CFG["min_history"]:].notna().sum() >= CFG["min_history"]
     mask = (hist & (m["a"] >= CFG["min_amount"]) & (c >= CFG["min_price"]) & (P["v"].iloc[-1] > 0)
-            & codes.map(lambda t: t in market and t.endswith("0") and "스팩" not in names[t])
+            & codes.map(lambda t: t in market and market.get(t) in ("KOSPI", "KOSDAQ") and t not in ETF_SET and t.endswith("0") and "스팩" not in names[t])
             & (mcap.reindex(c.index).fillna(np.inf) >= CFG["min_mcap"]))
     uni = c.index[mask]
 
@@ -2733,7 +2899,7 @@ def build(demo=False, mode="file"):
     gainers = None
     try:
         lastchg = m["chg"]
-        gl = [t for t in lastchg[(lastchg >= 15) & (m["a"] >= 10e8)].sort_values(ascending=False).index if t.endswith("0")][:5]
+        gl = [t for t in lastchg[(lastchg >= 15) & (m["a"] >= 10e8)].sort_values(ascending=False).index if t.endswith("0") and t not in ETF_SET][:5]
         if demo and not gl:
             gl = list(lastchg.dropna().sort_values(ascending=False).index[:3])
         gstats = gainer_stats(P, I)
@@ -2765,6 +2931,13 @@ def build(demo=False, mode="file"):
                      picks_of.get(t, ""), num(m["rs"][t], 1),
                      num(m["fhi"][t]), num(m["flo"][t]), (1 if m["fup"][t] else 0) if bool(m["fbig"][t]) else None,
                      m["pat"][t]]
+
+    try:
+        wextra, wnews, wnames = build_watch(load_watchlist(), names, market, demo, P["c"].index)
+        allstk.update(wextra)
+    except Exception as ex:
+        print(f"  내 종목 확장 실패: {ex}", flush=True)
+        wextra, wnews, wnames = {}, {}, {}
 
     print("과거 성적 검증 중…", flush=True)
     try:
@@ -2820,14 +2993,26 @@ def build(demo=False, mode="file"):
         risk=risk, outlook=outlook, macro=macro,
         bt=bt, fc=fc, status=STATUS, review=rv, tips=tips, brief=brief, gen_iso=datetime.now().strftime("%Y-%m-%dT%H:%M"),
         tabs=tabs, all=allstk, news=news, yt=yt, gainers=gainers, smap=sector_map, sstocks=sector_stocks,
-        names={t: str(n) for t, n in getattr(namefn, "__self__", {}).items()},
+        names={**{t: str(n) for t, n in getattr(namefn, "__self__", {}).items()}, **wnames}, wnews=wnews, etfs=sorted(ETF_SET & set(allstk)),
         worker=os.environ.get("AI_WORKER_URL", "").strip(),
     )
+
+
+def save_status():
+    """원격 점검용: 데이터 수집 결과만 저장소 history/status.json 에 남김 (종목·금액 정보 없음)"""
+    try:
+        os.makedirs(HIST_DIR, exist_ok=True)
+        with open(os.path.join(HIST_DIR, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(dict(at=datetime.now().strftime("%Y-%m-%d %H:%M"), status=STATUS), f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
 
 
 def write_html(data, path):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=lambda o: o.item() if hasattr(o, "item") else str(o)).replace("</", "<\\/")
+    if not data.get("demo"):
+        save_status()
     if SITE_PASSWORD:
         enc = encrypt_text(payload, SITE_PASSWORD)
         boot = "const ENC=" + json.dumps(enc) + ";" + LOCK_JS
@@ -3603,6 +3788,13 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
 .lvchips{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:12.5px;margin-top:2px}
 .lvchips span{display:inline-flex;align-items:center;gap:4px;color:var(--c)} .lvchips i{width:8px;height:8px;border-radius:50%;background:var(--c)}
 .lvchips span.cur{font-weight:800}
+
+.acth{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline;margin:12px 0 6px;font-size:13px;color:var(--muted)}.acth b{font-size:14.5px;color:var(--ink)}
+.allai{width:100%;margin-top:12px}
+.keep{margin-top:12px;padding:12px 14px;border-radius:12px;background:var(--sunk);border-left:4px solid var(--line)}
+.keep.ok{border-left-color:var(--ok)}.keep.mid{border-left-color:var(--mid)}.keep.bad{border-left-color:var(--bad)}
+.keep .lab{font-size:12.5px;font-weight:700;color:var(--muted)}.keep .val{font-size:19px;font-weight:900}
+.keep.ok .val{color:var(--ok)}.keep.mid .val{color:var(--mid)}.keep.bad .val{color:var(--bad)}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -3645,13 +3837,14 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
   <section class="view" id="v-mine" hidden>
     <div class="vh"><h2>내 종목 <button class="q" data-help="mine" aria-label="설명 보기">?</button></h2></div>
     <div class="form">
-      <label>종목명 또는 코드<input id="fStock" list="stocklist" placeholder="예: 삼성전자" autocomplete="off"></label>
-      <label>수량 (주)<input id="fQty" type="number" inputmode="numeric" min="1" placeholder="100"></label>
+      <label>종목명 또는 코드<input id="fStock" list="stocklist" placeholder="예: 삼성전자 · KODEX 은선물 · 애플 · 수이" autocomplete="off"></label>
+      <label>계좌 (선택)<input id="fAcct" list="acctlist" placeholder="예: ISA, 연금, 토스" autocomplete="off"></label>
+      <label>수량 (주)<input id="fQty" type="number" inputmode="decimal" min="0" step="any" placeholder="100"></label>
       <label>평균 매입가 (원)<input id="fAvg" type="number" inputmode="numeric" min="1" placeholder="71000"></label>
       <span class="fbtns"><button class="btn" id="fCheck">점검</button><button class="btn ghost" id="fSave">저장</button></span>
       <p class="err" id="fErr" hidden></p>
     </div>
-    <datalist id="stocklist"></datalist>
+    <datalist id="stocklist"></datalist><datalist id="acctlist"></datalist>
     <div id="mylist"></div>
   </section>
 
@@ -4495,7 +4688,8 @@ function renderPanel(){
 function drawAll(){if(sheet.open&&SHEET_DRAW)SHEET_DRAW();}
 
 const KEY='my-holdings-v1';
-const loadH=()=>{try{return JSON.parse(localStorage.getItem(KEY))||[];}catch(_){return [];}};
+const hid=h=>h.code+'|'+(h.acct||'');
+const loadH=()=>{try{return (JSON.parse(localStorage.getItem(KEY))||[]).map(h=>Object.assign({acct:''},h,{id:hid(Object.assign({acct:''},h))}));}catch(_){return [];}};
 const saveH=h=>{try{localStorage.setItem(KEY,JSON.stringify(h));}catch(_){}};
 const NAMES=Object.assign({},D.names||{});Object.entries(D.all).forEach(([code,a])=>{if(!NAMES[code])NAMES[code]=a[0];});
 const byName={};Object.entries(NAMES).forEach(([code,n])=>{byName[n]=code;});
@@ -4530,7 +4724,9 @@ async function fetchSnap(code){
   catch(e){SNAP[code]=null;PENDING[code]='err:'+e.message;}
   rerender();
 }
-function findCode(q){q=q.trim();if(!q)return null;if(NAMES[q])return q;const m=q.match(/\((\w{6})\)/);if(m&&NAMES[m[1]])return m[1];
+function findCode(q){q=q.trim();if(!q)return null;if(NAMES[q])return q;
+  const U=q.toUpperCase();if(NAMES['US:'+U])return 'US:'+U;if(NAMES['CR:'+U])return 'CR:'+U;
+  const m2=q.match(/\(((?:US|CR):[A-Z0-9.\-]+)\)/);if(m2&&NAMES[m2[1]])return m2[1];const m=q.match(/\((\w{6})\)/);if(m&&NAMES[m[1]])return m[1];
   if(/^[0-9A-Z]{6}$/.test(q)&&AI_URL)return q;
   if(byName[q])return byName[q];const k=Object.keys(byName).find(n=>n.replace(/\s/g,'')===q.replace(/\s/g,''));return k?byName[k]:null;}
 
@@ -4582,7 +4778,8 @@ function lvBar(r){
     ${useLog?'<p class="vl" style="text-align:left;margin:2px 0 0;font-size:11px">가격 차이가 커서 눈금을 줄여 표시했습니다.</p>':''}</div>`;
 }
 function holdPrompt(r){
-  return `한국 주식 ${r.name}(${r.code}, ${r.mk})을 ${f0(r.qty)}주, 평균 ${f0(r.avg)}원에 보유하고 있어.\n`+
+  const kind=r.code.startsWith('US:')?'미국 주식':r.code.startsWith('CR:')?'가상자산':r.mk==='ETF'?'국내 ETF':'한국 주식';
+  return `${kind} ${r.name}(${r.code.replace(/^(US|CR):/,'')})을 ${fq(r.qty)}주, 평균 ${f0(r.avg)}원(원화 기준)에 보유하고 있어.\n`+
     `- 기준일 ${D.asof} 종가 ${f0(r.c)}원, 평가손익 ${pctS(r.pl)} (${f0(r.plAmt)}원)\n`+
     `- 차트 점검 결과: ${r.v}. 손절 참고 ${f0(r.stop)}원, 1차 목표 ${f0(r.t1)}원, 2차 목표 ${f0(r.t2)}원\n`+
     `- 차트 근거: ${r.why.slice(0,3).join(' ')}\n\n`+
@@ -4591,16 +4788,16 @@ function holdPrompt(r){
     `보유 / 일부 매도 / 전량 매도 중 어떤 전략이 좋을지 근거 3가지, 주요 리스크, 참고 기사 링크와 함께 알려줘.`;
 }
 function holdCard(h,saved){
-  const act=saved?`<button class="btn ghost sm danger" data-rm="${h.code}">🗑 삭제</button>`:`<button class="btn ghost sm" data-save="1">＋ 저장</button>`;
+  const act=saved?`<button class="btn ghost sm danger" data-rm="${hid(h)}">🗑 삭제</button>`:`<button class="btn ghost sm" data-save="1">＋ 저장</button>`;
   if(!snapOf(h.code)){
     const nm=esc(NAMES[h.code]||h.code),st=PENDING[h.code];
     if(AI_URL&&!st)setTimeout(()=>fetchSnap(h.code),0);
     const msg=!AI_URL?'오늘 아침 시세 수집에서 빠진 종목이라 차트 점검을 할 수 없습니다. 내일 아침 갱신 때 다시 확인해 주세요. 아래 AI 분석은 지금도 쓸 수 있습니다.':
       (typeof st==='string'&&st.startsWith('err:'))?'시세를 불러오지 못했습니다: '+esc(st.slice(4)):'시세를 불러오는 중입니다…';
-    const bp=`한국 주식 ${NAMES[h.code]||h.code}(${h.code})을 ${f0(h.qty)}주, 평균 ${f0(h.avg)}원에 보유하고 있어. `+
+    const bp=`한국 주식 ${NAMES[h.code]||h.code}(${h.code})을 ${fq(h.qty)}주, 평균 ${f0(h.avg)}원에 보유하고 있어. `+
       `현재 주가와 최근 차트 흐름(20일선·60일선, RSI, 거래량), 최근 한 달 국내 뉴스·공시와 Reuters·Bloomberg 같은 해외 영문 기사(영문은 한국어로 요약)를 웹에서 검색해서 `+
       `최근 한 달 주요 이슈를 날짜순으로 정리하고, 보유 / 일부 매도 / 전량 매도 중 어떤 전략이 좋을지 손절가·목표가, 근거 3가지, 리스크, 참고 기사 링크와 함께 알려줘.`;
-    return `<div class="hold"><div><div class="hdr"><div><b>${nm}</b> <span class="code">${esc(h.code)}</span> · ${f0(h.qty)}주 · 평단 ${f0(h.avg)}</div><span class="acts">${act}</span></div>
+    return `<div class="hold"><div><div class="hdr"><div><b>${nm}</b> <span class="code">${esc(h.code)}</span> · ${fq(h.qty)}주 · 평단 ${f0(h.avg)}</div><span class="acts">${act}</span></div>
       <p class="vl" style="text-align:left;margin:8px 0 0">${msg}</p></div><div>${aiSlot({prompt:bp,code:h.code,kind:'hold',key:`ai:${D.asof}:${h.code}:hx`,tone:'mid'})}</div></div>`;
   }
   const r=analyzeHolding(h.code,h.qty,h.avg);
@@ -4610,12 +4807,17 @@ function holdCard(h,saved){
       <div class="hdr"><div><div class="name" style="margin:0">${esc(r.name)} <span class="code tn">${r.code} ${r.mk}</span></div>
         <div class="price tn">${f0(r.c)}<span>${pct(r.chg)}</span></div></div><span class="acts">${act}</span></div>
       <dl class="pos-grid tn">
-        <div><dt>보유</dt><dd>${f0(r.qty)}주 · 평단 ${f0(r.avg)}</dd></div>
+        <div><dt>보유${h.acct?' · '+esc(h.acct):''}</dt><dd>${fq(r.qty)}주 · 평단 ${f0(r.avg)}</dd></div>
         <div><dt>평가금액</dt><dd>${f0(r.val)}원</dd></div>
         <div><dt>평가손익</dt><dd class="${r.pl>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</dd></div>
         <div><dt>수익률</dt><dd class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,2)}</dd></div>
       </dl>
       ${(()=>{const st=holdStatus(r);return `<div class="hprog">${progBar(st)}${st.al.map(a=>`<span class="alrt ${a[0]}">${a[1]} ${a[2]}</span>`).join('')}</div>`;})()}
+      ${(()=>{const kj=keepJudge(r.code,r.tone),W=(D.wnews||{})[r.code];
+        return `<div class="keep ${kj.c}"><div class="lab">📰 지속 투자 판단 <span class="vl">(차트 + 뉴스 키워드 · 참고용)</span></div><div class="val">${kj.v}</div>
+          ${W?`<p class="vl" style="text-align:left;margin:4px 0">최근 2주 뉴스 분위기: <b>${esc(W.senti.label)}</b> (긍정 ${W.senti.pos} · 부정 ${W.senti.neg}건)</p>
+            ${W.items.length?`<ul class="bl">${W.items.slice(0,5).map(x=>`<li><span class="dt tn">${esc(x.d||'')}</span>${x.en?'<span class="en">해외</span>':''}<a href="${esc(x.u)}" target="_blank" rel="noopener">${esc(x.t)}</a></li>`).join('')}</ul>`:''}`
+          :'<p class="vl" style="text-align:left;margin:4px 0">이 종목은 뉴스를 모으는 목록(watchlist)에 없어서 차트로만 판단했습니다. Claude에게 "내 종목 뉴스 목록에 추가해줘"라고 하시면 다음 날부터 뉴스도 반영됩니다.</p>'}</div>`;})()}
       <div class="hv"><div class="lab">📊 차트 기준 전략 <button class="q" data-help="hold" aria-label="설명 보기">?</button></div><div class="val ${r.tone}">${r.v}</div></div>
       <div class="plan"><b>실행 계획 (예시)</b>${r.plan}${r.tips.map(t=>`<br>· ${t}`).join('')}</div>
       <div style="margin-top:12px">${aiSlot({prompt:holdPrompt(r),code:r.code,kind:'hold',key:`ai:${D.asof}:${r.code}:h${r.qty}:${r.avg}`,tone:r.tone==='no'?'bad':r.tone})}</div>
@@ -4640,7 +4842,8 @@ function renderMine(){
   let tot=0,cost=0;list.forEach(h=>{if(snapOf(h.code)){const r=analyzeHolding(h.code,h.qty,h.avg);tot+=r.val;cost+=r.avg*r.qty;}else if(AI_URL&&!PENDING[h.code])setTimeout(()=>fetchSnap(h.code),0);});
   const pl=tot-cost;
   box.innerHTML=`<div class="msum tn"><span>저장 ${list.length}종목</span><span>평가 ${f0(tot)}원</span><b class="${pl>=0?'upc':'downc'}">${pl>=0?'+':''}${f0(pl)}원</b></div>
-    <div class="mlist">${list.map(h=>holdRowHTML(h,true)).join('')}</div>${cfgHTML()}
+    ${groupedHTML(list,true)}
+    <button class="btn ai allai" data-allai="1">🤖 내 종목 전체 AI 점검 (최근 뉴스로 지속 투자 판단)</button>${cfgHTML()}
     <p class="vl" style="text-align:left;margin-top:6px">종목을 누르면 자세한 점검이 열리고, ✕를 누르면 목록에서 지워집니다.</p>`;
 }
 function rerender(){renderMine();if(location.hash==='#home'||location.hash===''||!location.hash)renderHome();}
@@ -4684,17 +4887,45 @@ function progBar(st){
   return `<div class="pgb"><div class="pgt"><i class="${st.prog>=st.cf.tgt?'hot':st.prog<0?'neg':''}" style="width:${v}%"></i><s style="left:${st.cf.tgt}%" title="알림 기준 ${st.cf.tgt}%"></s></div>
     <span class="tn">${st.lab} <b>${st.prog<0?'평단 아래':Math.round(st.prog)+'%'}</b></span></div>`;
 }
+const fq=x=>x==null?'-':(Math.abs(x%1)>1e-9?(+x).toLocaleString('ko-KR',{maximumFractionDigits:4}):f0(x));
+/* 뉴스 + 차트로 본 '지속 투자' 판단 (규칙 기반 · 참고용) */
+function keepJudge(code,tone){
+  const W=(D.wnews||{})[code],sl=W?W.senti.label:null,neg=W&&W.senti.score<=-1,pos=W&&W.senti.score>=1;
+  let v,c;
+  if(tone==='no')[v,c]=neg?['정리 검토','bad']:['비중 축소 검토','bad'];
+  else if(tone==='mid')[v,c]=neg?['비중 축소 검토','bad']:pos?['보유 유지','ok']:['관망 (보유)','mid'];
+  else [v,c]=neg?['보유 · 악재 확인','mid']:['지속 투자','ok'];
+  return {v,c,news:sl,has:!!W};
+}
 function holdRowHTML(h,del){
-  const nm=esc(NAMES[h.code]||h.code);
-  if(!snapOf(h.code))return `<div class="mrow"><button class="mmain" data-hold="${h.code}"><span class="pn"><b>${nm}</b><small>${f0(h.qty)}주 · 평단 ${f0(h.avg)}</small></span><span class="vl">데이터 없음</span></button>${del?`<button class="del" data-rm="${h.code}" aria-label="${nm} 삭제">✕</button>`:''}</div>`;
-  const r=analyzeHolding(h.code,h.qty,h.avg),st=holdStatus(r);
-  return `<div class="mrow"><button class="mmain hold2 ${st.al.length?'al-'+st.al[0][0]:''}" data-hold="${h.code}">
-      <span class="pn"><b>${esc(r.name)}</b><small class="tn">${f0(r.qty)}주 · 평단 ${f0(r.avg)} · 현재 ${f0(r.c)}</small></span>
+  const nm=esc(NAMES[h.code]||h.code),id=hid(h);
+  if(!snapOf(h.code))return `<div class="mrow"><button class="mmain" data-hold="${id}"><span class="pn"><b>${nm}</b><small>${fq(h.qty)}주 · 평단 ${f0(h.avg)}${h.acct?' · '+esc(h.acct):''}</small></span><span class="vl">데이터 없음</span></button>${del?`<button class="del" data-rm="${id}" aria-label="${nm} 삭제">✕</button>`:''}</div>`;
+  const r=analyzeHolding(h.code,h.qty,h.avg),st=holdStatus(r),kj=keepJudge(h.code,r.tone);
+  return `<div class="mrow"><button class="mmain hold2 ${st.al.length?'al-'+st.al[0][0]:''}" data-hold="${id}">
+      <span class="pn"><b>${esc(r.name)}</b><small class="tn">${fq(h.qty)}주 · 평단 ${f0(r.avg)} · 현재 ${f0(r.c)}</small></span>
       <span class="mpl tn"><b class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,1)}</b><small class="${r.plAmt>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</small></span>
-      <span class="chip ${r.tone}">${r.v}</span>
-      <span class="hfull">${progBar(st)}<span class="hlv tn">목표 <b class="upc">${f0(r.t1)}</b> (${pctS(st.toT,1)}) · 손절 <b class="downc">${f0(r.stop)}</b> (−${st.toS.toFixed(1)}%)</span>
+      <span class="chip ${kj.c==='bad'?'no':kj.c}">${kj.v}</span>
+      <span class="hfull">${progBar(st)}<span class="hlv tn">목표 <b class="upc">${f0(r.t1)}</b> (${pctS(st.toT,1)}) · 손절 <b class="downc">${f0(r.stop)}</b> (−${st.toS.toFixed(1)}%)${kj.news?` · 뉴스 ${kj.news}`:''}</span>
         ${st.al.map(a=>`<span class="alrt ${a[0]}">${a[1]} ${a[2]}</span>`).join('')}</span></button>
-    ${del?`<button class="del" data-rm="${h.code}" aria-label="${esc(r.name)} 삭제">✕</button>`:''}</div>`;
+    ${del?`<button class="del" data-rm="${id}" aria-label="${esc(r.name)} 삭제">✕</button>`:''}</div>`;
+}
+/* 계좌별로 묶어서 보여주기 */
+function groupedHTML(list,del){
+  const g={};list.forEach(h=>{(g[h.acct||'계좌 미지정']=g[h.acct||'계좌 미지정']||[]).push(h);});
+  const keys=Object.keys(g);
+  return keys.map(k=>{let tot=0,cost=0;g[k].forEach(h=>{if(snapOf(h.code)){const r=analyzeHolding(h.code,h.qty,h.avg);tot+=r.val;cost+=r.avg*r.qty;}});const pl=tot-cost;
+    return `${keys.length>1||k!=='계좌 미지정'?`<div class="acth tn"><b>${esc(k)}</b><span>${g[k].length}종목 · 평가 ${f0(tot)}원</span><span class="${pl>=0?'upc':'downc'}">${pl>=0?'+':''}${f0(pl)}원 (${cost?pctS(pl/cost*100,1):'-'})</span></div>`:''}
+      <div class="mlist">${g[k].map(h=>holdRowHTML(h,del)).join('')}</div>`;}).join('');
+}
+/* 내 종목 전체를 한 번에 Claude에게 */
+function allPrompt(){
+  const L=loadH();if(!L.length)return '';
+  const rows=L.map(h=>{const nm=NAMES[h.code]||h.code;if(!snapOf(h.code))return `- [${h.acct||'-'}] ${nm}: ${fq(h.qty)}주, 평단 ${f0(h.avg)}원 (대시보드 데이터 없음)`;
+    const r=analyzeHolding(h.code,h.qty,h.avg),kj=keepJudge(h.code,r.tone),W=(D.wnews||{})[h.code];
+    return `- [${h.acct||'-'}] ${nm}(${h.code.replace(/^(US|CR):/,'')}): ${fq(h.qty)}주, 평단 ${f0(h.avg)}원, 현재 ${f0(r.c)}원, 손익 ${pctS(r.pl,1)} / 차트 판단 ${r.v}, 목표 ${f0(r.t1)}원·손절 ${f0(r.stop)}원 / 규칙 판단 ${kj.v}`+(W&&W.items.length?` / 최근 뉴스: ${W.items.slice(0,2).map(x=>x.t).join(' | ')}`:'');}).join('\n');
+  return `내 보유 종목 전체야 (${D.asof} 종가 기준, 금액은 원화).\n${rows}\n\n`+
+    `종목마다 최근 2주~한 달 국내·해외 뉴스와 공시를 웹에서 검색해서 ①지속 투자 / 비중 축소 / 정리 중 하나로 의견을 내고 ②근거 2~3가지 ③주의할 리스크 ④참고 기사 링크를 알려줘. `+
+    `마지막에 포트폴리오 전체로 봤을 때 한쪽에 너무 쏠려 있는지, 손실이 큰 종목을 어떻게 다루면 좋을지도 정리해줘.`;
 }
 function cfgHTML(){const cf=loadCfg();
   return `<details class="cfgbox"><summary>🔔 알림 기준 설정 <span class="vl">목표 ${cf.tgt}% · 손절 ${cf.stop}% 이내</span></summary>
@@ -4713,8 +4944,9 @@ function myHomeHTML(){
   rows.sort((a,b)=>rank(a)-rank(b)||((b.s&&b.s.prog)||-999)-((a.s&&a.s.prog)||-999));
   const alerts=rows.filter(x=>x.s&&x.s.al.length);
   return `<div class="card wide mine1"><div class="ch"><h3>💼 내 종목 ${alerts.length?`<span class="abadge">🔔 ${alerts.length}</span>`:''}</h3><a class="more" href="#mine">＋ 추가 · 관리</a></div>
-    ${alerts.length?`<div class="alist">${alerts.map(x=>`<button class="alrow ${x.s.al[0][0]}" data-hold="${x.h.code}"><b>${esc(NAMES[x.h.code]||x.h.code)}</b>${x.s.al.map(a=>`<span>${a[1]} ${a[2]}</span>`).join('')}</button>`).join('')}</div>`:'<p class="vl" style="text-align:left;margin:0 0 8px">지금은 목표가 근접·손절가 근접 종목이 없습니다.</p>'}
-    <div class="mlist">${rows.map(x=>holdRowHTML(x.h,false)).join('')}</div>${cfgHTML()}</div>`;
+    ${alerts.length?`<div class="alist">${alerts.map(x=>`<button class="alrow ${x.s.al[0][0]}" data-hold="${hid(x.h)}"><b>${esc(NAMES[x.h.code]||x.h.code)}</b>${x.s.al.map(a=>`<span>${a[1]} ${a[2]}</span>`).join('')}</button>`).join('')}</div>`:'<p class="vl" style="text-align:left;margin:0 0 8px">지금은 목표가 근접·손절가 근접 종목이 없습니다.</p>'}
+    ${groupedHTML(rows.map(x=>x.h),false)}
+    <button class="btn ai allai" data-allai="1">🤖 내 종목 전체 AI 점검 (최근 뉴스로 지속 투자 판단)</button>${cfgHTML()}</div>`;
 }
 function renderHome(){
   const box=document.getElementById('v-home'),W=weather(),R=D.risk||{},q=(D.brief&&D.brief.quick)||[],FC=D.fc&&(D.fc.KOSPI||D.fc.KOSDAQ),SW=stateWeather();
@@ -4778,25 +5010,27 @@ document.addEventListener('click',e=>{
   const yv=e.target.closest('[data-vid]');if(yv){openVideo(+yv.dataset.vid);return;}
   const ys=e.target.closest('[data-yts]');if(ys){openYtStock(ys.dataset.yts);return;}
   const pk=e.target.closest('[data-pick]');if(pk){const [k,i]=pk.dataset.pick.split(':').map(Number);openPick(k,i);return;}
-  const hd=e.target.closest('[data-hold]');if(hd){const h=loadH().find(x=>x.code===hd.dataset.hold);if(h)openHold(h);return;}
+  const al=e.target.closest('[data-allai]');if(al){const t=allPrompt();if(t)askAI(t);return;}
+  const hd=e.target.closest('[data-hold]');if(hd){const h=loadH().find(x=>x.id===hd.dataset.hold||x.code===hd.dataset.hold);if(h)openHold(h);return;}
   const rm=e.target.closest('[data-rm]');
-  if(rm){const code=rm.dataset.rm,nm=NAMES[code]||code;if(!confirm(`${nm}을(를) 내 종목에서 삭제할까요?`))return;
-    saveH(loadH().filter(h=>h.code!==code));if(sheet.open)sheet.close();rerender();return;}
+  if(rm){const id=rm.dataset.rm,code=id.split('|')[0],nm=NAMES[code]||code;if(!confirm(`${nm}을(를) 내 종목에서 삭제할까요?`))return;
+    saveH(loadH().filter(h=>h.id!==id&&h.code!==id).map(({id:_,...x})=>x));if(sheet.open)sheet.close();rerender();return;}
   const sv=e.target.closest('[data-save]');
-  if(sv&&CHECK){const l=loadH().filter(h=>h.code!==CHECK.code);l.unshift(CHECK);saveH(l);rerender();openHold(CHECK);return;}
+  if(sv&&CHECK){const l=loadH().filter(h=>h.id!==hid(CHECK)).map(({id:_,...x})=>x);l.unshift(CHECK);saveH(l);rerender();openHold(Object.assign({id:hid(CHECK)},CHECK));return;}
 });
 function initHolds(){
   const dl=document.getElementById('stocklist');
   dl.innerHTML=Object.entries(NAMES).map(([code,n])=>`<option value="${esc(n)} (${code})"></option>`).join('');
   const err=document.getElementById('fErr');
   const read=()=>{
-    const code=findCode(document.getElementById('fStock').value),qty=+document.getElementById('fQty').value,avg=+document.getElementById('fAvg').value;
-    const bad=!code?'종목을 찾지 못했습니다. 목록에서 고르거나 6자리 코드로 입력해 주세요.':!(qty>0)?'수량을 입력해 주세요.':!(avg>0)?'평균 매입가를 입력해 주세요.':'';
-    err.hidden=!bad;err.textContent=bad;return bad?null:{code,qty,avg};
+    const code=findCode(document.getElementById('fStock').value),qty=+document.getElementById('fQty').value,avg=+document.getElementById('fAvg').value,acct=document.getElementById('fAcct').value.trim();
+    const bad=!code?'종목을 찾지 못했습니다. 목록에서 고르거나 6자리 코드·미국 티커(예: AAPL)로 입력해 주세요. 목록에 없는 미국 주식·코인은 Claude에게 추가를 요청하세요.':!(qty>0)?'수량을 입력해 주세요.':!(avg>0)?'평균 매입가를 입력해 주세요 (원화).':'';
+    err.hidden=!bad;err.textContent=bad;return bad?null:{code,qty,avg,acct};
   };
   const clear=()=>['fStock','fQty','fAvg'].forEach(id=>document.getElementById(id).value='');
   document.getElementById('fCheck').onclick=()=>{const h=read();if(!h)return;CHECK=h;openHold(h);};
-  document.getElementById('fSave').onclick=()=>{const h=read();if(!h)return;CHECK=h;const l=loadH().filter(x=>x.code!==h.code);l.unshift(h);saveH(l);clear();rerender();openHold(h);};
+  document.getElementById('fSave').onclick=()=>{const h=read();if(!h)return;CHECK=h;const l=loadH().filter(x=>x.id!==hid(h)).map(({id:_,...x})=>x);l.unshift(h);saveH(l);clear();rerender();openHold(Object.assign({id:hid(h)},h));};
+  document.getElementById('acctlist').innerHTML=[...new Set(['ISA','연금저축','위탁','토스','빗썸',...loadH().map(h=>h.acct).filter(Boolean)])].map(a=>`<option value="${esc(a)}"></option>`).join('');
   renderMine();
 }
 
