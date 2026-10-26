@@ -1707,7 +1707,7 @@ def news_sentiment(items):
 
 def build_watch(wl, names, market, demo, dates=None):
     """watchlist 종목: 미국·코인 요약값 + 모든 종목의 최근 2주 뉴스와 분위기"""
-    extra, news, namemap = {}, {}, {}
+    extra, news, namemap, dfs = {}, {}, {}, {}
     krw = (load_external(demo, dates) if dates is not None else EXT_CACHE.get("data", {})).get("krw")
     for it in wl:
         typ = it.get("type", "kr")
@@ -1723,13 +1723,16 @@ def build_watch(wl, names, market, demo, dates=None):
                     for k in "ohlc":
                         df[k] = df[k] * fx
                 s = snap_from_ohlc(df, nm, "미국")
+                dfs[key] = df
                 q_ko, q_en = f'"{nm}" 주가', f'"{tk}" stock'
             elif typ == "crypto":
                 sym = it["symbol"].upper()
                 key, nm = "CR:" + sym, it.get("name") or sym
                 if demo:
                     continue
-                s = snap_from_ohlc(fetch_crypto_ohlc(sym), nm, "코인")
+                dfc = fetch_crypto_ohlc(sym)
+                s = snap_from_ohlc(dfc, nm, "코인")
+                dfs[key] = dfc
                 q_ko, q_en = f'"{nm}" 코인', f'"{sym}" crypto'
             else:
                 key = it.get("code") or next((k for k, v in names.items() if str(v).replace(" ", "") == str(it.get("name", "")).replace(" ", "")), None)
@@ -1748,7 +1751,7 @@ def build_watch(wl, names, market, demo, dates=None):
             print(f"  watchlist {it} 실패: {str(ex)[:80]}", flush=True)
     ok_ = sum(1 for it in wl if it.get("type") in ("us", "crypto"))
     stat("내 종목 확장 (미국·코인·뉴스)", bool(extra) or not ok_, f"미국·코인 {len(extra)}/{ok_}개 · 뉴스 {len(news)}종목")
-    return extra, news, namemap
+    return extra, news, namemap, dfs
 
 
 # ───────────────────────────── 유튜브 채널 · 급등주 해부 ─────────────────────────────
@@ -2824,7 +2827,7 @@ def build(demo=False, mode="file"):
         tabs.append(dict(k=k, name=STRATS[k], stocks=stocks, loss=loss))
 
     # ── 유튜브 언급 종목 · 어제의 급등주를 우리 방식으로 분석 ──
-    def light_entry(t, k=None):
+    def light_entry(t, k=None, with_series=True):
         if k is None:
             sc_ = {kk: float(ev["scores"].loc[t, f"s{kk}"]) + sum(float(d[t]) for _, d, _ in ev["aux"][kk]) for kk in (1, 2, 3)}
             k = max(sc_, key=sc_.get)
@@ -2839,9 +2842,13 @@ def build(demo=False, mode="file"):
                  checks=[dict(label=lb, s=num(s_[t], 2), v=safe(fn, t)) for lb, _, s_, fn in ev["checks"][k]], aux=aux,
                  tg=dict(t1=num(tg["t1"]), t2=num(tg["t2"]), stop=num(tg["stop"]), rr=num(tg["rr"], 2), t1p=num(tg["t1p"], 1),
                          t2p=num(tg["t2p"], 1), sp=num(tg["sp"], 1), note=tg["note"], stop_label=tg["stop_label"]),
-                 series=series(t, tg), read=chart_read(t, ev))
+                 series=(series(t, tg) if with_series else None), read=chart_read(t, ev))
         e["plan"] = plan_for(k, t, ev, tg)
-        e["series"].update(b1=e["plan"]["b1"], b2=e["plan"]["b2"])
+        if with_series:
+            e["series"].update(b1=e["plan"]["b1"], b2=e["plan"]["b2"])
+        else:
+            e.pop("series")
+            e["fib"] = fib_levels(t, m)
         e["prompt"] = ai_prompt(e, asof)
         return e
 
@@ -2933,11 +2940,34 @@ def build(demo=False, mode="file"):
                      m["pat"][t]]
 
     try:
-        wextra, wnews, wnames = build_watch(load_watchlist(), names, market, demo, P["c"].index)
+        wextra, wnews, wnames, wdfs = build_watch(load_watchlist(), names, market, demo, P["c"].index)
         allstk.update(wextra)
     except Exception as ex:
         print(f"  내 종목 확장 실패: {ex}", flush=True)
-        wextra, wnews, wnames = {}, {}, {}
+        wextra, wnews, wnames, wdfs = {}, {}, {}, {}
+
+    # ── 종목별 파일: 어떤 종목을 눌러도 같은 분석 + 차트 (누를 때만 불러옴) ──
+    charts = {}
+    try:
+        sl_ = slice(-130, None)
+        dlist = [x.strftime("%Y-%m-%d") for x in P["c"].index[sl_]]
+        cols = {k: P[k].iloc[sl_] for k in "ohlcv"}
+        for t in c.index:
+            if c[t] != c[t]:
+                continue
+            ser = dict(d=dlist, **{k: [num(v_) for v_ in cols[k][t].to_numpy(float)] for k in "ohlcv"})
+            try:
+                e = light_entry(t, with_series=False)
+            except Exception:
+                e = None
+            charts[t] = dict(s=ser, e=e)
+        for key, df in wdfs.items():
+            df = df.iloc[-130:]
+            nd = 0 if float(df["c"].iloc[-1]) >= 100 else 2
+            charts[key] = dict(s=dict(d=[x.strftime("%Y-%m-%d") for x in df.index], **{k: [num(v_, nd if k != "v" else 0) for v_ in df[k].to_numpy(float)] for k in "ohlcv"}), e=None)
+        stat("종목별 차트·분석 파일", True, f"{len(charts)}종목")
+    except Exception as ex:
+        print(f"  종목별 파일 실패: {ex}", flush=True)
 
     print("과거 성적 검증 중…", flush=True)
     try:
@@ -2992,7 +3022,7 @@ def build(demo=False, mode="file"):
         regime_now=regime_now, weak={k_: True for k_ in weak_strats(bt, regime_now)},
         risk=risk, outlook=outlook, macro=macro,
         bt=bt, fc=fc, status=STATUS, review=rv, tips=tips, brief=brief, gen_iso=datetime.now().strftime("%Y-%m-%dT%H:%M"),
-        tabs=tabs, all=allstk, news=news, yt=yt, gainers=gainers, smap=sector_map, sstocks=sector_stocks,
+        _charts=charts, tabs=tabs, all=allstk, news=news, yt=yt, gainers=gainers, smap=sector_map, sstocks=sector_stocks,
         names={**{t: str(n) for t, n in getattr(namefn, "__self__", {}).items()}, **wnames}, wnews=wnews, etfs=sorted(ETF_SET & set(allstk)),
         worker=os.environ.get("AI_WORKER_URL", "").strip(),
     )
@@ -3008,8 +3038,33 @@ def save_status():
         pass
 
 
+def write_charts(charts, out_dir, data):
+    import base64
+    import hashlib
+    cdir = os.path.join(out_dir, "charts")
+    os.makedirs(cdir, exist_ok=True)
+    key = None
+    if SITE_PASSWORD:
+        salt = os.urandom(16)
+        key = hashlib.pbkdf2_hmac("sha256", SITE_PASSWORD.encode("utf-8"), salt, PBKDF2_ITER, 32)
+        data["chs"] = dict(s=base64.b64encode(salt).decode(), it=PBKDF2_ITER)
+        aes = _aes()(key)
+    for code, obj in charts.items():
+        txt = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=lambda o: o.item() if hasattr(o, "item") else str(o))
+        if key:
+            iv = os.urandom(12)
+            txt = json.dumps(dict(i=base64.b64encode(iv).decode(), c=base64.b64encode(aes.encrypt(iv, txt.encode("utf-8"), None)).decode()))
+        with open(os.path.join(cdir, code.replace(":", "_") + ".json"), "w", encoding="utf-8") as f:
+            f.write(txt)
+
+
 def write_html(data, path):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    charts = data.pop("_charts", None) or {}
+    if data.get("demo"):
+        data["chartsInline"] = charts              # 미리보기(파일로 열기)에서는 페이지 안에 넣음
+    elif charts:
+        write_charts(charts, os.path.dirname(os.path.abspath(path)), data)
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=lambda o: o.item() if hasattr(o, "item") else str(o)).replace("</", "<\\/")
     if not data.get("demo"):
         save_status()
@@ -3106,7 +3161,7 @@ LOCK_JS = r"""
   async function tryOpen(pw,remember){
     try{const data=await open_(pw);
       try{if(remember)localStorage.setItem('site-pass',pw);else localStorage.removeItem('site-pass');}catch(_){}
-      lock.hidden=true;document.body.classList.remove('locked');APP(data);return true;}
+      window.__SITEPW=pw;lock.hidden=true;document.body.classList.remove('locked');APP(data);return true;}
     catch(_){return false;}
   }
   let saved=null;try{saved=localStorage.getItem('site-pass');}catch(_){}
@@ -3795,6 +3850,16 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
 .keep.ok{border-left-color:var(--ok)}.keep.mid{border-left-color:var(--mid)}.keep.bad{border-left-color:var(--bad)}
 .keep .lab{font-size:12.5px;font-weight:700;color:var(--muted)}.keep .val{font-size:19px;font-weight:900}
 .keep.ok .val{color:var(--ok)}.keep.mid .val{color:var(--mid)}.keep.bad .val{color:var(--bad)}
+
+.hchart{margin-top:14px}.hchart .chartbox{min-height:200px}
+.entbox{margin-top:16px;padding-top:12px;border-top:1px dashed var(--line)}
+
+.iebar{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 4px}
+.impbox{display:grid;gap:10px}.impbox h3{margin:0;display:flex;gap:8px;align-items:center;padding-right:46px}
+.impbox textarea,.impbox input[type=password]{font:inherit;font-size:14px;padding:10px;border-radius:10px;border:1.5px solid var(--line);background:var(--sunk);color:var(--ink);width:100%}
+.impmode{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13.5px}
+.okmsg{color:var(--ok);font-weight:700}
+.pbox{background:var(--sunk);border-radius:10px;padding:10px;margin:8px 0}.pbox pre{white-space:pre-wrap;font-size:12px;margin:0 0 8px}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -3845,6 +3910,7 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
       <p class="err" id="fErr" hidden></p>
     </div>
     <datalist id="stocklist"></datalist><datalist id="acctlist"></datalist>
+    <div class="iebar"><button class="btn ghost sm" data-imp="1">📥 가져오기</button><button class="btn ghost sm" data-exp="1">📤 내보내기 (암호 파일)</button><button class="btn ghost sm" data-help="import">📸 사진으로 등록하는 법</button></div>
     <div id="mylist"></div>
   </section>
 
@@ -4228,6 +4294,18 @@ const HELP={
       <h5>과거 패턴 계산</h5><p><b>일정 전 5일</b> = 일정 전날 종가 ÷ 6거래일 전 종가 − 1 · <b>일정 후 5일</b> = 일정 후 4거래일 종가 ÷ 일정 전날 종가 − 1. 관련 섹터 대표 ETF(시장 전체 일정은 코스피)로 과거 약 5년간 같은 일정을 모아 평균과 상승 비율을 냅니다. 표본이 3번 미만이면 표시하지 않습니다.</p>
       <h5>5일 전망 모델에 들어가는 값</h5><p>섹터 일정이 5거래일 안에 있는지, 시장 전체 일정이 5거래일 안에 있는지, 섹터 일정 직후인지, 실적 시즌인지 4가지를 입력으로 넣습니다.</p>
       <h5>일정 추가하기</h5><p>GitHub 저장소에 <b>events.json</b> 파일을 만들고 <code>[{"date":"2027-05-20","name":"행사명","sectors":["반도체"]}]</code> 형식으로 적으면 다음 실행부터 반영됩니다. 섹터 이름은 표의 섹터 이름과 같게 쓰고, 시장 전체 일정은 <code>"*"</code>로 씁니다. 몇 달에 한 번 Claude에게 "일정 업데이트해줘"라고 하시면 다시 검색해서 채워 드립니다.</p>`],
+  import:['📸 사진으로 내 종목 등록 · 기기 옮기기',()=>`<h5>캡처 사진으로 한 번에 등록하기</h5>
+      <ol><li>증권앱(키움·토스 등)과 코인앱의 <b>잔고 화면을 캡처</b>합니다. 계좌가 여러 개면 계좌마다 캡처하세요.</li>
+      <li><b>Claude 앱</b>을 열고 캡처 사진들을 올린 뒤, 아래 <b>요청 문장</b>을 붙여넣고 보냅니다.</li>
+      <li>Claude가 <code>STOCKS1:[...]</code>로 시작하는 코드를 만들어 줍니다. <b>코드 전체를 복사</b>합니다.</li>
+      <li>여기 <b>내 종목 → 📥 가져오기</b>를 누르고 코드를 붙여넣은 뒤 <b>가져오기</b>를 누르면 끝입니다.</li></ol>
+      <div class="pbox"><pre>${esc(PHOTO_PROMPT)}</pre><button class="btn sm" data-copyprompt="1">📋 요청 문장 복사</button></div>
+      <p>가져온 뒤 수량·평단이 맞는지 한 번 확인해 주세요. 목록에 없는 미국 주식·코인은 "찾지 못한 종목"으로 알려줍니다.</p>
+      <h5>폰 ↔ PC 옮기기 (암호 파일)</h5>
+      <ol><li>옮길 기기에서 <b>📤 내보내기</b> → 비밀번호를 정하면 <b>암호 파일</b>이 내려받아집니다(파일 저장이 안 되면 나오는 코드를 복사).</li>
+      <li>파일(또는 코드)을 카톡 "나에게 보내기"·메일 등으로 다른 기기에 보냅니다.</li>
+      <li>다른 기기에서 <b>📥 가져오기</b> → 파일 선택(또는 코드 붙여넣기) → 비밀번호 입력 → 가져오기.</li></ol>
+      <p>암호 파일은 정한 비밀번호 없이는 내용을 볼 수 없습니다(AES-256). 비밀번호를 잊으면 열 수 없으니 기억해 두세요.</p>`],
   sector:['섹터 대장주',()=>`<p>섹터마다 그 업종을 대표하는 큰 종목들 중 <b>시가총액이 큰 순서로 5개</b>를 보여줍니다. 후보 목록은 프로그램 안 SECTOR_LEADERS에 적어 두었고, 바뀌면 그 목록만 고치면 됩니다.</p>
       <ul><li><b>5일 · 20일</b>: 최근 등락률</li><li><b>판정</b>: 차트 추세·과열·세력 이탈 패턴으로 붙인 우리 의견(긍정적 / 관망 / 추격 주의 / 주의)</li>
       <li>종목을 누르면 세 전략 중 가장 잘 맞는 전략 기준의 점수·매매 포인트·결론·차트가 열립니다.</li></ul>
@@ -4243,6 +4321,120 @@ helpDlg.addEventListener('click',e=>{if(e.target===helpDlg)helpDlg.close();});
 
 
 
+
+/* ───── 종목별 파일 (차트 + 분석): 누를 때만 불러오기 ───── */
+const FCACHE={};let CKEY=null;
+const b64u=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+async function chartKey(){
+  if(CKEY||!D.chs)return CKEY;
+  const base=await crypto.subtle.importKey('raw',new TextEncoder().encode(window.__SITEPW||''),'PBKDF2',false,['deriveKey']);
+  CKEY=await crypto.subtle.deriveKey({name:'PBKDF2',salt:b64u(D.chs.s),iterations:D.chs.it,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['decrypt']);
+  return CKEY;
+}
+async function loadStock(code){
+  if(FCACHE[code])return FCACHE[code];
+  if(D.chartsInline){return FCACHE[code]=D.chartsInline[code]||null;}
+  try{const r=await fetch('charts/'+code.replace(':','_')+'.json',{cache:'force-cache'});if(!r.ok)return null;let j=await r.json();
+    if(D.chs){const k=await chartKey();const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64u(j.i)},k,b64u(j.c));j=JSON.parse(new TextDecoder().decode(pt));}
+    return FCACHE[code]=j;}catch(_){return null;}
+}
+/* 시가·고가·저가·종가·거래량만 받아서 차트용 지표를 계산 (파이썬과 같은 공식) */
+function buildSeries(s,lines){
+  const n=s.c.length,c=s.c,ma=(a,p,i)=>{if(i<p-1)return null;let t=0;for(let j=i-p+1;j<=i;j++)t+=a[j];return t/p;};
+  const bbm=[],bbu=[],bbl=[],ma60=[],vma=[],rsi=[],hist=[];
+  let au=0,ad=0,e12=c[0],e26=c[0],sig=0;
+  for(let i=0;i<n;i++){
+    const m=ma(c,20,i);bbm.push(m);
+    if(m!=null){let v=0;for(let j=i-19;j<=i;j++)v+=(c[j]-m)**2;const sd=Math.sqrt(v/20);bbu.push(m+2*sd);bbl.push(m-2*sd);}else{bbu.push(null);bbl.push(null);}
+    ma60.push(ma(c,60,i));vma.push(ma(s.v,20,i));
+    if(i>0){const d=c[i]-c[i-1];au=(au*13+Math.max(d,0))/14;ad=(ad*13+Math.max(-d,0))/14;rsi.push(ad?100-100/(1+au/ad):100);}else rsi.push(null);
+    e12=e12+(c[i]-e12)*2/13;e26=e26+(c[i]-e26)*2/27;const mc=e12-e26;sig=i?sig+(mc-sig)*2/10:mc;hist.push(mc-sig);
+  }
+  const k=Math.max(0,n-100),cut=a=>a.slice(k);
+  const hi=Math.max(...s.h.slice(-120)),lo=Math.min(...s.l.slice(-120)),ih=s.h.slice(-120).indexOf(hi),il=s.l.slice(-120).indexOf(lo);
+  const fib=lo>0&&hi/lo-1>=.15?[.382,.5,.618].map(r=>[`${r*100}%`,Math.round(ih>il?hi-(hi-lo)*r:lo+(hi-lo)*r)]):null;
+  return Object.assign({d:cut(s.d),o:cut(s.o),h:cut(s.h),l:cut(s.l),c:cut(c),v:cut(s.v),bbu:cut(bbu),bbm:cut(bbm),bbl:cut(bbl),ma60:cut(ma60),vma:cut(vma),rsi:cut(rsi),hist:cut(hist),fib},lines||{});
+}
+async function drawLazy(code,lines){
+  const box=sheet.querySelector('.chartbox');if(!box)return null;
+  box.innerHTML='<p class="vl" style="text-align:center;padding:30px 0">차트 불러오는 중…</p>';
+  const f=await loadStock(code);
+  if(!f||!f.s||!f.s.c||f.s.c.length<25){box.innerHTML='<p class="vl" style="text-align:center;padding:20px 0">차트 자료가 없습니다.</p>';return f;}
+  const ser=buildSeries(f.s,lines);SHEET_DRAW=()=>drawChart(box,ser);drawChart(box,ser);return f;
+}
+const linesOf=x=>x?{t1:x.tg&&x.tg.t1,t2:x.tg&&x.tg.t2,stop:x.tg&&x.tg.stop,b1:x.plan&&x.plan.b1,b2:x.plan&&x.plan.b2}:{};
+/* 어떤 종목이든 같은 화면: 분석(전략·매매 포인트·결론) + 차트 + 뉴스 + AI */
+async function openStock(code){
+  const local=(()=>{for(const t of D.tabs){const x=t.stocks.find(s=>s.code===code);if(x)return x;}return (D.sstocks&&D.sstocks[code])||(YT&&YT.stocks[code])||(D.gainers&&D.gainers.items.find(g=>g.code===code))||null;})();
+  if(local&&local.series){openSheet(pickCard(local),()=>{const b=sheet.querySelector('.chartbox');if(b)drawChart(b,local.series);});return;}
+  if(local){openSheet(pickCard(local));drawLazy(code,linesOf(local));return;}
+  openSheet(`<p class="vl" style="padding:30px 0;text-align:center">불러오는 중…</p>`);
+  const f=await loadStock(code);
+  if(f&&f.e){const x=f.e;openSheet(pickCard(x));drawLazy(code,linesOf(x));}
+  else{const nm=NAMES[code]||code;openSheet(`<article class="pick"><div class="info"><div class="name">${esc(nm)} <span class="code tn">${esc(code)}</span></div><p class="vl" style="text-align:left">이 종목은 전략 분석 대상이 아닙니다(미국 주식·코인 등). 내 종목에 넣으면 차트 기준 보유 전략과 목표가·손절가를 볼 수 있습니다.</p></div><div class="right"><div class="chartbox"></div></div></article>`);drawLazy(code,{});}
+}
+
+/* ───── 내 종목 내보내기 · 가져오기 (암호 파일 / 코드) ───── */
+async function pwKey(pw,salt,it){const base=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:it,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);}
+const toB64=u=>btoa(String.fromCharCode(...new Uint8Array(u)));
+async function exportHold(){
+  const L=loadH().map(({id:_,...x})=>x);if(!L.length){alert('저장한 내 종목이 없습니다.');return;}
+  const pw=prompt('파일을 잠글 비밀번호를 정해 주세요 (가져올 때 필요합니다)');if(!pw)return;
+  if(prompt('비밀번호를 한 번 더 입력해 주세요')!==pw){alert('비밀번호가 서로 다릅니다.');return;}
+  const salt=crypto.getRandomValues(new Uint8Array(16)),iv=crypto.getRandomValues(new Uint8Array(12)),it=150000;
+  const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},await pwKey(pw,salt,it),new TextEncoder().encode(JSON.stringify({h:L,cfg:loadCfg()})));
+  const txt=JSON.stringify({v:'MS1',s:toB64(salt),i:toB64(iv),c:toB64(ct),it});
+  const day=new Date().toISOString().slice(0,10);
+  try{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([txt],{type:'application/json'}));a.download=`내종목_${day}.stock.json`;document.body.appendChild(a);a.click();a.remove();}catch(_){}
+  openSheet(`<div class="impbox"><h3>🔒 내 종목 암호 파일</h3>
+    <p class="okmsg">✅ 파일(내종목_${day}.stock.json)이 내려받아졌습니다.</p>
+    <p class="vl" style="text-align:left">파일 저장이 안 되는 화면이면 아래 코드를 복사해 카톡 "나에게 보내기" 등으로 옮긴 뒤, 다른 기기의 <b>📥 가져오기</b>에 붙여넣고 비밀번호를 입력하세요.</p>
+    <textarea id="expText" rows="5" readonly>${esc(txt)}</textarea><button class="btn" id="expCopy">📋 코드 복사</button></div>`);
+  document.getElementById('expCopy').onclick=e=>{const t=document.getElementById('expText');t.select();(navigator.clipboard?navigator.clipboard.writeText(t.value):Promise.reject()).then(()=>{e.target.textContent='✅ 복사됨';}).catch(()=>{document.execCommand('copy');e.target.textContent='✅ 복사됨';});};
+}
+function openImport(){
+  openSheet(`<div class="impbox"><h3>📥 내 종목 가져오기 <button class="q" data-help="import" aria-label="설명 보기">?</button></h3>
+    <p class="vl" style="text-align:left">① 내보낸 <b>암호 파일</b>을 고르거나 ② <b>코드</b>(암호 파일 내용 또는 Claude가 만든 등록 코드)를 붙여넣으세요.</p>
+    <input type="file" id="impFile" accept=".json,.txt,application/json,text/plain">
+    <textarea id="impText" rows="5" placeholder='여기에 코드를 붙여넣기'></textarea>
+    <input type="password" id="impPw" placeholder="비밀번호 (암호 파일일 때만)">
+    <div class="impmode"><label><input type="radio" name="impm" value="merge" checked> 기존 목록에 합치기</label><label><input type="radio" name="impm" value="replace"> 기존 목록을 지우고 바꾸기</label></div>
+    <button class="btn" id="impGo">가져오기</button><div id="impMsg"></div></div>`);
+  document.getElementById('impFile').onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{document.getElementById('impText').value=r.result;};r.readAsText(f);};
+  document.getElementById('impGo').onclick=doImport;
+}
+async function doImport(){
+  const msg=document.getElementById('impMsg'),raw=document.getElementById('impText').value.trim();
+  if(!raw){msg.innerHTML='<p class="err">파일을 고르거나 코드를 붙여넣어 주세요.</p>';return;}
+  let list=null,cfg=null;
+  try{
+    const txt=raw.replace(/^```(json)?|```$/g,'').trim();
+    const j=JSON.parse(txt.startsWith('STOCKS1:')?txt.slice(8):txt);
+    if(j&&j.v==='MS1'){const pw=document.getElementById('impPw').value;if(!pw){msg.innerHTML='<p class="err">암호 파일입니다. 비밀번호를 입력해 주세요.</p>';return;}
+      try{const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64u(j.i)},await pwKey(pw,b64u(j.s),j.it),b64u(j.c));const o=JSON.parse(new TextDecoder().decode(pt));list=o.h;cfg=o.cfg;}
+      catch(_){msg.innerHTML='<p class="err">비밀번호가 맞지 않습니다.</p>';return;}}
+    else list=Array.isArray(j)?j:(j.h||j.items||j.stocks);
+  }catch(_){msg.innerHTML='<p class="err">코드 형식을 읽지 못했습니다. 코드 전체를 빠짐없이 붙여넣었는지 확인해 주세요.</p>';return;}
+  const ok=[],miss=[];
+  (list||[]).forEach(x=>{const code=x.code&&(NAMES[x.code]?x.code:findCode(String(x.code)))||findCode(String(x.name||'')),qty=+String(x.qty).replace(/,/g,''),avg=+String(x.avg).replace(/[,원]/g,'');
+    if(code&&qty>0&&avg>0)ok.push({code,qty,avg,acct:String(x.acct||'').trim()});else miss.push(x.name||x.code||'?');});
+  if(!ok.length){msg.innerHTML=`<p class="err">등록할 수 있는 종목이 없습니다.${miss.length?' 찾지 못한 이름: '+miss.map(esc).join(', '):''}</p>`;return;}
+  const mode=(document.querySelector('input[name=impm]:checked')||{}).value;
+  const base=mode==='replace'?[]:loadH().map(({id:_,...x})=>x);
+  ok.forEach(h=>{const i=base.findIndex(b=>hid(b)===hid(h));if(i>=0)base[i]=h;else base.push(h);});
+  saveH(base);if(cfg)saveCfg(cfg);rerender();
+  msg.innerHTML=`<p class="okmsg">✅ ${ok.length}종목을 가져왔습니다.${miss.length?`<br>⚠️ 찾지 못한 종목 ${miss.length}개: ${miss.map(esc).join(', ')} → Claude에게 "내 종목 목록에 추가해줘"라고 하면 다음 날부터 등록할 수 있습니다.`:''}</p>`;
+}
+const PHOTO_PROMPT=`첨부한 증권앱·코인앱 잔고 캡처에서 종목명, 보유 수량, 평균 매입가(원), 계좌 이름을 읽어서 '오늘의 종목 발굴' 가져오기 코드로 만들어줘.
+형식은 이것만 출력해줘 (설명 없이 코드 블록 하나):
+STOCKS1:[{"name":"종목명","qty":수량,"avg":평균매입가원,"acct":"계좌"}]
+규칙: 미국 주식은 티커도 알면 name에 티커(예: AAPL)를 넣고, 평균가는 원화 기준. 코인은 name에 심볼(예: SUI). 계좌는 화면 위쪽 계좌명(예: ISA, 연금저축, 위탁, 토스, 빗썸). 숫자의 쉼표는 빼줘.`;
+document.addEventListener('click',e=>{
+  if(e.target.closest('[data-exp]')){exportHold();}
+  else if(e.target.closest('[data-imp]')){openImport();}
+  else if(e.target.closest('[data-copyprompt]')){navigator.clipboard&&navigator.clipboard.writeText(PHOTO_PROMPT).then(()=>{e.target.textContent='✅ 복사됨';});}
+});
 /* ───── 매매 포인트 ───── */
 function planStat(k){const P_=D.bt&&D.bt.plan&&D.bt.plan[k];if(!P_)return '';
   return `<p class="pstat tn">과거 ${D.bt.start}~${D.bt.end}에 이 규칙대로 했다면: 체결 ${P_.fill}% · 거래당 평균 <b class="${P_.avg>=0?'pos':'neg'}">${pctS(P_.avg,2)}</b> · 승률 ${P_.win}% · 평균 ${P_.days}일 보유 <span class="vl">(비용 차감 · 그냥 다음 날 시가에 사서 5일 보유 ${P_.base==null?'-':pctS(P_.base,2)})</span></p>`;}
@@ -4296,7 +4488,7 @@ function openVideo(i){
     <div class="lbl">언급 종목 · 우리 방식 판정</div><div class="ychips">${mentChips(v)}</div>
     <div class="aibox aibtn" style="margin-top:12px"><p><b style="color:var(--ink)">🤖 영상 종목 AI 점검</b><br>영상 제목과 우리 분석이 입력된 채로 Claude가 열립니다. Enter만 누르세요.</p><a class="btn ai" href="${claudeURL(prompt,null)}" target="_blank" rel="noopener">🤖 Claude에서 점검</a></div></div>`);
 }
-function openYtStock(code){const x=ytStock(code)||(D.sstocks&&D.sstocks[code])||(D.gainers&&D.gainers.items.find(g=>g.code===code));if(!x)return;
+function openYtStock(code){openStock(code);return;const x=null;if(!x)return;
   openSheet(pickCard(x),()=>{const b=sheet.querySelector('.chartbox');if(b&&x.series)drawChart(b,x.series);});}
 /* ───── 섹터 지도 → 대장주 팝업 ───── */
 function openSector(name){
@@ -4650,7 +4842,7 @@ function pickCard(x){
           <dl class="kv tn"><div><dt>거래대금</dt><dd>${won(x.amount)}</dd></div><div><dt>시가총액</dt><dd>${won(x.mcap)}</dd></div><div><dt>거래량</dt><dd>${x.vr==null?'-':x.vr.toFixed(1)+'배'}</dd></div></dl>
         </details>
       </div>
-      <div class="right">${x.series?'<div class="chartbox"></div>':'<p class="vl" style="text-align:left">차트는 1~6위만 제공합니다.</p>'}${newsHTML(x.code,4)}${aiHTML(x)}</div>
+      <div class="right"><div class="chartbox"></div>${newsHTML(x.code,4)}${aiHTML(x)}</div>
     </article>`;
 }
 let SHEET_DRAW=null;
@@ -4664,7 +4856,7 @@ function openSheet(html,draw){
 document.getElementById('sheetClose').onclick=()=>sheet.close();
 sheet.addEventListener('click',e=>{if(e.target===sheet)sheet.close();});
 function openPick(k,i){
-  const x=D.tabs.find(t=>t.k===k).stocks[i];
+  const x=D.tabs.find(t=>t.k===k).stocks[i];if(!x.series){openStock(x.code);return;}
   openSheet(pickCard(x),()=>{const b=sheet.querySelector('.chartbox');if(b&&x.series)drawChart(b,x.series);});
 }
 function renderPanel(){
@@ -4833,8 +5025,14 @@ function holdCard(h,saved){
 let CHECK=null;
 const isSaved=code=>loadH().some(h=>h.code===code);
 function openHold(h){
-  const draw=()=>{};
-  openSheet(holdCard(h,isSaved(h.code)),draw);
+  const saved=loadH().some(x=>x.id===hid(h));
+  openSheet(holdCard(h,saved)+`<div class="hchart"><div class="lbl">📈 차트 <span class="vl">목표·손절선은 보유 기준</span></div><div class="chartbox"></div></div><div id="hent"></div>`);
+  const r=snapOf(h.code)?analyzeHolding(h.code,h.qty,h.avg):null;
+  drawLazy(h.code,r?{t1:r.t1,t2:r.t2,stop:r.stop}:{}).then(f=>{
+    const box=document.getElementById('hent');if(!box)return;
+    if(f&&f.e){const x=f.e;box.innerHTML=`<div class="entbox"><div class="lbl">🔎 새로 산다면? (추천 종목과 같은 분석 · ${STRAT[x.strat].n} 기준)</div>${planHTML(x)}${storyHTML(x)}${scoreHTML(x)}
+      <details class="mini-fold"><summary>점수 계산 자세히</summary><div class="lbl">기본 조건</div>${checksHTML(x.checks)}<div class="lbl">보조 지표</div>${auxHTML(x.aux)}</details></div>`;}
+  });
 }
 function renderMine(){
   const list=loadH(),box=document.getElementById('mylist');
