@@ -3867,6 +3867,11 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
 .pvh{display:grid;gap:2px}.pvh .vl{text-align:left}
 .pvrow select{font:inherit;font-size:14px;padding:8px;border-radius:10px;border:1.5px solid var(--line);background:var(--surface);color:var(--ink);width:100%}
 .pvrow select.miss{border-color:var(--bad)}
+
+.sortbar{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;margin:8px 0 2px;padding-bottom:2px}
+.sortbar button{flex:none;font:inherit;font-size:12.5px;font-weight:700;padding:6px 10px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--muted);cursor:pointer}
+.sortbar button.on{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+.sortbar button.grp{margin-left:auto;border-style:dashed}.sortbar button.grp.on{background:var(--sunk);color:var(--ink);border-color:var(--line)}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -5089,7 +5094,7 @@ function renderMine(){
   let tot=0,cost=0;list.forEach(h=>{if(snapOf(h.code)){const r=analyzeHolding(h.code,h.qty,h.avg);tot+=r.val;cost+=r.avg*r.qty;}else if(AI_URL&&!PENDING[h.code])setTimeout(()=>fetchSnap(h.code),0);});
   const pl=tot-cost;
   box.innerHTML=`<div class="msum tn"><span>저장 ${list.length}종목</span><span>평가 ${f0(tot)}원</span><b class="${pl>=0?'upc':'downc'}">${pl>=0?'+':''}${f0(pl)}원</b></div>
-    ${groupedHTML(list,true)}
+    ${sortBar()}${groupedHTML(list,true)}
     <button class="btn ai allai" data-allai="1">🤖 내 종목 전체 AI 점검 (최근 뉴스로 지속 투자 판단)</button>${cfgHTML()}
     <p class="vl" style="text-align:left;margin-top:6px">종목을 누르면 자세한 점검이 열리고, ✕를 누르면 목록에서 지워집니다.</p>`;
 }
@@ -5150,14 +5155,30 @@ function holdRowHTML(h,del){
   const r=analyzeHolding(h.code,h.qty,h.avg),st=holdStatus(r),kj=keepJudge(h.code,r.tone);
   return `<div class="mrow"><button class="mmain hold2 ${st.al.length?'al-'+st.al[0][0]:''}" data-hold="${id}">
       <span class="pn"><b>${esc(r.name)}</b><small class="tn">${fq(h.qty)}주 · 평단 ${f0(r.avg)} · 현재 ${f0(r.c)}</small></span>
-      <span class="mpl tn"><b class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,1)}</b><small class="${r.plAmt>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</small></span>
+      <span class="mpl tn"><b class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,1)}</b><small class="${r.plAmt>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</small><small class="${(r.chg||0)>=0?'upc':'downc'}">오늘 ${pctS(r.chg||0,1)}</small></span>
       <span class="chip ${kj.c==='bad'?'no':kj.c}">${kj.v}</span>
       <span class="hfull">${progBar(st)}<span class="hlv tn">목표 <b class="upc">${f0(r.t1)}</b> (${pctS(st.toT,1)}) · 손절 <b class="downc">${f0(r.stop)}</b> (−${st.toS.toFixed(1)}%)${kj.news?` · 뉴스 ${kj.news}`:''}</span>
         ${st.al.map(a=>`<span class="alrt ${a[0]}">${a[1]} ${a[2]}</span>`).join('')}</span></button>
     ${del?`<button class="del" data-rm="${id}" aria-label="${esc(r.name)} 삭제">✕</button>`:''}</div>`;
 }
+/* 정렬: 알림순 · 수익률 높은/낮은 순 · 오늘 상승/하락 순 · 평가금액 순 */
+const SORTS=[['alert','알림순'],['plUp','수익률 높은 순'],['plDn','수익률 낮은 순'],['dayUp','오늘 상승 순'],['dayDn','오늘 하락 순'],['val','평가금액 순']];
+const getSort=()=>{try{return localStorage.getItem('my-sort')||'alert';}catch(_){return 'alert';}};
+function sortHold(list){
+  const m=getSort(),info=h=>{if(!snapOf(h.code))return {pl:-1e9,chg:-1e9,val:0,rank:9};const r=analyzeHolding(h.code,h.qty,h.avg),st=holdStatus(r);
+    return {pl:r.pl,chg:r.chg||0,val:r.val,rank:!st.al.length?9:st.al[0][0]==='bad'?0:st.al[0][0]==='warn'?1:2,prog:st.prog??-999};};
+  const L=list.map(h=>({h,i:info(h)}));
+  const f={alert:(a,b)=>a.i.rank-b.i.rank||b.i.prog-a.i.prog,plUp:(a,b)=>b.i.pl-a.i.pl,plDn:(a,b)=>a.i.pl-b.i.pl,dayUp:(a,b)=>b.i.chg-a.i.chg,dayDn:(a,b)=>a.i.chg-b.i.chg,val:(a,b)=>b.i.val-a.i.val}[m]||(()=>0);
+  return L.sort(f).map(x=>x.h);
+}
+const getGroup=()=>{try{return localStorage.getItem('my-group')!=='off';}catch(_){return true;}};
+function sortBar(){const m=getSort();return `<div class="sortbar" role="group" aria-label="정렬">${SORTS.map(([k,l])=>`<button class="${k===m?'on':''}" data-sort="${k}">${l}</button>`).join('')}<button class="grp ${getGroup()?'on':''}" data-grp="1">${getGroup()?'계좌별 ✓':'계좌별'}</button></div>`;}
+document.addEventListener('click',e=>{const b=e.target.closest('[data-sort]'),g=e.target.closest('[data-grp]');if(!b&&!g)return;
+  try{if(b)localStorage.setItem('my-sort',b.dataset.sort);if(g)localStorage.setItem('my-group',getGroup()?'off':'on');}catch(_){}rerender();});
 /* 계좌별로 묶어서 보여주기 */
 function groupedHTML(list,del){
+  list=sortHold(list);
+  if(!getGroup())return `<div class="mlist">${list.map(h=>holdRowHTML(h,del)).join('')}</div>`;
   const g={};list.forEach(h=>{(g[h.acct||'계좌 미지정']=g[h.acct||'계좌 미지정']||[]).push(h);});
   const keys=Object.keys(g);
   return keys.map(k=>{let tot=0,cost=0;g[k].forEach(h=>{if(snapOf(h.code)){const r=analyzeHolding(h.code,h.qty,h.avg);tot+=r.val;cost+=r.avg*r.qty;}});const pl=tot-cost;
@@ -5192,7 +5213,7 @@ function myHomeHTML(){
   const alerts=rows.filter(x=>x.s&&x.s.al.length);
   return `<div class="card wide mine1"><div class="ch"><h3>💼 내 종목 ${alerts.length?`<span class="abadge">🔔 ${alerts.length}</span>`:''}</h3><a class="more" href="#mine">＋ 추가 · 관리</a></div>
     ${alerts.length?`<div class="alist">${alerts.map(x=>`<button class="alrow ${x.s.al[0][0]}" data-hold="${hid(x.h)}"><b>${esc(NAMES[x.h.code]||x.h.code)}</b>${x.s.al.map(a=>`<span>${a[1]} ${a[2]}</span>`).join('')}</button>`).join('')}</div>`:'<p class="vl" style="text-align:left;margin:0 0 8px">지금은 목표가 근접·손절가 근접 종목이 없습니다.</p>'}
-    ${groupedHTML(rows.map(x=>x.h),false)}
+    ${sortBar()}${groupedHTML(rows.map(x=>x.h),false)}
     <button class="btn ai allai" data-allai="1">🤖 내 종목 전체 AI 점검 (최근 뉴스로 지속 투자 판단)</button>${cfgHTML()}</div>`;
 }
 function renderHome(){
