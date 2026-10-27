@@ -3860,6 +3860,13 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
 .impmode{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13.5px}
 .okmsg{color:var(--ok);font-weight:700}
 .pbox{background:var(--sunk);border-radius:10px;padding:10px;margin:8px 0}.pbox pre{white-space:pre-wrap;font-size:12px;margin:0 0 8px}
+
+.pvlist{display:grid;gap:8px}
+.pvrow{border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:grid;gap:6px}
+.pvrow.need{border-color:var(--mid);background:rgba(183,121,31,.06)} .pvrow.none{opacity:.7}
+.pvh{display:grid;gap:2px}.pvh .vl{text-align:left}
+.pvrow select{font:inherit;font-size:14px;padding:8px;border-radius:10px;border:1.5px solid var(--line);background:var(--surface);color:var(--ink);width:100%}
+.pvrow select.miss{border-color:var(--bad)}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -4300,7 +4307,7 @@ const HELP={
       <li>Claude가 <code>STOCKS1:[...]</code>로 시작하는 코드를 만들어 줍니다. <b>코드 전체를 복사</b>합니다.</li>
       <li>여기 <b>내 종목 → 📥 가져오기</b>를 누르고 코드를 붙여넣은 뒤 <b>가져오기</b>를 누르면 끝입니다.</li></ol>
       <div class="pbox"><pre>${esc(PHOTO_PROMPT)}</pre><button class="btn sm" data-copyprompt="1">📋 요청 문장 복사</button></div>
-      <p>가져온 뒤 수량·평단이 맞는지 한 번 확인해 주세요. 목록에 없는 미국 주식·코인은 "찾지 못한 종목"으로 알려줍니다.</p>
+      <p>붙여넣으면 바로 저장하지 않고 <b>확인 화면</b>이 먼저 나옵니다. 캡처에서 <b>이름이 잘린 종목</b>(…)이나 이름이 비슷한 종목이 여러 개면, 캡처의 현재가와 가장 가까운 후보를 위에 보여주고 <b>직접 고르게</b> 합니다. 수량·평단도 그 화면에서 확인하세요.</p>
       <h5>폰 ↔ PC 옮기기 (암호 파일)</h5>
       <ol><li>옮길 기기에서 <b>📤 내보내기</b> → 비밀번호를 정하면 <b>암호 파일</b>이 내려받아집니다(파일 저장이 안 되면 나오는 코드를 복사).</li>
       <li>파일(또는 코드)을 카톡 "나에게 보내기"·메일 등으로 다른 기기에 보냅니다.</li>
@@ -4416,6 +4423,7 @@ async function doImport(){
       catch(_){msg.innerHTML='<p class="err">비밀번호가 맞지 않습니다.</p>';return;}}
     else list=Array.isArray(j)?j:(j.h||j.items||j.stocks);
   }catch(_){msg.innerHTML='<p class="err">코드 형식을 읽지 못했습니다. 코드 전체를 빠짐없이 붙여넣었는지 확인해 주세요.</p>';return;}
+  if(!(list||[]).every(x=>x.code&&NAMES[x.code])){previewImport(list||[]);return;}
   const ok=[],miss=[];
   (list||[]).forEach(x=>{const code=x.code&&(NAMES[x.code]?x.code:findCode(String(x.code)))||findCode(String(x.name||'')),qty=+String(x.qty).replace(/,/g,''),avg=+String(x.avg).replace(/[,원]/g,'');
     if(code&&qty>0&&avg>0)ok.push({code,qty,avg,acct:String(x.acct||'').trim()});else miss.push(x.name||x.code||'?');});
@@ -4426,10 +4434,51 @@ async function doImport(){
   saveH(base);if(cfg)saveCfg(cfg);rerender();
   msg.innerHTML=`<p class="okmsg">✅ ${ok.length}종목을 가져왔습니다.${miss.length?`<br>⚠️ 찾지 못한 종목 ${miss.length}개: ${miss.map(esc).join(', ')} → Claude에게 "내 종목 목록에 추가해줘"라고 하면 다음 날부터 등록할 수 있습니다.`:''}</p>`;
 }
-const PHOTO_PROMPT=`첨부한 증권앱·코인앱 잔고 캡처에서 종목명, 보유 수량, 평균 매입가(원), 계좌 이름을 읽어서 '오늘의 종목 발굴' 가져오기 코드로 만들어줘.
+/* 잘린 이름·비슷한 이름: 후보를 찾아 현재가로 순위를 매기고, 애매하면 사람에게 묻기 */
+const normN=t=>String(t||'').replace(/[….]+$/,'').replace(/\.\.\.$/,'').replace(/\s+/g,'').toUpperCase();
+function nameCands(x){
+  const q=normN(x.name),price=+String(x.price||'').replace(/[,원]/g,'')||0;
+  if(!q)return [];
+  const exact=findCode(String(x.name||'').replace(/[….]+$/,'').trim());
+  let c=Object.keys(NAMES).filter(k=>{const n=normN(NAMES[k]);return n.startsWith(q)||(q.length>=3&&n.includes(q));});
+  if(exact&&!c.includes(exact))c.unshift(exact);
+  const px=k=>(D.all[k]||[])[2];
+  const sc=k=>{const p=px(k);const dp=price&&p?Math.abs(p/price-1):(price?9:0);return dp*100+(normN(NAMES[k])===q?-50:0)+normN(NAMES[k]).length*0.01;};
+  return c.map(k=>({k,sc:sc(k),p:px(k)})).sort((a,b)=>a.sc-b.sc).slice(0,8);
+}
+function previewImport(list){
+  const rows=list.map((x,i)=>{const cs=nameCands(x),price=+String(x.price||'').replace(/[,원]/g,'')||0,qty=+String(x.qty).replace(/,/g,''),avg=+String(x.avg).replace(/[,원]/g,'');
+    const auto=cs.length===1||(cs.length>1&&price&&cs[0].sc<1.5&&cs[1].sc>5&&!x.cut)||(cs.length>1&&!x.cut&&normN(NAMES[cs[0].k])===normN(x.name));
+    return {x,i,cs,qty,avg,auto,need:!auto&&cs.length>1};});
+  const opt=(r)=>r.cs.map((c,j)=>`<option value="${c.k}" ${j===0&&r.auto?'selected':''}>${j===0&&c.sc<1.5&&r.x.price?'⭐ ':''}${esc(NAMES[c.k])}${c.p?` · 현재 ${f0(c.p)}`:''}${j===0&&c.sc<1.5&&r.x.price?' (캡처 현재가와 일치)':''}</option>`).join('');
+  const need=rows.filter(r=>r.need).length,none=rows.filter(r=>!r.cs.length);
+  openSheet(`<div class="impbox"><h3>📋 가져올 종목 확인</h3>
+    <p class="vl" style="text-align:left">${need?`<b class="neg">이름이 잘렸거나 비슷한 종목이 여러 개인 ${need}개</b>는 직접 골라 주세요. `:''}캡처의 현재가와 가장 가까운 종목을 맨 위에 두었습니다.</p>
+    <div class="pvlist">${rows.map(r=>`<div class="pvrow ${r.need?'need':''} ${!r.cs.length?'none':''}">
+      <div class="pvh"><b>${esc(r.x.name||'?')}${r.x.cut?' <span class="chip mid">이름 잘림</span>':''}</b><span class="vl tn">${fq(r.qty)}주 · 평단 ${f0(r.avg)}${r.x.price?` · 캡처 현재가 ${f0(+String(r.x.price).replace(/[,원]/g,''))}`:''}${r.x.acct?` · ${esc(r.x.acct)}`:''}</span></div>
+      ${r.cs.length?`<select data-pv="${r.i}">${r.need?'<option value="">— 어떤 종목인가요? 골라 주세요 —</option>':''}${opt(r)}<option value="-">이 종목은 건너뛰기</option></select>`:'<p class="err" style="margin:4px 0">목록에서 찾지 못했습니다 → 건너뜁니다 (Claude에게 "내 종목 목록에 추가해줘")</p>'}
+    </div>`).join('')}</div>
+    <div class="impmode"><label><input type="radio" name="pvm" value="merge" checked> 기존 목록에 합치기</label><label><input type="radio" name="pvm" value="replace"> 기존 목록을 지우고 바꾸기</label></div>
+    <button class="btn" id="pvGo">이대로 등록</button><div id="pvMsg"></div></div>`);
+  document.getElementById('pvGo').onclick=()=>{
+    const sel=[...document.querySelectorAll('[data-pv]')],empty=sel.filter(s_=>!s_.value);
+    if(empty.length){empty.forEach(s_=>s_.classList.add('miss'));document.getElementById('pvMsg').innerHTML=`<p class="err">아직 고르지 않은 종목이 ${empty.length}개 있습니다.</p>`;empty[0].scrollIntoView({block:'center'});return;}
+    const ok=[];sel.forEach(s_=>{if(s_.value==='-')return;const r=rows[+s_.dataset.pv];if(r.qty>0&&r.avg>0)ok.push({code:s_.value,qty:r.qty,avg:r.avg,acct:String(r.x.acct||'').trim()});});
+    const mode=(document.querySelector('input[name=pvm]:checked')||{}).value,base=mode==='replace'?[]:loadH().map(({id:_,...x})=>x);
+    ok.forEach(h=>{const i=base.findIndex(b=>hid(b)===hid(h));if(i>=0)base[i]=h;else base.push(h);});
+    saveH(base);rerender();
+    document.getElementById('pvMsg').innerHTML=`<p class="okmsg">✅ ${ok.length}종목을 등록했습니다.${none.length?` 찾지 못한 ${none.length}개는 건너뛰었습니다.`:''}</p>`;
+    document.getElementById('pvGo').disabled=true;
+  };
+}
+const PHOTO_PROMPT=`첨부한 증권앱·코인앱 잔고 캡처에서 종목마다 이름, 보유 수량, 평균 매입가(원), 현재가(원), 계좌 이름을 읽어서 '오늘의 종목 발굴' 가져오기 코드로 만들어줘.
 형식은 이것만 출력해줘 (설명 없이 코드 블록 하나):
-STOCKS1:[{"name":"종목명","qty":수량,"avg":평균매입가원,"acct":"계좌"}]
-규칙: 미국 주식은 티커도 알면 name에 티커(예: AAPL)를 넣고, 평균가는 원화 기준. 코인은 name에 심볼(예: SUI). 계좌는 화면 위쪽 계좌명(예: ISA, 연금저축, 위탁, 토스, 빗썸). 숫자의 쉼표는 빼줘.`;
+STOCKS1:[{"name":"종목명","cut":false,"qty":수량,"avg":평균매입가,"price":현재가,"acct":"계좌"}]
+규칙:
+- 이름이 화면에서 잘려 있으면(…로 끝나거나 줄바꿈으로 끝이 안 보이면) 보이는 글자까지만 쓰고 "cut":true. 나머지를 추측해서 채우지 마.
+- 현재가가 화면에 없으면 price는 빼도 돼. 평가금액만 보이면 평가금액÷수량으로 계산해서 넣어줘.
+- 미국 주식은 티커를 알면 name에 티커(예: AAPL), 평균가·현재가는 원화 기준. 코인은 name에 심볼(예: SUI).
+- 계좌는 화면 위쪽 계좌명(예: ISA, 연금저축, 위탁, 토스, 빗썸). 숫자의 쉼표·원은 빼줘.`;
 document.addEventListener('click',e=>{
   if(e.target.closest('[data-exp]')){exportHold();}
   else if(e.target.closest('[data-imp]')){openImport();}
