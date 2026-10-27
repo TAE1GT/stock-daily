@@ -1,9 +1,9 @@
 {
- "at": "2026-10-27 08:20",
+ "at": "2026-10-27 09:34",
  "status": {
   "종목 목록 (네이버)": {
    "ok": true,
-   "detail": "네이버 증권 모바일 API (JSON) · 3949종목"
+   "detail": "네이버 증권 모바일 API (JSON) · 3948종목"
   },
   "종목 시세 (네이버 차트)": {
    "ok": true,
@@ -18,8 +18,8 @@
    "detail": "61/61종목"
   },
   "유튜브 채널 (RSS)": {
-   "ok": false,
-   "detail": "HTTP Error 500: Internal Server Error"
+   "ok": true,
+   "detail": "영상 15개 · 언급 종목 1개"
   },
   "섹터 대장주": {
    "ok": true,
@@ -39,7 +39,7 @@
   },
   "종목별 차트·분석 파일": {
    "ok": true,
-   "detail": "3965종목"
+   "detail": "3961종목"
   },
   "과거 성적 검증": {
    "ok": true,
@@ -55,7 +55,7 @@
   },
   "오늘 장 예보 (밤사이 해외시장)": {
    "ok": true,
-   "detail": "KOSPI 시가 +1.04% / 상승 마감 69% · KOSDAQ 시가 +1.02% / 상승 마감 61%"
+   "detail": "KOSPI 시가 +1.15% / 상승 마감 71% · KOSDAQ 시가 +1.07% / 상승 마감 62%"
   },
   "예측 기록 (저장소 history 폴더)": {
    "ok": false,
