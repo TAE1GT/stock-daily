@@ -3915,13 +3915,12 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
     <div class="vh"><h2>내 종목 <button class="q" data-help="mine" aria-label="설명 보기">?</button></h2></div>
     <div class="form">
       <label>종목명 또는 코드<input id="fStock" list="stocklist" placeholder="예: 삼성전자 · KODEX 은선물 · 애플 · 수이" autocomplete="off"></label>
-      <label>계좌 (선택)<input id="fAcct" list="acctlist" placeholder="예: ISA, 연금, 토스" autocomplete="off"></label>
       <label>수량 (주)<input id="fQty" type="number" inputmode="decimal" min="0" step="any" placeholder="100"></label>
       <label>평균 매입가 (원)<input id="fAvg" type="number" inputmode="numeric" min="1" placeholder="71000"></label>
       <span class="fbtns"><button class="btn" id="fCheck">점검</button><button class="btn ghost" id="fSave">저장</button></span>
       <p class="err" id="fErr" hidden></p>
     </div>
-    <datalist id="stocklist"></datalist><datalist id="acctlist"></datalist>
+    <datalist id="stocklist"></datalist>
     <div class="iebar"><button class="btn ghost sm" data-imp="1">📥 가져오기</button><button class="btn ghost sm" data-exp="1">📤 내보내기 (암호 파일)</button><button class="btn ghost sm" data-help="import">📸 사진으로 등록하는 법</button></div>
     <div id="mylist"></div>
   </section>
@@ -4431,12 +4430,11 @@ async function doImport(){
   if(!(list||[]).every(x=>x.code&&NAMES[x.code])){previewImport(list||[]);return;}
   const ok=[],miss=[];
   (list||[]).forEach(x=>{const code=x.code&&(NAMES[x.code]?x.code:findCode(String(x.code)))||findCode(String(x.name||'')),qty=+String(x.qty).replace(/,/g,''),avg=+String(x.avg).replace(/[,원]/g,'');
-    if(code&&qty>0&&avg>0)ok.push({code,qty,avg,acct:String(x.acct||'').trim()});else miss.push(x.name||x.code||'?');});
+    if(code&&qty>0&&avg>0)ok.push({code,qty,avg});else miss.push(x.name||x.code||'?');});
   if(!ok.length){msg.innerHTML=`<p class="err">등록할 수 있는 종목이 없습니다.${miss.length?' 찾지 못한 이름: '+miss.map(esc).join(', '):''}</p>`;return;}
   const mode=(document.querySelector('input[name=impm]:checked')||{}).value;
-  const base=mode==='replace'?[]:loadH().map(({id:_,...x})=>x);
-  ok.forEach(h=>{const i=base.findIndex(b=>hid(b)===hid(h));if(i>=0)base[i]=h;else base.push(h);});
-  saveH(base);if(cfg)saveCfg(cfg);rerender();
+  const base=mode==='replace'?[]:loadH().filter(b=>!ok.some(h=>h.code===b.code)).map(({id:_,...x})=>x);
+  saveH(mergeH([...base,...ok]));if(cfg)saveCfg(cfg);rerender();
   msg.innerHTML=`<p class="okmsg">✅ ${ok.length}종목을 가져왔습니다.${miss.length?`<br>⚠️ 찾지 못한 종목 ${miss.length}개: ${miss.map(esc).join(', ')} → Claude에게 "내 종목 목록에 추가해줘"라고 하면 다음 날부터 등록할 수 있습니다.`:''}</p>`;
 }
 /* 잘린 이름·비슷한 이름: 후보를 찾아 현재가로 순위를 매기고, 애매하면 사람에게 묻기 */
@@ -4460,7 +4458,7 @@ function previewImport(list){
   openSheet(`<div class="impbox"><h3>📋 가져올 종목 확인</h3>
     <p class="vl" style="text-align:left">${need?`<b class="neg">이름이 잘렸거나 비슷한 종목이 여러 개인 ${need}개</b>는 직접 골라 주세요. `:''}캡처의 현재가와 가장 가까운 종목을 맨 위에 두었습니다.</p>
     <div class="pvlist">${rows.map(r=>`<div class="pvrow ${r.need?'need':''} ${!r.cs.length?'none':''}">
-      <div class="pvh"><b>${esc(r.x.name||'?')}${r.x.cut?' <span class="chip mid">이름 잘림</span>':''}</b><span class="vl tn">${fq(r.qty)}주 · 평단 ${f0(r.avg)}${r.x.price?` · 캡처 현재가 ${f0(+String(r.x.price).replace(/[,원]/g,''))}`:''}${r.x.acct?` · ${esc(r.x.acct)}`:''}</span></div>
+      <div class="pvh"><b>${esc(r.x.name||'?')}${r.x.cut?' <span class="chip mid">이름 잘림</span>':''}</b><span class="vl tn">${fq(r.qty)}주 · 평단 ${f0(r.avg)}${r.x.price?` · 캡처 현재가 ${f0(+String(r.x.price).replace(/[,원]/g,''))}`:''}</span></div>
       ${r.cs.length?`<select data-pv="${r.i}">${r.need?'<option value="">— 어떤 종목인가요? 골라 주세요 —</option>':''}${opt(r)}<option value="-">이 종목은 건너뛰기</option></select>`:'<p class="err" style="margin:4px 0">목록에서 찾지 못했습니다 → 건너뜁니다 (Claude에게 "내 종목 목록에 추가해줘")</p>'}
     </div>`).join('')}</div>
     <div class="impmode"><label><input type="radio" name="pvm" value="merge" checked> 기존 목록에 합치기</label><label><input type="radio" name="pvm" value="replace"> 기존 목록을 지우고 바꾸기</label></div>
@@ -4468,22 +4466,21 @@ function previewImport(list){
   document.getElementById('pvGo').onclick=()=>{
     const sel=[...document.querySelectorAll('[data-pv]')],empty=sel.filter(s_=>!s_.value);
     if(empty.length){empty.forEach(s_=>s_.classList.add('miss'));document.getElementById('pvMsg').innerHTML=`<p class="err">아직 고르지 않은 종목이 ${empty.length}개 있습니다.</p>`;empty[0].scrollIntoView({block:'center'});return;}
-    const ok=[];sel.forEach(s_=>{if(s_.value==='-')return;const r=rows[+s_.dataset.pv];if(r.qty>0&&r.avg>0)ok.push({code:s_.value,qty:r.qty,avg:r.avg,acct:String(r.x.acct||'').trim()});});
-    const mode=(document.querySelector('input[name=pvm]:checked')||{}).value,base=mode==='replace'?[]:loadH().map(({id:_,...x})=>x);
-    ok.forEach(h=>{const i=base.findIndex(b=>hid(b)===hid(h));if(i>=0)base[i]=h;else base.push(h);});
-    saveH(base);rerender();
+    const ok=[];sel.forEach(s_=>{if(s_.value==='-')return;const r=rows[+s_.dataset.pv];if(r.qty>0&&r.avg>0)ok.push({code:s_.value,qty:r.qty,avg:r.avg});});
+    const mode=(document.querySelector('input[name=pvm]:checked')||{}).value,base=mode==='replace'?[]:loadH().filter(b=>!ok.some(h=>h.code===b.code)).map(({id:_,...x})=>x);
+    saveH(mergeH([...base,...ok]));rerender();
     document.getElementById('pvMsg').innerHTML=`<p class="okmsg">✅ ${ok.length}종목을 등록했습니다.${none.length?` 찾지 못한 ${none.length}개는 건너뛰었습니다.`:''}</p>`;
     document.getElementById('pvGo').disabled=true;
   };
 }
-const PHOTO_PROMPT=`첨부한 증권앱·코인앱 잔고 캡처에서 종목마다 이름, 보유 수량, 평균 매입가(원), 현재가(원), 계좌 이름을 읽어서 '오늘의 종목 발굴' 가져오기 코드로 만들어줘.
+const PHOTO_PROMPT=`첨부한 증권앱·코인앱 잔고 캡처에서 종목마다 이름, 보유 수량, 평균 매입가(원), 현재가(원)를 읽어서 '오늘의 종목 발굴' 가져오기 코드로 만들어줘.
 형식은 이것만 출력해줘 (설명 없이 코드 블록 하나):
-STOCKS1:[{"name":"종목명","cut":false,"qty":수량,"avg":평균매입가,"price":현재가,"acct":"계좌"}]
+STOCKS1:[{"name":"종목명","cut":false,"qty":수량,"avg":평균매입가,"price":현재가}]
 규칙:
 - 이름이 화면에서 잘려 있으면(…로 끝나거나 줄바꿈으로 끝이 안 보이면) 보이는 글자까지만 쓰고 "cut":true. 나머지를 추측해서 채우지 마.
 - 현재가가 화면에 없으면 price는 빼도 돼. 평가금액만 보이면 평가금액÷수량으로 계산해서 넣어줘.
 - 미국 주식은 티커를 알면 name에 티커(예: AAPL), 평균가·현재가는 원화 기준. 코인은 name에 심볼(예: SUI).
-- 계좌는 화면 위쪽 계좌명(예: ISA, 연금저축, 위탁, 토스, 빗썸). 숫자의 쉼표·원은 빼줘.`;
+- 같은 종목이 여러 캡처(계좌)에 있으면 따로 적어도 돼(가져올 때 수량은 합치고 평단은 가중평균으로 계산함). 숫자의 쉼표·원은 빼줘.`;
 document.addEventListener('click',e=>{
   if(e.target.closest('[data-exp]')){exportHold();}
   else if(e.target.closest('[data-imp]')){openImport();}
@@ -4934,8 +4931,11 @@ function renderPanel(){
 function drawAll(){if(sheet.open&&SHEET_DRAW)SHEET_DRAW();}
 
 const KEY='my-holdings-v1';
-const hid=h=>h.code+'|'+(h.acct||'');
-const loadH=()=>{try{return (JSON.parse(localStorage.getItem(KEY))||[]).map(h=>Object.assign({acct:''},h,{id:hid(Object.assign({acct:''},h))}));}catch(_){return [];}};
+const hid=h=>h.code;
+function mergeH(list){const m={},order=[];(list||[]).forEach(h=>{if(!h||!h.code)return;const q=+h.qty||0,a=+h.avg||0;
+  if(!m[h.code]){m[h.code]={code:h.code,qty:q,avg:a};order.push(h.code);}else{const o=m[h.code],tq=o.qty+q;o.avg=tq?(o.avg*o.qty+a*q)/tq:o.avg;o.qty=tq;}});
+  return order.map(c=>({...m[c],avg:Math.round(m[c].avg*100)/100}));}
+const loadH=()=>{try{return mergeH(JSON.parse(localStorage.getItem(KEY))||[]).map(h=>Object.assign(h,{id:h.code}));}catch(_){return [];}};
 const saveH=h=>{try{localStorage.setItem(KEY,JSON.stringify(h));}catch(_){}};
 const NAMES=Object.assign({},D.names||{});Object.entries(D.all).forEach(([code,a])=>{if(!NAMES[code])NAMES[code]=a[0];});
 const byName={};Object.entries(NAMES).forEach(([code,n])=>{byName[n]=code;});
@@ -5053,7 +5053,7 @@ function holdCard(h,saved){
       <div class="hdr"><div><div class="name" style="margin:0">${esc(r.name)} <span class="code tn">${r.code} ${r.mk}</span></div>
         <div class="price tn">${f0(r.c)}<span>${pct(r.chg)}</span></div></div><span class="acts">${act}</span></div>
       <dl class="pos-grid tn">
-        <div><dt>보유${h.acct?' · '+esc(h.acct):''}</dt><dd>${fq(r.qty)}주 · 평단 ${f0(r.avg)}</dd></div>
+        <div><dt>보유</dt><dd>${fq(r.qty)}주 · 평단 ${f0(r.avg)}</dd></div>
         <div><dt>평가금액</dt><dd>${f0(r.val)}원</dd></div>
         <div><dt>평가손익</dt><dd class="${r.pl>=0?'upc':'downc'}">${r.plAmt>=0?'+':''}${f0(r.plAmt)}원</dd></div>
         <div><dt>수익률</dt><dd class="${r.pl>=0?'upc':'downc'}">${pctS(r.pl,2)}</dd></div>
@@ -5151,7 +5151,7 @@ function keepJudge(code,tone){
 }
 function holdRowHTML(h,del){
   const nm=esc(NAMES[h.code]||h.code),id=hid(h);
-  if(!snapOf(h.code))return `<div class="mrow"><button class="mmain" data-hold="${id}"><span class="pn"><b>${nm}</b><small>${fq(h.qty)}주 · 평단 ${f0(h.avg)}${h.acct?' · '+esc(h.acct):''}</small></span><span class="vl">데이터 없음</span></button>${del?`<button class="del" data-rm="${id}" aria-label="${nm} 삭제">✕</button>`:''}</div>`;
+  if(!snapOf(h.code))return `<div class="mrow"><button class="mmain" data-hold="${id}"><span class="pn"><b>${nm}</b><small>${fq(h.qty)}주 · 평단 ${f0(h.avg)}</small></span><span class="vl">데이터 없음</span></button>${del?`<button class="del" data-rm="${id}" aria-label="${nm} 삭제">✕</button>`:''}</div>`;
   const r=analyzeHolding(h.code,h.qty,h.avg),st=holdStatus(r),kj=keepJudge(h.code,r.tone);
   return `<div class="mrow"><button class="mmain hold2 ${st.al.length?'al-'+st.al[0][0]:''}" data-hold="${id}">
       <span class="pn"><b>${esc(r.name)}</b><small class="tn">${fq(h.qty)}주 · 평단 ${f0(r.avg)} · 현재 ${f0(r.c)}</small></span>
@@ -5172,13 +5172,13 @@ function sortHold(list){
   return L.sort(f).map(x=>x.h);
 }
 const getGroup=()=>{try{return localStorage.getItem('my-group')!=='off';}catch(_){return true;}};
-function sortBar(){const m=getSort();return `<div class="sortbar" role="group" aria-label="정렬">${SORTS.map(([k,l])=>`<button class="${k===m?'on':''}" data-sort="${k}">${l}</button>`).join('')}<button class="grp ${getGroup()?'on':''}" data-grp="1">${getGroup()?'계좌별 ✓':'계좌별'}</button></div>`;}
+function sortBar(){const m=getSort();return `<div class="sortbar" role="group" aria-label="정렬">${SORTS.map(([k,l])=>`<button class="${k===m?'on':''}" data-sort="${k}">${l}</button>`).join('')}</div>`;}
 document.addEventListener('click',e=>{const b=e.target.closest('[data-sort]'),g=e.target.closest('[data-grp]');if(!b&&!g)return;
   try{if(b)localStorage.setItem('my-sort',b.dataset.sort);if(g)localStorage.setItem('my-group',getGroup()?'off':'on');}catch(_){}rerender();});
 /* 계좌별로 묶어서 보여주기 */
 function groupedHTML(list,del){
   list=sortHold(list);
-  if(!getGroup())return `<div class="mlist">${list.map(h=>holdRowHTML(h,del)).join('')}</div>`;
+  return `<div class="mlist">${list.map(h=>holdRowHTML(h,del)).join('')}</div>`;
   const g={};list.forEach(h=>{(g[h.acct||'계좌 미지정']=g[h.acct||'계좌 미지정']||[]).push(h);});
   const keys=Object.keys(g);
   return keys.map(k=>{let tot=0,cost=0;g[k].forEach(h=>{if(snapOf(h.code)){const r=analyzeHolding(h.code,h.qty,h.avg);tot+=r.val;cost+=r.avg*r.qty;}});const pl=tot-cost;
@@ -5188,9 +5188,9 @@ function groupedHTML(list,del){
 /* 내 종목 전체를 한 번에 Claude에게 */
 function allPrompt(){
   const L=loadH();if(!L.length)return '';
-  const rows=L.map(h=>{const nm=NAMES[h.code]||h.code;if(!snapOf(h.code))return `- [${h.acct||'-'}] ${nm}: ${fq(h.qty)}주, 평단 ${f0(h.avg)}원 (대시보드 데이터 없음)`;
+  const rows=L.map(h=>{const nm=NAMES[h.code]||h.code;if(!snapOf(h.code))return `- ${nm}: ${fq(h.qty)}주, 평단 ${f0(h.avg)}원 (대시보드 데이터 없음)`;
     const r=analyzeHolding(h.code,h.qty,h.avg),kj=keepJudge(h.code,r.tone),W=(D.wnews||{})[h.code];
-    return `- [${h.acct||'-'}] ${nm}(${h.code.replace(/^(US|CR):/,'')}): ${fq(h.qty)}주, 평단 ${f0(h.avg)}원, 현재 ${f0(r.c)}원, 손익 ${pctS(r.pl,1)} / 차트 판단 ${r.v}, 목표 ${f0(r.t1)}원·손절 ${f0(r.stop)}원 / 규칙 판단 ${kj.v}`+(W&&W.items.length?` / 최근 뉴스: ${W.items.slice(0,2).map(x=>x.t).join(' | ')}`:'');}).join('\n');
+    return `- ${nm}(${h.code.replace(/^(US|CR):/,'')}): ${fq(h.qty)}주, 평단 ${f0(h.avg)}원, 현재 ${f0(r.c)}원, 손익 ${pctS(r.pl,1)} / 차트 판단 ${r.v}, 목표 ${f0(r.t1)}원·손절 ${f0(r.stop)}원 / 규칙 판단 ${kj.v}`+(W&&W.items.length?` / 최근 뉴스: ${W.items.slice(0,2).map(x=>x.t).join(' | ')}`:'');}).join('\n');
   return `내 보유 종목 전체야 (${D.asof} 종가 기준, 금액은 원화).\n${rows}\n\n`+
     `종목마다 최근 2주~한 달 국내·해외 뉴스와 공시를 웹에서 검색해서 ①지속 투자 / 비중 축소 / 정리 중 하나로 의견을 내고 ②근거 2~3가지 ③주의할 리스크 ④참고 기사 링크를 알려줘. `+
     `마지막에 포트폴리오 전체로 봤을 때 한쪽에 너무 쏠려 있는지, 손실이 큰 종목을 어떻게 다루면 좋을지도 정리해줘.`;
@@ -5291,14 +5291,14 @@ function initHolds(){
   dl.innerHTML=Object.entries(NAMES).map(([code,n])=>`<option value="${esc(n)} (${code})"></option>`).join('');
   const err=document.getElementById('fErr');
   const read=()=>{
-    const code=findCode(document.getElementById('fStock').value),qty=+document.getElementById('fQty').value,avg=+document.getElementById('fAvg').value,acct=document.getElementById('fAcct').value.trim();
+    const code=findCode(document.getElementById('fStock').value),qty=+document.getElementById('fQty').value,avg=+document.getElementById('fAvg').value;
     const bad=!code?'종목을 찾지 못했습니다. 목록에서 고르거나 6자리 코드·미국 티커(예: AAPL)로 입력해 주세요. 목록에 없는 미국 주식·코인은 Claude에게 추가를 요청하세요.':!(qty>0)?'수량을 입력해 주세요.':!(avg>0)?'평균 매입가를 입력해 주세요 (원화).':'';
-    err.hidden=!bad;err.textContent=bad;return bad?null:{code,qty,avg,acct};
+    err.hidden=!bad;err.textContent=bad;return bad?null:{code,qty,avg};
   };
   const clear=()=>['fStock','fQty','fAvg'].forEach(id=>document.getElementById(id).value='');
   document.getElementById('fCheck').onclick=()=>{const h=read();if(!h)return;CHECK=h;openHold(h);};
   document.getElementById('fSave').onclick=()=>{const h=read();if(!h)return;CHECK=h;const l=loadH().filter(x=>x.id!==hid(h)).map(({id:_,...x})=>x);l.unshift(h);saveH(l);clear();rerender();openHold(Object.assign({id:hid(h)},h));};
-  document.getElementById('acctlist').innerHTML=[...new Set(['ISA','연금저축','위탁','토스','빗썸',...loadH().map(h=>h.acct).filter(Boolean)])].map(a=>`<option value="${esc(a)}"></option>`).join('');
+
   renderMine();
 }
 
