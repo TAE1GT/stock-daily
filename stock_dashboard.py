@@ -44,6 +44,9 @@ CFG = dict(
     cost=0.25,             # 왕복 거래비용 % (수수료+세금) — 성적 계산 때 차감
     vb_filter=dict(max_day_change=15.0, min_close_to_high=0.95, min_vol_ratio=3.0),   # 거래량 돌파 '그림자 필터' (기록만, 아직 미적용)
     min_samples=30, min_days=15,   # 실시간 기록 진단: 이보다 적으면 '관찰 중'
+    # 과거 1년 반 검증으로 바꾼 전략별 규칙 (2026-10-27): 거래량 돌파는 손절을 현재가−2.5×ATR 이하로 넓히고 손익비 1.5 이상만
+    #   근거: 거래당 +0.51% (910건) → +1.53% (803건), t=4.44, 앞·뒤 기간 모두 플러스
+    strat_rule={2: dict(smul=2.5, rmin=1.5)},
 
 )
 
@@ -105,7 +108,7 @@ def stat(key, ok, detail=""):
 
 
 STRATS = {1: "추세 눌림목", 2: "거래량 돌파", 3: "과매도 반등"}
-STOP_LABEL = {1: "20일선 -3%", 2: "돌파 기준가", 3: "최근 5일 저점"}
+STOP_LABEL = {1: "20일선 -3%", 2: "돌파 기준가·현재가−2.5×ATR 중 낮은 값", 3: "최근 5일 저점"}
 TARGET_RULE = {
     1: ("최근 20일 고점", "현재가 + 2.5×ATR"),
     2: ("현재가 + 2×ATR", "돌파 기준가 + 박스권 높이"),
@@ -625,6 +628,10 @@ def evaluate(P, I, market, light=False):
         2: (c + 2 * atr, hi60 + (hi60 - lo60), hi60),
         3: (ma20, bbu, P["l"].iloc[-5:].min()),
     }
+    for k_, rule in CFG.get("strat_rule", {}).items():
+        if rule.get("smul"):
+            t1_, t2_, st_ = tg[k_]
+            tg[k_] = (t1_, t2_, np.minimum(st_, c - rule["smul"] * atr))
     metrics = dict(c=c, chg=chg, vr=vr, rsi=rsi, pb=pb, a=P["a"].iloc[-1], atr=atr, rs=rs,
                    h0=h0, h1=h1, ma20=ma20, ma60=ma60, ma60_5=ma60_5, bbu=bbu, bbl=bbl,
                    hi20=hi20, lo20=P["l"].iloc[-20:].min(), hi60=hi60, lo5=P["l"].iloc[-5:].min(),
@@ -1766,7 +1773,27 @@ NAME_STOP = {"대상", "한국", "미래", "동방", "선진", "대원", "국보
 
 def fetch_youtube(n=15):
     import html as _h
-    xml = http_get(f"https://www.youtube.com/feeds/videos.xml?channel_id={YT_CHANNEL['id']}", retries=2)
+    cache = os.path.join(HIST_DIR, "yt_cache.xml")
+    xml = None
+    for url in (f"https://www.youtube.com/feeds/videos.xml?channel_id={YT_CHANNEL['id']}",
+                f"https://www.youtube.com/feeds/videos.xml?playlist_id=UU{YT_CHANNEL['id'][2:]}"):     # 업로드 재생목록 주소
+        try:
+            xml = http_get(url, retries=3)
+            if "<entry>" in xml:
+                break
+        except Exception:
+            xml = None
+    if xml and "<entry>" in xml:
+        try:
+            os.makedirs(HIST_DIR, exist_ok=True)
+            open(cache, "w", encoding="utf-8").write(xml)
+        except Exception:
+            pass
+    elif os.path.exists(cache):
+        print("  유튜브 RSS 실패 → 마지막으로 받은 목록 사용", flush=True)
+        xml = open(cache, encoding="utf-8").read()
+    else:
+        raise RuntimeError("유튜브 RSS 응답 없음 (두 주소 모두)")
     out = []
     for e in re.findall(r"<entry>(.*?)</entry>", xml, re.S)[:n]:
         g = lambda pat: (re.search(pat, e, re.S) or [None, ""])[1]
@@ -2163,7 +2190,7 @@ def save_snapshot(snap):
     """그날 데이터 기준일 파일 하나 (같은 날 여러 번 돌면 마지막 장전 갱신으로 덮어씀). 150개 넘으면 오래된 것 삭제"""
     os.makedirs(HIST_DIR, exist_ok=True)
     save_json(os.path.join(HIST_DIR, f"{snap['asof']}.json"), snap)
-    files = sorted(x for x in os.listdir(HIST_DIR) if x.endswith(".json"))
+    files = sorted(x for x in os.listdir(HIST_DIR) if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", x))
     for x in files[:-150]:
         os.remove(os.path.join(HIST_DIR, x))
 
@@ -2172,10 +2199,10 @@ def load_history(exclude_asof):
     if not os.path.isdir(HIST_DIR):
         return []
     out = []
-    for x in sorted(x for x in os.listdir(HIST_DIR) if x.endswith(".json"))[-60:]:
+    for x in sorted(x for x in os.listdir(HIST_DIR) if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", x))[-60:]:
         try:
             s = load_json(os.path.join(HIST_DIR, x))
-            if x != "backtest_cache.json" and s.get("asof") != exclude_asof:
+            if s.get("asof") and s.get("asof") != exclude_asof and s.get("picks") is not None:
                 out.append(s)
         except Exception:
             pass
@@ -2520,7 +2547,7 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
     if not demo and asof and os.path.exists(cache):
         try:
             cj = load_json(cache)
-            if cj.get("asof") == asof and cj.get("ver") == 4:
+            if cj.get("asof") == asof and cj.get("ver") == 5:
                 print("  과거 성적: 오늘 계산해 둔 결과 재사용", flush=True)
                 stat("과거 성적 검증", True, f"{cj['res']['n_days']}거래일 · {cj['res']['start']}~{cj['res']['end']} (재사용)")
                 return cj["res"]
@@ -2605,7 +2632,22 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
                     if sim.get("filled") and not sim.get("open"):
                         r.update(pr=sim["ret"], pdays=sim["days"], pexit=sim["exit"])
                 return r
-            for rank, tk in enumerate(sc.index[:3], 1):
+            rmin = CFG.get("strat_rule", {}).get(k, {}).get("rmin")
+            chosen = []
+            for tk in sc.index[:30 if rmin else 3]:
+                if rmin:
+                    c0_, a_ = float(c[tk]), float(m_["atr"][tk])
+                    a_ = a_ if np.isfinite(a_) and a_ > 0 else c0_ * 0.03
+                    tg_, st_ = float(t1s[tk]), float(sts[tk])
+                    st_ = st_ if np.isfinite(st_) and st_ < c0_ * 0.995 else c0_ - 1.5 * a_
+                    tg_ = tg_ if np.isfinite(tg_) and tg_ > c0_ * 1.01 else c0_ + 1.5 * a_
+                    gg = lambda key: float(m_[key][tk]) if m_[key][tk] == m_[key][tk] else None
+                    if (trade_plan(k, c0_, a_, gg("ma20"), gg("bbl"), gg("hi60"), gg("lo5"), tg_, float(t2s[tk]), st_)["rr"] or 0) < rmin:
+                        continue
+                chosen.append(tk)
+                if len(chosen) == 3:
+                    break
+            for rank, tk in enumerate(chosen, 1):
                 x = rec(tk, rank)
                 if x:
                     rows.append(x)
@@ -2706,7 +2748,7 @@ def backtest(P, I, market, mcap, names, asof=None, demo=False):
     if not demo and asof:
         try:
             os.makedirs(HIST_DIR, exist_ok=True)
-            save_json(cache, dict(asof=asof, ver=4, res=res))
+            save_json(cache, dict(asof=asof, ver=5, res=res))
         except Exception:
             pass
     return res
@@ -2781,6 +2823,9 @@ def build(demo=False, mode="file"):
                 loss += 1
                 continue
             tg = target_for(k, t, ev, vp.get(t, (None, None))[0])
+            rmin = CFG.get("strat_rule", {}).get(k, {}).get("rmin")
+            if rmin and (plan_for(k, t, ev, tg)["rr"] or 0) < rmin:
+                continue                                              # 계획 손익비가 기준 미달 → 이 전략 추천에서 제외
             aux = [dict(label=lb, v=safe(fn, t), d=int(d[t])) for lb, d, fn in ev["aux"][k]]
             aux.append(dict(label="손익비", v=f"1 : {tg['rr']:.1f}" if np.isfinite(tg["rr"]) else "-", d=rr_delta(tg["rr"])))
             f, i = x.get("f"), x.get("i")
@@ -4913,7 +4958,7 @@ function openPick(k,i){
 function renderPanel(){
   const tab=D.tabs.find(t=>t.k===current),st=tab.stocks;
   const wk=D.weak&&D.weak[current],rg=D.bt&&D.bt.regime&&D.bt.regime[current]&&D.bt.regime[current][D.regime_now];
-  document.getElementById('tabdesc').innerHTML=(wk&&rg&&rg.h3?`<span class="rwarn">⚠️ 지금 같은 ${D.regime_now}장에서 이 전략은 과거에 시장보다 평균 ${pctS(rg.h3.ex,2)}였습니다 (${rg.h3.n}건) · 오늘은 참고만</span><br>`:'')+(D.risk&&D.risk.score>=50?`<span class="rwarn">⚠️ 시장 위험 '${D.risk.level}' · 매수 금액을 크게 줄이세요</span><br>`:'')+esc(STRAT[current].d);
+  document.getElementById('tabdesc').innerHTML=(wk&&rg&&rg.h3?`<span class="rwarn">⚠️ 지금 같은 ${D.regime_now}장에서 이 전략은 과거에 시장보다 평균 ${pctS(rg.h3.ex,2)}였습니다 (${rg.h3.n}건) · 오늘은 참고만</span><br>`:'')+(D.risk&&D.risk.score>=50?`<span class="rwarn">⚠️ 시장 위험 '${D.risk.level}' · 매수 금액을 크게 줄이세요</span><br>`:'')+esc(STRAT[current].d)+(current===2?'<br><span class="vl" style="text-align:left">과거 검증 반영: 손절을 현재가−2.5×ATR까지 넓히고, 계획 손익비 1.5 이상인 종목만 추천합니다.</span>':'');
   if(!st.length){document.getElementById('panel').innerHTML='<div class="empty">오늘은 이 전략에 맞는 종목이 없습니다.</div>';return;}
   const row=(x,i)=>`<button class="prow ${i<3?'top':''}" data-pick="${tab.k}:${i}">
       <span class="rk tn">${x.rank}</span>
