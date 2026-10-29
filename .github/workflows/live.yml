@@ -1,0 +1,30 @@
+name: 내 종목 시세 (장중 5분마다)
+
+on:
+  schedule:
+    # 한국시간 평일 08:30 출발(늦게 시작돼도 9시부터 5시간 40분) / 12:00 출발(오후 마감까지 이어받기)
+    - cron: "30 23 * * 0-4"
+    - cron: "0 3 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write              # live 브랜치에 prices.json 올리기
+
+concurrency:
+  group: live-prices
+  cancel-in-progress: false    # 앞 회차가 끝나면 이어서 실행
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      TZ: Asia/Seoul
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas numpy cryptography
+      - name: 장중 시세 올리기
+        run: python stock_dashboard.py --live --minutes 340
