@@ -4016,6 +4016,10 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
 .impcta{display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 12px}.impcta .btn{flex:1 1 auto;text-align:center;text-decoration:none}
 .livebadge{display:inline-block;font-size:12px;font-weight:700;padding:3px 9px;border-radius:999px;background:var(--sunk);color:var(--muted);margin:0 0 6px}
 .livebadge.on{background:rgba(22,163,74,.12);color:#16a34a}
+
+.ivbox{margin-top:12px;padding:12px 14px;border-radius:12px;border:2px solid var(--mid);background:rgba(183,121,31,.07)}
+.ivbox.no{border-color:var(--bad);background:rgba(194,65,12,.07)}
+.ivbox .lab{font-size:12.5px;font-weight:700;color:var(--muted)}.ivbox .val{font-size:18px;font-weight:900}.ivbox p{margin:4px 0 0;font-size:13.5px}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -5132,15 +5136,16 @@ async function pollLive(){
 function liveBadge(){const L=LIVE&&LIVE.date===todayStr();return `<span class="livebadge ${L?'on':''}">${L?`⚡ 실시간 ${esc(LIVE.at)} 기준`:`${esc(D.asof.slice(5))} 종가 기준`}</span>`;}
 function analyzeHolding(code,qty,avg){
   let [name,mk,c,chg,ma20,ma60,slope,bbu,bbl,rsi,atr0,h0,h1,hi20,lo20,hi60,res,sup,pick,rs,fhi,flo,fup,patt]=snapOf(code);
-  const lp=livePx(code);if(lp){c=lp[0];if(lp[1]!=null)chg=lp[1];}
-  const atr=atr0||c*.03,pl=(c/avg-1)*100,plAmt=(c-avg)*qty;
-  const pb=(bbu&&bbl&&bbu>bbl)?(c-bbl)/(bbu-bbl):null;
-  const up=ma20&&ma60&&c>ma20&&ma20>ma60&&slope>0, down=ma60&&c<ma60&&slope<0;
+  const c0=c,chg0=chg,lp=livePx(code);
+  /* 목표·손절·기본 판단은 아침(전 거래일 종가) 기준으로 고정, 장중 가격은 아래에서 따로 비교 */
+  const atr=atr0||c*.03;
+  const pb=(bbu&&bbl&&bbu>bbl)?(c0-bbl)/(bbu-bbl):null;
+  const up=ma20&&ma60&&c0>ma20&&ma20>ma60&&slope>0, down=ma60&&c0<ma60&&slope<0;
   const macdUp=h0!=null&&h1!=null&&h0>h1;
   let stop=up?Math.max((ma20||c)-atr,lo20||0):(sup?sup-.5*atr:(lo20||c)-.5*atr), stopWhy=up?'20일선 − 1×ATR':'아래 매물대·20일 저점';
-  if(!(stop<c*.995)){stop=c-1.5*atr;stopWhy='현재가 − 1.5×ATR';}
-  const cand=[bbu,hi20,res].filter(x=>x&&x>c*1.01);
-  let t1=cand.length?Math.min(...cand):c+1.5*atr; let t2=Math.max(hi60||0,c+2.5*atr); if(t2<=t1*1.01)t2=t1+atr;
+  if(!(stop<c0*.995)){stop=c0-1.5*atr;stopWhy='전일 종가 − 1.5×ATR';}
+  const cand=[bbu,hi20,res].filter(x=>x&&x>c0*1.01);
+  let t1=cand.length?Math.min(...cand):c0+1.5*atr; let t2=Math.max(hi60||0,c0+2.5*atr); if(t2<=t1*1.01)t2=t1+atr;
   const why=[];
   if(ma20&&ma60)why.push(up?'주가가 20일선·60일선 위에 있고 60일선이 올라가는 상승 추세입니다.':down?'주가가 60일선 아래에 있고 60일선이 내려가는 하락 추세입니다.':`주가가 20일선 ${c>ma20?'위':'아래'}, 60일선 ${c>ma60?'위':'아래'}에 있는 혼조 구간입니다.`);
   if(rsi!=null)why.push(`RSI ${rsi.toFixed(0)}: ${rsi>=70?'단기 과열 구간입니다.':rsi<=30?'과매도 구간입니다.':rsi<=40?'약한 편입니다.':'보통 수준입니다.'}`);
@@ -5155,7 +5160,7 @@ function analyzeHolding(code,qty,avg){
   }
   if(patt&&patt!=='없음')why.push(`세력 패턴(최근 20일): ${patt}${patt.includes('이탈')?' — 큰손이 빠져나간 흔적일 수 있어 주의가 필요합니다.':' — 큰손이 사 모은 흔적으로 볼 수 있습니다.'}`);
   if(pick)why.push(`오늘 매수 후보 목록에 있습니다: ${pick}.`);
-  let v,tone,plan;
+  let v,tone,plan;const pl=(c0/avg-1)*100;
   if(down&&h0!=null&&h0<0&&!macdUp){v=pl<0?'손절 검토':'이익 보호 매도';tone='no';plan=pl<0?`하락 추세가 이어지고 있습니다. 반등 시 ${f0(Math.min(ma20||t1,t1))}원 부근에서 비중을 줄이고, ${f0(stop)}원을 깨면 정리하는 것을 검토하세요.`:'수익이 남아 있을 때 일부(1/2)를 정리하고, 나머지는 손절가 이탈 시 정리하는 방법을 검토하세요.';}
   else if(((rsi!=null&&rsi>=70)||(pb!=null&&pb>=1))&&pl>=10){v='일부 익절 (1/3)';tone='mid';plan=`단기 과열 신호가 있습니다. 1/3 정도 수익을 확정하고, 나머지는 ${f0(stop)}원 손절가를 올려 잡은 채 보유하는 방법을 검토하세요.`;}
   else if(up){v='보유 (추세 유지)';tone='ok';plan=`1차 목표 ${f0(t1)}원 도달 시 1/3, 2차 목표 ${f0(t2)}원 도달 시 1/3을 나눠 매도하고, 나머지는 20일선을 깨기 전까지 보유하는 방법을 검토하세요.`;}
@@ -5165,7 +5170,23 @@ function analyzeHolding(code,qty,avg){
   const tips=[];
   if(up&&rsi!=null&&rsi>=40&&rsi<=55&&ma20&&Math.abs(c/ma20-1)<.03)tips.push('20일선 눌림 구간이라 분할 추가매수를 고려해볼 수 있는 자리입니다.');
   if(pl<=-15&&!up)tips.push('손실 구간에서의 물타기는 추세가 돌아선 것(20일선 회복 등)을 확인한 뒤에 하는 것이 안전합니다.');
-  return {name,mk,c,chg,pl,plAmt,val:c*qty,v,tone,plan,why,tips,stop,stopWhy,t1,t2,qty,avg,code};
+  /* ── 장중 판단: 지금 가격이 아침 기준 목표·손절·추세선을 넘었는지 ── */
+  const v0=v,tone0=tone;let live=null;
+  if(lp){c=lp[0];chg=lp[1]!=null?lp[1]:chg;
+    const G=(D.gainers&&D.gainers.stats)||{},gs=k=>Object.entries(G).find(([n])=>n.includes(k));
+    const st=x=>x?`과거 2년 비슷한 급등 다음 날 평균 ${pctS(x[1].d1,1)}(오른 비율 ${x[1].up1}%)`:'';
+    const pbL=(bbu&&bbl&&bbu>bbl)?(c-bbl)/(bbu-bbl):null;
+    if(c<=stop){v='손절가 이탈 · 정리 검토';tone='no';live=`장중 ${f0(c)}원으로 손절가 ${f0(stop)}원 아래입니다.`;plan=`계획한 손절가를 깼습니다. 장 마감까지 ${f0(stop)}원 위로 회복하지 못하면 정리를 검토하세요.`;}
+    else if(chg>=29){v='상한가 · 익절 검토';tone='mid';live=`오늘 ${pctS(chg,1)} 상한가 부근입니다. ${st(gs('상한가'))}.`;plan=`상한가는 다음 날 크게 흔들리는 경우가 많습니다. 절반 이상 수익을 확정하고, 나머지는 오늘 시가 또는 평단 위로 손절가를 올려 두는 방법을 검토하세요.`;}
+    else if(chg>=15){v='급등 · 일부 익절 검토';tone='mid';live=`오늘 ${pctS(chg,1)} 급등 중입니다. ${st(gs('15'))}.`;plan=`급등한 날은 1/3~1/2을 수익 확정하고, 나머지는 손절가를 평단 위로 올려 보유하는 방법을 검토하세요.`;}
+    else if(c>=t2){v='2차 목표 도달 · 매도 검토';tone='mid';live=`장중 ${f0(c)}원으로 2차 목표 ${f0(t2)}원을 넘었습니다.`;plan=`남은 물량의 대부분을 정리하고, 일부만 남긴다면 손절가를 1차 목표 ${f0(t1)}원으로 올려 두세요.`;}
+    else if(c>=t1){v='1차 목표 도달 · 절반 매도 검토';tone='mid';live=`장중 ${f0(c)}원으로 1차 목표 ${f0(t1)}원에 닿았습니다.`;plan=`절반을 매도하고, 남은 절반은 손절가를 평단 ${f0(avg)}원 위로 올려 2차 목표 ${f0(t2)}원까지 보유하는 방법을 검토하세요.`;}
+    else if(chg<=-10){v='급락 · 손절가 확인';tone='no';live=`오늘 ${pctS(chg,1)} 급락 중입니다.`;plan=`손절가 ${f0(stop)}원까지 ${((c-stop)/c*100).toFixed(1)}% 남았습니다. 이탈하면 정리, 지키면 마감까지 지켜보세요.`;}
+    else if(pbL!=null&&pbL>=1&&tone0==='ok'&&chg>=5){v='장중 과열 · 일부 익절';tone='mid';live=`오늘 ${pctS(chg,1)} 올라 볼린저 상단 ${f0(bbu)}원을 넘었습니다.`;plan=`단기 과열입니다. 1/3 정도 수익을 확정하는 방법을 검토하세요.`;}
+    else if(ma20&&c0>=ma20&&c<ma20&&tone0==='ok'){v='20일선 이탈 · 주의';tone='mid';live=`장중 ${f0(c)}원으로 20일선 ${f0(ma20)}원 아래로 내려왔습니다.`;plan=`마감까지 20일선을 되찾지 못하면 비중 축소를 검토하세요.`;}
+  }
+  const plNow=(c/avg-1)*100,plAmt=(c-avg)*qty;
+  return {name,mk,c,c0,chg,pl:plNow,plAmt,val:c*qty,v,v0,tone,tone0,live,plan,why,tips,stop,stopWhy,t1,t2,qty,avg,code};
 }
 function lvBar(r){
   /* 가격 위치: 점은 막대 위에, 이름·가격은 아래 칩으로 (겹치지 않게). 값 차이가 크면 로그 눈금 */
@@ -5219,6 +5240,7 @@ function holdCard(h,saved){
           ${W?`<p class="vl" style="text-align:left;margin:4px 0">최근 2주 뉴스 분위기: <b>${esc(W.senti.label)}</b> (긍정 ${W.senti.pos} · 부정 ${W.senti.neg}건)</p>
             ${W.items.length?`<ul class="bl">${W.items.slice(0,5).map(x=>`<li><span class="dt tn">${esc(x.d||'')}</span>${x.en?'<span class="en">해외</span>':''}<a href="${esc(x.u)}" target="_blank" rel="noopener">${esc(x.t)}</a></li>`).join('')}</ul>`:''}`
           :'<p class="vl" style="text-align:left;margin:4px 0">이 종목은 뉴스를 모으는 목록(watchlist)에 없어서 차트로만 판단했습니다. Claude에게 "내 종목 뉴스 목록에 추가해줘"라고 하시면 다음 날부터 뉴스도 반영됩니다.</p>'}</div>`;})()}
+      ${r.live?`<div class="ivbox ${r.tone}"><div class="lab">⚡ 장중 판단 변화 <span class="vl">(${LIVE?esc(LIVE.at):''} 기준)</span></div><div class="val">${esc(r.v0)} → ${esc(r.v)}</div><p>${esc(r.live)}</p></div>`:''}
       <div class="hv"><div class="lab">📊 차트 기준 전략 <button class="q" data-help="hold" aria-label="설명 보기">?</button></div><div class="val ${r.tone}">${r.v}</div></div>
       <div class="plan"><b>실행 계획 (예시)</b>${r.plan}${r.tips.map(t=>`<br>· ${t}`).join('')}</div>
       <div style="margin-top:12px">${aiSlot({prompt:holdPrompt(r),code:r.code,kind:'hold',key:`ai:${D.asof}:${r.code}:h${r.qty}:${r.avg}`,tone:r.tone==='no'?'bad':r.tone})}</div>
@@ -5282,7 +5304,8 @@ function holdStatus(r){
   const prog=base?(c-r.avg)/(base-r.avg)*100:null;
   const toT=(r.t1/c-1)*100,toS=(c-r.stop)/c*100;
   const al=[];
-  if(c<r.stop)al.push(['bad','🚨',`손절가 ${f0(r.stop)}원 아래 · 정리 검토`]);
+  if(r.live&&r.v!==r.v0)al.push([r.tone==='no'?'bad':'warn','⚡',`장중: ${r.v0} → ${r.v}`]);
+  else if(c<r.stop)al.push(['bad','🚨',`손절가 ${f0(r.stop)}원 아래 · 정리 검토`]);
   else if(toS<=cf.stop)al.push(['warn','⚠️',`손절가까지 ${toS.toFixed(1)}% 남음`]);
   if(prog!=null&&prog>=100)al.push(['ok','✅',`${lab} 도달 · 절반 익절 검토`]);
   else if(prog!=null&&prog>=cf.tgt)al.push(['ok','🎯',`${lab} ${Math.round(prog)}% 근접 · 익절 준비`]);
