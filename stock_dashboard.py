@@ -3121,6 +3121,8 @@ def write_html(data, path):
     gc = re.sub(r"[^a-z0-9-]", "", os.environ.get("GOATCOUNTER_CODE", "").strip().lower())
     analytics = (f'<script data-goatcounter="https://{gc}.goatcounter.com/count" data-goatcounter-settings=\'{{"no_onload":true}}\' '
                  f'async src="https://gc.zgo.at/count.js"></script><script>window.GC_CODE="{gc}";</script>') if gc else ""
+    repo = os.environ.get("GITHUB_REPOSITORY", "TAE1GT/stock-daily")
+    boot = f"window.LIVE_URL='https://raw.githubusercontent.com/{repo}/live/prices.json';" + boot
     html = TEMPLATE.replace("__BOOT__", boot).replace("__LOCKED__", "locked" if SITE_PASSWORD else "").replace("__ANALYTICS__", analytics)
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -3174,6 +3176,94 @@ def serve(port, demo, out, open_browser):
     HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
+# ───────────────────────────── 장중 내 종목 시세 (5분마다 · live 브랜치의 prices.json) ─────────────────────────────
+def live_quotes_kr(codes):
+    """네이버 실시간 시세를 여러 종목씩 묶어서 (서버에서 받으므로 브라우저 제한 없음)"""
+    out = {}
+    for i in range(0, len(codes), 60):
+        chunk = codes[i:i + 60]
+        try:
+            j = json.loads(http_get("https://polling.finance.naver.com/api/realtime/domestic/stock/" + ",".join(chunk), retries=2))
+            for d in j.get("datas", []):
+                p = _num(str(d.get("closePrice", "")))
+                r = _num(str(d.get("fluctuationsRatio", "")))
+                if p == p and p > 0:
+                    out[str(d.get("itemCode"))] = [p, r if r == r else None]
+            continue
+        except Exception:
+            pass
+        try:                                                     # 예전 형식 주소
+            q = "|".join("SERVICE_ITEM:" + c for c in chunk)
+            j = json.loads(http_get("https://polling.finance.naver.com/api/realtime?query=" + q, retries=2))
+            for d in j["result"]["areas"][0]["datas"]:
+                p, cr, rf = float(d.get("nv", 0)), float(d.get("cr", 0)), str(d.get("rf", "3"))
+                if p > 0:
+                    out[str(d["cd"])] = [p, -cr if rf in ("4", "5") else cr]
+        except Exception:
+            pass
+    return out
+
+
+def live_loop(minutes=340, every=300):
+    """장중에 5분마다 시세만 받아서 live 브랜치에 prices.json 한 개로 올림 (기록이 쌓이지 않게 매번 덮어씀)"""
+    import subprocess
+    import time as _t
+    sh = lambda *a: subprocess.run(a, check=False, capture_output=True, text=True)
+    lst = listing_mobile_api()
+    codes = [c for c in lst.index if re.fullmatch(r"\d{5}[0-9A-Z]", str(c))]
+    try:
+        etf = listing_etf()
+        if etf is not None:
+            codes += [c for c in etf.index if c not in set(codes)]
+    except Exception:
+        pass
+    wl = load_watchlist()
+    us = [it["ticker"].upper() for it in wl if it.get("type") == "us"]
+    cr = [it["symbol"].upper() for it in wl if it.get("type") == "crypto"]
+    print(f"장중 시세: 국내 {len(codes)} · 미국 {len(us)} · 코인 {len(cr)}", flush=True)
+    sh("git", "config", "user.name", "stock-daily-bot")
+    sh("git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+    sh("git", "switch", "--orphan", "live")
+    start, first = _t.time(), True
+    while _t.time() - start < minutes * 60:
+        now = datetime.now()
+        hm = now.hour * 60 + now.minute
+        if hm < 8 * 60 + 55:
+            _t.sleep(min(600, (8 * 60 + 55 - hm) * 60))
+            continue
+        if hm > 15 * 60 + 45 and not first:
+            break
+        d = live_quotes_kr(codes)
+        try:
+            fx = fetch_yahoo_ohlc("KRW=X", "5d")["c"].iloc[-1]
+        except Exception:
+            fx = None
+        for tk in us:
+            try:
+                j = json.loads(http_get(f"https://query1.finance.yahoo.com/v8/finance/chart/{tk}?range=1d&interval=5m", retries=1))["chart"]["result"][0]["meta"]
+                p, pc = float(j["regularMarketPrice"]), float(j.get("chartPreviousClose") or j.get("previousClose") or 0)
+                if fx:
+                    d["US:" + tk] = [round(p * fx, 2), round((p / pc - 1) * 100, 2) if pc else None]
+            except Exception:
+                pass
+        if cr:
+            try:
+                for x in json.loads(http_get("https://api.upbit.com/v1/ticker?markets=" + ",".join("KRW-" + s for s in cr), retries=1)):
+                    d["CR:" + x["market"][4:]] = [float(x["trade_price"]), round(float(x["signed_change_rate"]) * 100, 2)]
+            except Exception:
+                pass
+        with open("prices.json", "w", encoding="utf-8") as f:
+            json.dump(dict(date=now.strftime("%Y-%m-%d"), at=now.strftime("%H:%M"), d=d), f, separators=(",", ":"))
+        sh("git", "add", "-f", "prices.json")
+        sh("git", "commit", "-q", "-m", f"시세 {now:%m-%d %H:%M}", *([] if first else ["--amend"]))
+        r = sh("git", "push", "-q", "-f", "origin", "live")
+        print(f"  {now:%H:%M} 시세 {len(d)}종목 올림 {'(실패: ' + r.stderr[:80] + ')' if r.returncode else ''}", flush=True)
+        first = False
+        if hm > 15 * 60 + 40:
+            break
+        _t.sleep(every)
+
+
 def main():
     ap = argparse.ArgumentParser(description="매일 아침 종목 발굴 대시보드")
     ap.add_argument("--serve", action="store_true", help="로컬 서버 모드 (새로고침 시 자동 갱신)")
@@ -3181,7 +3271,12 @@ def main():
     ap.add_argument("--demo", action="store_true", help="가상 데이터로 미리보기")
     ap.add_argument("--out", default=None, help="저장할 HTML 경로")
     ap.add_argument("--no-open", action="store_true", help="브라우저 자동 열기 끄기")
+    ap.add_argument("--live", action="store_true", help="장중 5분마다 내 종목 시세 올리기 (GitHub Actions 전용)")
+    ap.add_argument("--minutes", type=int, default=340)
     args = ap.parse_args()
+    if args.live:
+        live_loop(args.minutes)
+        return
     out = args.out or os.path.join(BASE, "dashboard_demo.html" if args.demo else "dashboard.html")
     if args.serve:
         serve(args.port, args.demo, out, not args.no_open)
@@ -3917,6 +4012,10 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
 .sortbar button{flex:none;font:inherit;font-size:12.5px;font-weight:700;padding:6px 10px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--muted);cursor:pointer}
 .sortbar button.on{background:var(--ink);color:var(--surface);border-color:var(--ink)}
 .sortbar button.grp{margin-left:auto;border-style:dashed}.sortbar button.grp.on{background:var(--sunk);color:var(--ink);border-color:var(--line)}
+
+.impcta{display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 12px}.impcta .btn{flex:1 1 auto;text-align:center;text-decoration:none}
+.livebadge{display:inline-block;font-size:12px;font-weight:700;padding:3px 9px;border-radius:999px;background:var(--sunk);color:var(--muted);margin:0 0 6px}
+.livebadge.on{background:rgba(22,163,74,.12);color:#16a34a}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -3958,6 +4057,7 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
 
   <section class="view" id="v-mine" hidden>
     <div class="vh"><h2>내 종목 <button class="q" data-help="mine" aria-label="설명 보기">?</button></h2></div>
+    <div class="impcta"><button class="btn" data-imp="1">📥 가져오기 · 코드 붙여넣기</button><button class="btn ghost" data-help="import">📸 사진으로 등록하는 법</button></div>
     <div class="form">
       <label>종목명 또는 코드<input id="fStock" list="stocklist" placeholder="예: 삼성전자 · KODEX 은선물 · 애플 · 수이" autocomplete="off"></label>
       <label>수량 (주)<input id="fQty" type="number" inputmode="decimal" min="0" step="any" placeholder="100"></label>
@@ -3966,7 +4066,7 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
       <p class="err" id="fErr" hidden></p>
     </div>
     <datalist id="stocklist"></datalist>
-    <div class="iebar"><button class="btn ghost sm" data-imp="1">📥 가져오기</button><button class="btn ghost sm" data-exp="1">📤 내보내기 (암호 파일)</button><button class="btn ghost sm" data-help="import">📸 사진으로 등록하는 법</button></div>
+    <div class="iebar"><button class="btn ghost sm" data-exp="1">📤 내보내기 (다른 기기로 옮기기)</button></div>
     <div id="mylist"></div>
   </section>
 
@@ -5021,8 +5121,18 @@ function findCode(q){q=q.trim();if(!q)return null;if(NAMES[q])return q;
   if(/^[0-9A-Z]{6}$/.test(q)&&AI_URL)return q;
   if(byName[q])return byName[q];const k=Object.keys(byName).find(n=>n.replace(/\s/g,'')===q.replace(/\s/g,''));return k?byName[k]:null;}
 
+let LIVE=null;
+const todayStr=()=>{const d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;};
+const livePx=code=>LIVE&&LIVE.date===todayStr()&&LIVE.d[code]?LIVE.d[code]:null;
+async function pollLive(){
+  if(!window.LIVE_URL||document.hidden)return;
+  try{const r=await fetch(window.LIVE_URL+'?t='+Math.floor(Date.now()/60000),{cache:'no-store'});if(!r.ok)return;const j=await r.json();
+    if(!LIVE||j.at!==LIVE.at){LIVE=j;if(loadH().length)rerender();}}catch(_){}
+}
+function liveBadge(){const L=LIVE&&LIVE.date===todayStr();return `<span class="livebadge ${L?'on':''}">${L?`⚡ 실시간 ${esc(LIVE.at)} 기준`:`${esc(D.asof.slice(5))} 종가 기준`}</span>`;}
 function analyzeHolding(code,qty,avg){
-  const [name,mk,c,chg,ma20,ma60,slope,bbu,bbl,rsi,atr0,h0,h1,hi20,lo20,hi60,res,sup,pick,rs,fhi,flo,fup,patt]=snapOf(code);
+  let [name,mk,c,chg,ma20,ma60,slope,bbu,bbl,rsi,atr0,h0,h1,hi20,lo20,hi60,res,sup,pick,rs,fhi,flo,fup,patt]=snapOf(code);
+  const lp=livePx(code);if(lp){c=lp[0];if(lp[1]!=null)chg=lp[1];}
   const atr=atr0||c*.03,pl=(c/avg-1)*100,plAmt=(c-avg)*qty;
   const pb=(bbu&&bbl&&bbu>bbl)?(c-bbl)/(bbu-bbl):null;
   const up=ma20&&ma60&&c>ma20&&ma20>ma60&&slope>0, down=ma60&&c<ma60&&slope<0;
@@ -5138,7 +5248,7 @@ function renderMine(){
   if(!list.length){box.innerHTML='<div class="empty">저장한 종목이 없습니다. 위에 입력하고 <b>저장</b>을 누르면 매일 자동으로 다시 점검하고, 첫 화면에 목표가 근접 알림을 보여드립니다.</div>'+cfgHTML();return;}
   let tot=0,cost=0;list.forEach(h=>{if(snapOf(h.code)){const r=analyzeHolding(h.code,h.qty,h.avg);tot+=r.val;cost+=r.avg*r.qty;}else if(AI_URL&&!PENDING[h.code])setTimeout(()=>fetchSnap(h.code),0);});
   const pl=tot-cost;
-  box.innerHTML=`<div class="msum tn"><span>저장 ${list.length}종목</span><span>평가 ${f0(tot)}원</span><b class="${pl>=0?'upc':'downc'}">${pl>=0?'+':''}${f0(pl)}원</b></div>
+  box.innerHTML=`${liveBadge()}<div class="msum tn"><span>저장 ${list.length}종목</span><span>평가 ${f0(tot)}원</span><b class="${pl>=0?'upc':'downc'}">${pl>=0?'+':''}${f0(pl)}원</b></div>
     ${sortBar()}${groupedHTML(list,true)}
     <button class="btn ai allai" data-allai="1">🤖 내 종목 전체 AI 점검 (최근 뉴스로 지속 투자 판단)</button>${cfgHTML()}
     <p class="vl" style="text-align:left;margin-top:6px">종목을 누르면 자세한 점검이 열리고, ✕를 누르면 목록에서 지워집니다.</p>`;
@@ -5251,12 +5361,13 @@ document.addEventListener('click',e=>{const sv=e.target.closest('.cfgSave');if(!
   saveCfg({tgt:t,stop:s_});rerender();});
 function myHomeHTML(){
   const saved=loadH();
-  if(!saved.length)return `<a class="card wide minecta" href="#mine"><b>💼 내 종목을 등록해 보세요</b><span class="vl">보유 종목·수량·평단을 넣으면 매일 아침 분석 결과와 목표가 근접 알림을 이 첫 화면에 보여드립니다.</span></a>`;
+  if(!saved.length)return `<div class="card wide minecta"><b>💼 내 종목을 등록해 보세요</b><span class="vl">보유 종목·수량·평단을 넣으면 분석 결과와 목표가 근접 알림을 이 첫 화면에 보여드립니다.</span>
+    <div class="impcta"><button class="btn" data-imp="1">📥 코드 붙여넣기</button><a class="btn ghost" href="#mine">✏️ 직접 입력</a><button class="btn ghost" data-help="import">📸 사진으로 등록</button></div></div>`;
   const rows=saved.map(h=>({h,s:snapOf(h.code)?holdStatus(analyzeHolding(h.code,h.qty,h.avg)):null}));
   const rank=x=>!x.s||!x.s.al.length?9:x.s.al[0][0]==='bad'?0:x.s.al[0][0]==='warn'?1:2;
   rows.sort((a,b)=>rank(a)-rank(b)||((b.s&&b.s.prog)||-999)-((a.s&&a.s.prog)||-999));
   const alerts=rows.filter(x=>x.s&&x.s.al.length);
-  return `<div class="card wide mine1"><div class="ch"><h3>💼 내 종목 ${alerts.length?`<span class="abadge">🔔 ${alerts.length}</span>`:''}</h3><a class="more" href="#mine">＋ 추가 · 관리</a></div>
+  return `<div class="card wide mine1"><div class="ch"><h3>💼 내 종목 ${alerts.length?`<span class="abadge">🔔 ${alerts.length}</span>`:''}</h3><a class="more" href="#mine">＋ 추가 · 관리</a></div>${liveBadge()}
     ${alerts.length?`<div class="alist">${alerts.map(x=>`<button class="alrow ${x.s.al[0][0]}" data-hold="${hid(x.h)}"><b>${esc(NAMES[x.h.code]||x.h.code)}</b>${x.s.al.map(a=>`<span>${a[1]} ${a[2]}</span>`).join('')}</button>`).join('')}</div>`:'<p class="vl" style="text-align:left;margin:0 0 8px">지금은 목표가 근접·손절가 근접 종목이 없습니다.</p>'}
     ${sortBar()}${groupedHTML(rows.map(x=>x.h),false)}
     <button class="btn ai allai" data-allai="1">🤖 내 종목 전체 AI 점검 (최근 뉴스로 지속 투자 판단)</button>${cfgHTML()}</div>`;
@@ -5353,6 +5464,7 @@ document.getElementById('demo').hidden=!D.demo;
 document.getElementById('refresh').onclick=()=>location.reload();
 renderBrief();renderScore();renderRevLink();renderVisits();checkFresh();setInterval(checkFresh,10*60*1000);renderRisk();renderMacro();renderOutlook();renderEvents();
 renderGainers();renderTabs();renderPanel();initHolds();route();
+pollLive();setInterval(pollLive,3*60*1000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pollLive();});
 let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(drawAll,150);});
 }
 </script>
