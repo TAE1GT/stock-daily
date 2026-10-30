@@ -1868,6 +1868,94 @@ def re_series(rows, lo=76, hi=90):
     return [dict(m=k, med=round(float(np.median(v)), 2), n=len(v)) for k, v in sorted(m.items())]
 
 
+# ── 부동산 예상치: 분당 추세 × 단지 상대강도 × 거래량 신호 + 선도지구 선례(구역 지정 효과) · 과거 검증 ──
+def _months_ahead(m, h):
+    return (pd.Timestamp(m + "-01") + pd.DateOffset(months=h)).strftime("%Y-%m")
+
+
+def _slope(vals):
+    """월별 로그가격의 기울기 (Theil-Sen: 튀는 거래에 덜 흔들림)"""
+    y = np.log(np.asarray(vals, float))
+    n = len(y)
+    if n < 4:
+        return 0.0
+    s = [(y[j] - y[i]) / (j - i) for i in range(n) for j in range(i + 1, n)]
+    return float(np.median(s))
+
+
+def re_forecast(zser, bser, vol, event_prem=None, horizons=(3, 6, 12)):
+    """zser/bser: [{m, med, n}] (단지 / 분당 전체). 반환: 시나리오별 예상 경로 + 68% 범위"""
+    if len(bser) < 8 or len(zser) < 4:
+        return None
+    b12 = bser[-12:]
+    g_b = _slope([x["med"] for x in b12])                                 # 분당 월 성장률(로그)
+    z12 = [x for x in zser if x["m"] >= b12[0]["m"]]
+    rel = (_slope([x["med"] for x in z12]) - g_b) if len(z12) >= 4 else 0.0
+    v3, v12 = (np.mean(vol[-3:]), np.mean(vol[-12:])) if len(vol) >= 12 else (None, None)
+    vadj = 0.002 if v3 and v3 > v12 * 1.2 else -0.002 if v3 and v3 < v12 * 0.8 else 0.0
+    dif = np.diff(np.log([x["med"] for x in bser[-24:]]))
+    sig = float(np.std(dif)) if len(dif) > 3 else 0.02
+    zd = np.diff(np.log([x["med"] for x in zser[-24:]]))
+    sig_z = max(sig, float(np.std(zd)) / 1.5 if len(zd) > 3 else sig)       # 단지는 거래가 적어 더 흔들림
+    base = float(np.median([x["med"] for x in zser[-3:]]))
+    m0 = zser[-1]["m"]
+    path, lvl, damp = [], np.log(base), 0.92
+    for h in range(1, max(horizons) + 1):
+        lvl += (g_b + 0.5 * rel + vadj) * damp ** h
+        path.append(lvl)
+    out = dict(m0=m0, base=round(base, 2), g=round((np.exp(g_b) - 1) * 100, 2), rel=round((np.exp(rel) - 1) * 100, 2), vadj=vadj, sig=round(sig_z * 100, 1))
+    sc = {}
+    for name, extra in (("기본", 0.0), ("하락", -1.0), ("선례 적용", None)):
+        pts = []
+        for h in range(1, max(horizons) + 1):
+            l = path[h - 1]
+            if name == "하락":
+                l -= sig_z * np.sqrt(h)
+            if name == "선례 적용":
+                if not event_prem:
+                    break
+                l += np.log(1 + event_prem / 100) * min(1, h / 6)
+            pts.append(dict(m=_months_ahead(m0, h), med=round(float(np.exp(l)), 2),
+                            lo=round(float(np.exp(path[h - 1] - sig_z * np.sqrt(h))), 2), hi=round(float(np.exp(path[h - 1] + sig_z * np.sqrt(h))), 2)))
+        if pts:
+            sc[name] = pts
+    out["sc"] = sc
+    out["at"] = {f"h{h}": {k: v[h - 1]["med"] for k, v in sc.items() if len(v) >= h} for h in horizons}
+    return out
+
+
+def re_backtest(bser):
+    """분당 전체로 같은 방법을 과거에 적용: 3·6개월 뒤 예상 vs 실제"""
+    res = {3: [], 6: []}
+    for i in range(12, len(bser)):
+        hist = bser[:i]
+        f = re_forecast(hist, hist, [x["n"] for x in hist], horizons=(3, 6))
+        if not f:
+            continue
+        for h in (3, 6):
+            if i - 1 + h < len(bser):
+                act, pred, now = bser[i - 1 + h]["med"], f["sc"]["기본"][h - 1]["med"], hist[-1]["med"]
+                res[h].append((abs(pred / act - 1) * 100, (pred >= now) == (act >= now),
+                               f["sc"]["기본"][h - 1]["lo"] <= act <= f["sc"]["기본"][h - 1]["hi"]))
+    return {f"h{h}": dict(n=len(v), mape=round(float(np.mean([x[0] for x in v])), 1), hit=round(float(np.mean([x[1] for x in v])) * 100),
+                          band=round(float(np.mean([x[2] for x in v])) * 100)) for h, v in res.items() if v}
+
+
+def re_event_premium(zones_ser, bser, event_m="2024-11"):
+    """선도지구 선정(2024.11) 전 3개월 → 후 6개월, 분당 전체보다 얼마나 더 올랐나 (선도지구 4곳 평균)"""
+    bm = {x["m"]: x["med"] for x in bser}
+    pre = [_months_ahead(event_m, -k) for k in (1, 2, 3)]
+    post = [_months_ahead(event_m, k) for k in (4, 5, 6)]
+    ex = []
+    for ser in zones_ser:
+        zm = {x["m"]: x["med"] for x in ser}
+        a, b = [zm[m] for m in pre if m in zm], [zm[m] for m in post if m in zm]
+        ba, bb = [bm[m] for m in pre if m in bm], [bm[m] for m in post if m in bm]
+        if a and b and ba and bb:
+            ex.append((np.median(b) / np.median(a) - 1) - (np.median(bb) / np.median(ba) - 1))
+    return round(float(np.mean(ex)) * 100, 1) if len(ex) >= 2 else None
+
+
 def re_build(demo=False):
     key = os.environ.get("MOLIT_API_KEY", "").strip()
     out = dict(zones=[], haskey=bool(key or demo), market=None, updated=datetime.now().strftime("%Y-%m-%d"))
@@ -1941,6 +2029,20 @@ def re_build(demo=False):
             sig = "매수 분위기 (가격↑·거래↑)" if up and v3 >= v12 else "가격만 오름 (거래 위축)" if up else "위축 (가격↓)" if dn else "관망 (보합)"
         out["market"] = dict(bundang=sb[-36:], gwanggyo=sg[-36:], vol=vol[-36:], sig=sig,
                              v3=round(v3) if v3 else None, v12=round(v12) if v12 else None)
+    # 예상치 (시장 상황 반영)
+    try:
+        if out.get("market"):
+            bser = out["market"]["bundang"]
+            vol = out["market"]["vol"]
+            lead = [z["ser"] for z in out["zones"] if z["group"] == "1차 선도지구" and len(z["ser"]) >= 12]
+            prem = re_event_premium(lead, bser)
+            out["market"]["fc"] = re_forecast(bser, bser, vol)
+            out["market"]["bt"] = re_backtest(bser)
+            out["market"]["prem"] = prem
+            for z in out["zones"]:
+                z["fc"] = re_forecast(z["ser"], bser, vol, event_prem=(prem if z["group"] != "1차 선도지구" and prem and prem > 0 else None))
+    except Exception as ex:
+        print(f"  부동산 예상치 실패: {ex}", flush=True)
     out["news"] = [] if demo else gnews("분당 재건축 특별정비구역", "ko", 14, 6)
     return out
 
@@ -4666,6 +4768,11 @@ const HELP={
       <h5>과거 패턴 계산</h5><p><b>일정 전 5일</b> = 일정 전날 종가 ÷ 6거래일 전 종가 − 1 · <b>일정 후 5일</b> = 일정 후 4거래일 종가 ÷ 일정 전날 종가 − 1. 관련 섹터 대표 ETF(시장 전체 일정은 코스피)로 과거 약 5년간 같은 일정을 모아 평균과 상승 비율을 냅니다. 표본이 3번 미만이면 표시하지 않습니다.</p>
       <h5>5일 전망 모델에 들어가는 값</h5><p>섹터 일정이 5거래일 안에 있는지, 시장 전체 일정이 5거래일 안에 있는지, 섹터 일정 직후인지, 실적 시즌인지 4가지를 입력으로 넣습니다.</p>
       <h5>일정 추가하기</h5><p>GitHub 저장소에 <b>events.json</b> 파일을 만들고 <code>[{"date":"2027-05-20","name":"행사명","sectors":["반도체"]}]</code> 형식으로 적으면 다음 실행부터 반영됩니다. 섹터 이름은 표의 섹터 이름과 같게 쓰고, 시장 전체 일정은 <code>"*"</code>로 씁니다. 몇 달에 한 번 Claude에게 "일정 업데이트해줘"라고 하시면 다시 검색해서 채워 드립니다.</p>`],
+  refc:['🔮 부동산 예상 시세는 이렇게 계산합니다',()=>`<ul><li><b>기본</b>: 최근 12개월 <b>분당 전체</b> 84㎡ 가격 추세(튀는 거래에 덜 흔들리는 방식) + 이 구역이 분당보다 강했던/약했던 만큼의 절반 + 최근 3개월 <b>거래량</b>이 1년 평균보다 20% 이상 많으면 월 +0.2%, 적으면 −0.2%. 추세는 시간이 갈수록 약해지게(월 8%씩) 계산합니다.</li>
+      <li><b>하락</b>: 과거 월별 흔들림만큼 나빠지는 경우(68% 범위 아래쪽).</li>
+      <li><b>선례 적용</b>(2차 구역만): 2024년 11월 선도지구 선정 후 6개월간 선도지구가 분당보다 더 오른 만큼을 6개월에 걸쳐 더합니다. 이미 9월 선정 발표가 났으므로 일부는 가격에 들어가 있을 수 있습니다.</li>
+      <li>연한 띠는 68% 범위입니다. 과거 검증 숫자(오차·방향 적중)를 함께 보세요.</li>
+      <li>반영하지 못한 것: 금리·대출 규제 변화, 호가, 구역 지정 고시·사업시행자 지정 같은 실제 일정. 이런 변화가 생기면 숫자는 크게 달라질 수 있습니다. <b>참고용 숫자이지 보장이 아닙니다.</b></li></ul>`],
   re:['🏠 분당 재건축 보는 법',()=>`<ul><li><b>입주권 신호등</b>: 투기과열지구 재건축은 <b>사업시행자 지정 고시일 이후</b> 산 사람은 원칙적으로 조합원(분양대상자)이 될 수 없습니다. 🔴 선도지구 4곳은 지정이 끝났고, 🟡 2차 5곳은 12월 구역 지정 고시 후 사업시행자 지정 전까지가 기회입니다(선도지구는 구역 지정 후 약 5~6개월 만에 지정됨).</li>
       <li><b>예외</b>: 지정 후에도 1세대 1주택 10년 보유·5년 거주 매도인 등 예외 요건 매물은 승계 가능 — 반드시 확인.</li>
       <li><b>시세</b>: 국토교통부 실거래가(신고 기한 30일이라 최근 한 달은 덜 채워짐), 84㎡형(전용 76~90㎡) 월별 중간값. 호가(매물가)는 무료 공개 자료가 없어 넣지 않았습니다.</li>
@@ -4857,16 +4964,29 @@ const RE=D.re||null;
 const ok_=v=>v!=null&&isFinite(v);
 const eok=v=>ok_(v)?(v>=1?`${(+v).toFixed(2).replace(/\.?0+$/,'')}억`:`${Math.round(v*1e4).toLocaleString()}만`):'-';
 const SIG={red:['🔴','지금 사면 원칙적으로 입주권 ✕'],yellow:['🟡','입주권 가능 · 사업시행자 지정 전까지'],green:['🟢','입주권 가능 (후보 단계)']};
-function reChart(lines,vol){
-  const all=lines.flatMap(l=>l.data.map(x=>x.med)).filter(ok_);if(!all.length)return '<p class="vl">거래 자료가 없습니다.</p>';
-  const months=[...new Set(lines.flatMap(l=>l.data.map(x=>x.m)))].sort();const W=600,H=200,pl=8,pr=46,pt=10,pb=vol?54:22;
+function reChart(lines,vol,fc){
+  const fl=fc&&fc.sc?Object.entries(fc.sc).map(([k,v])=>({k,v:v.slice(0,12)})):[];
+  const all=[...lines.flatMap(l=>l.data.map(x=>x.med)),...fl.flatMap(f=>f.v.flatMap(x=>[x.med,x.lo,x.hi]))].filter(ok_);if(!all.length)return '<p class="vl">거래 자료가 없습니다.</p>';
+  const months=[...new Set([...lines.flatMap(l=>l.data.map(x=>x.m)),...fl.flatMap(f=>f.v.map(x=>x.m))])].sort();const W=600,H=200,pl=8,pr=46,pt=10,pb=vol?54:22;
   const lo=Math.min(...all)*.97,hi=Math.max(...all)*1.03,X=m=>pl+months.indexOf(m)/Math.max(1,months.length-1)*(W-pl-pr),Y=v=>pt+(hi-v)/(hi-lo||1)*(H-pt-pb);
   let g=[0,.5,1].map(t=>{const v=lo+(hi-lo)*t;return `<line x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--line)"/><text x="${W-pr+4}" y="${Y(v)+4}" font-size="11" fill="var(--muted)">${v.toFixed(1)}억</text>`;}).join('');
   lines.forEach(l=>{const pts=l.data.filter(x=>ok_(x.med)).map(x=>`${X(x.m).toFixed(1)},${Y(x.med).toFixed(1)}`);g+=`<polyline fill="none" stroke="${l.c}" stroke-width="2.4" points="${pts.join(' ')}"/>`+l.data.map(x=>`<circle cx="${X(x.m)}" cy="${Y(x.med)}" r="2.6" fill="${l.c}"/>`).join('');});
+  if(fl.length){const b=fl.find(f=>f.k==='기본');const last=lines[0].data.filter(x=>ok_(x.med)).slice(-1)[0];
+    if(b){const up=b.v.map(x=>`${X(x.m).toFixed(1)},${Y(x.hi).toFixed(1)}`),dn=b.v.slice().reverse().map(x=>`${X(x.m).toFixed(1)},${Y(x.lo).toFixed(1)}`);
+      g=`<polygon points="${up.join(' ')} ${dn.join(' ')}" fill="var(--up)" opacity=".08"/>`+g;}
+    const col={'기본':'var(--up)','하락':'var(--down)','선례 적용':'var(--mid)'};
+    fl.forEach(f=>{const pts=[last,...f.v].filter(Boolean).map(x=>`${X(x.m).toFixed(1)},${Y(x.med).toFixed(1)}`);g+=`<polyline fill="none" stroke="${col[f.k]}" stroke-width="2" stroke-dasharray="5 4" points="${pts.join(' ')}"/>`;});
+    if(last)g+=`<line x1="${X(last.m)}" x2="${X(last.m)}" y1="${pt}" y2="${H-pb}" stroke="var(--muted)" stroke-dasharray="2 3"/><text x="${X(last.m)+4}" y="${pt+10}" font-size="10.5" fill="var(--muted)">예상 →</text>`;}
   if(vol){const vm=Math.max(...vol.map(v=>v.n),1);g+=vol.map(v=>{const h=v.n/vm*34;return `<rect x="${X(v.m)-3}" y="${H-18-h}" width="6" height="${h}" fill="var(--faint)" opacity=".6"/>`;}).join('');}
   const lab=[months[0],months[Math.floor(months.length/2)],months[months.length-1]];
   g+=lab.map(m=>`<text x="${X(m)}" y="${H-4}" font-size="11" fill="var(--muted)" text-anchor="middle">${m.slice(2).replace('-','.')}</text>`).join('');
-  return `<svg viewBox="0 0 ${W} ${H}" width="100%" class="rech">${g}</svg><div class="lvchips">${lines.map(l=>`<span style="--c:${l.c}"><i></i>${esc(l.name)}</span>`).join('')}${vol?'<span style="--c:var(--faint)"><i></i>월 거래량</span>':''}</div>`;
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" class="rech">${g}</svg><div class="lvchips">${lines.map(l=>`<span style="--c:${l.c}"><i></i>${esc(l.name)}</span>`).join('')}${vol?'<span style="--c:var(--faint)"><i></i>월 거래량</span>':''}${fl.map(f=>`<span style="--c:${{'기본':'var(--up)','하락':'var(--down)','선례 적용':'var(--mid)'}[f.k]}"><i></i>예상 · ${f.k}</span>`).join('')}</div>`;
+}
+function fcTable(fc){
+  if(!fc)return '<p class="vl" style="text-align:left">거래 자료가 부족해 예상치를 내지 못했습니다.</p>';
+  const H=[3,6,12],ks=Object.keys(fc.sc),cur=fc.base;
+  return T(ks.map(k=>[`<b>${k}</b>`,...H.map(h=>{const v=fc.at['h'+h][k];return v?`${eok(v)}<br><small class="${v>=cur?'upc':'downc'}">${pctS((v/cur-1)*100,1)}</small>`:'-';})]),['시나리오','3개월 뒤','6개월 뒤','1년 뒤'])+
+    `<p class="vl" style="text-align:left">출발점 ${eok(cur)} (최근 3개월 거래 중간값) · 분당 추세 월 ${pctS(fc.g,2)} · 이 구역 상대강도 월 ${pctS(fc.rel,2)}${fc.vadj?` · 거래량 ${fc.vadj>0?'증가 +0.2%':'감소 −0.2%'}/월 반영`:''} · 흔들림 월 ±${fc.sig}%</p>`;
 }
 function zoneCard(z){const s=z.s,sg=SIG[z.status]||SIG.green;
   return `<button class="zcard ${z.status}" data-zone="${z.id}"><span class="zh"><b>${esc(z.name)}</b><small class="vl">${esc(z.dong)} · ${f0(z.units)}세대</small></span>
@@ -4884,7 +5004,8 @@ function openZone(id){
       <div><span class="vl">최근 3개월 중간값</span><b>${eok(s.med3)}</b><span class="vl">${ok_(s.chg3)?'이전 대비 '+pctS(s.chg3,1):''}</span></div>
       <div><span class="vl">36개월 최고가</span><b>${eok(s.peak)}</b><span class="vl">최근가는 ${pctS((s.last.p/s.peak-1)*100,1)}</span></div>
       <div><span class="vl">전세가율</span><b>${s.jeonse??'-'}%</b><span class="vl">갭 ${s.jeonse?eok(s.last.p*(1-s.jeonse/100)):'-'}</span></div></div>
-      <div class="lbl">📈 84㎡ 월별 실거래 중간값 · 거래량</div>${reChart([{name:z.name,c:'var(--up)',data:z.ser}],z.ser)}
+      <div class="lbl">📈 84㎡ 월별 실거래 중간값 · 거래량 · 예상</div>${reChart([{name:z.name,c:'var(--up)',data:z.ser}],z.ser,z.fc)}
+      <div class="lbl">🔮 예상 시세 (84㎡) <button class="q" data-help="refc" aria-label="설명 보기">?</button></div>${fcTable(z.fc)}
       <p class="vl" style="text-align:left">포함된 단지명: ${s.apts.map(esc).join(', ')} (국토부 실거래가의 단지명으로 묶었습니다. 빠지거나 잘못 들어간 단지가 있으면 알려주세요.)</p>
       <div class="lbl">최근 거래</div>${T(z.trades.map(t=>[t.d.slice(2),esc(t.apt),t.a.toFixed(1)+'㎡',t.f+'층',`<b>${eok(t.p)}</b>`]),['날짜','단지','전용','층','가격'])}`
       :(RE.haskey?'<p class="vl">아직 이 구역의 실거래 자료가 없습니다.</p>':'<p class="vl" style="text-align:left">실거래가는 공공데이터포털 키를 등록하면 나옵니다 (부동산 탭 맨 위 안내).</p>')}
@@ -4910,7 +5031,10 @@ function renderRE(){
     ${RE.haskey?'':`<div class="card resetup"><b>🔑 실거래가를 보려면 무료 키가 필요합니다</b><ol><li>공공데이터포털(data.go.kr) 가입 → <b>"국토교통부_아파트 매매 실거래가 자료"</b>와 <b>"국토교통부_아파트 전월세 실거래가 자료"</b> 활용신청</li><li>마이페이지의 <b>일반 인증키(Decoding)</b> 복사</li><li>Claude에게 "부동산 키 등록해줘"와 함께 키를 보내주시면 제가 등록합니다 (또는 GitHub Secret <code>MOLIT_API_KEY</code>)</li></ol><p class="vl" style="text-align:left">키가 없어도 입주권 신호등·체크리스트·계산기·뉴스는 지금 바로 쓸 수 있습니다.</p></div>`}
     ${M?`<div class="card"><div class="ch"><h3>🚦 분당 시장 분위기</h3><span class="chip mid">${esc(M.sig)}</span></div>
       <p class="vl tn" style="text-align:left;margin:0 0 6px">최근 3개월 월평균 거래 ${M.v3??'-'}건 (1년 평균 ${M.v12??'-'}건) · 84㎡ 중간값 기준</p>
-      ${reChart([{name:'분당',c:'var(--up)',data:M.bundang},{name:'광교',c:'var(--down)',data:M.gwanggyo}],null)}</div>`:''}
+      ${reChart([{name:'분당',c:'var(--up)',data:M.bundang},{name:'광교',c:'var(--down)',data:M.gwanggyo}],null,M.fc)}
+      <div class="lbl">🔮 분당 84㎡ 예상 <button class="q" data-help="refc" aria-label="설명 보기">?</button></div>${fcTable(M.fc)}
+      ${M.bt&&M.bt.h6?`<p class="vl" style="text-align:left">과거 검증(같은 방법을 과거에 적용): 6개월 뒤 평균 오차 ±${M.bt.h6.mape}% · 방향 적중 ${M.bt.h6.hit}% · 범위 안 ${M.bt.h6.band}% (${M.bt.h6.n}회)${M.bt.h3?` / 3개월 뒤 오차 ±${M.bt.h3.mape}%`:''}</p>`:''}
+      ${ok_(M.prem)?`<p class="vl" style="text-align:left">선도지구 선례: 2024년 11월 선정 후 6개월 동안 선도지구 4곳이 분당 전체보다 평균 <b>${pctS(M.prem,1)}</b> 더 움직였습니다 → 2차 구역의 '선례 적용' 시나리오에 반영</p>`:''}</div>`:''}
     ${['2차 특별정비구역','1차 선도지구'].map(g=>`<h3 class="sec">${g==='2차 특별정비구역'?'🟡 2차 특별정비구역 (12월 지정 고시 예정)':'🔴 1차 선도지구 (사업시행자 지정 완료)'}</h3><div class="zlist">${grp(g).map(zoneCard).join('')}</div>`).join('')}
     <details class="fold" open><summary>📝 매수 전 확인 · 계약 특약 체크리스트</summary><section><ul class="reck">${RECK.map((c,i)=>`<li><label><input type="checkbox" data-reck="${i}" ${ck[i]?'checked':''}><span><b>${esc(c[0])}</b>${c[1]?`<small class="vl">${esc(c[1])}</small>`:''}</span></label></li>`).join('')}</ul>
       <p class="vl" style="text-align:left">특약 문구는 반드시 재건축 경험이 많은 중개사·변호사와 최종 확인하세요. 체크 상태는 이 기기에 저장됩니다.</p></section></details>
