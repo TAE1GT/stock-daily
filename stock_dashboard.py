@@ -1968,8 +1968,7 @@ RE_REGIONS = [
     dict(name="과천", group="경기", lawd="41290"), dict(name="하남", group="경기", lawd="41450"), dict(name="평촌", group="경기", lawd="41173"),
     dict(name="송도", group="경기·인천", lawd="28185", dongs=["송도동"]),
     dict(name="해운대", group="지방", lawd="26350"), dict(name="수영", group="지방", lawd="26500"), dict(name="대구 수성", group="지방", lawd="27260"),
-    dict(name="대전 유성", group="지방", lawd="30200"), dict(name="세종", group="지방", lawd="36110"), dict(name="광주 남구", group="지방", lawd="29155"),
-    dict(name="울산 남구", group="지방", lawd="31140"),
+    dict(name="대전 유성", group="지방", lawd="30200"), dict(name="세종", group="지방", lawd="36110"), dict(name="울산 남구", group="지방", lawd="31140"),
 ]
 
 
@@ -2027,8 +2026,7 @@ def re_regions(key, demo=False):
         rows = [r for r in data.get(g["lawd"], []) if (not g.get("dongs") or r["dong"] in g["dongs"]) and (not g.get("excl") or r["dong"] not in g["excl"])]
         r84 = [r for r in rows if 76 <= r["area"] <= 90 and r.get("p")]
         if not r84:
-            out.append(dict(name=g["name"], group=g["group"], home=g.get("home", False), n12=0, leaders=[]))
-            continue
+            continue                                                     # 자료가 없는 지역은 지도에서 뺌
         now3 = [r["p"] / 1e4 for r in r84 if r["d"] >= cut3]
         ago3 = [r["p"] / 1e4 for r in r84 if y_lo <= r["d"] < cut12]
         prev3 = [r["p"] / 1e4 for r in r84 if (datetime.now() - timedelta(days=184)).strftime("%Y-%m-%d") <= r["d"] < cut3]
