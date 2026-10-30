@@ -1761,6 +1761,190 @@ def build_watch(wl, names, market, demo, dates=None):
     return extra, news, namemap, dfs
 
 
+# ───────────────────────────── 🏠 분당 재건축 (실거래가 · 입주권 신호등 · 뉴스) ─────────────────────────────
+# 구역 정보는 성남시 발표·언론 보도 기준 (2026-10-30 확인). 단계가 바뀌면 이 표만 고치면 됨.
+#   status: red = 사업시행자 지정 완료(지금 사면 원칙적으로 조합원 불가) / yellow = 구역 지정 고시 예정·임박 / green = 후보·추진 중
+RE_ZONES = [
+    dict(id="sibum", name="더시범 (선도지구)", dong="서현동", group="1차 선도지구", status="red",
+         stage="사업시행자 지정 (2026.6, 한국자산신탁)", units=3713, keys=[["시범", "현대"], ["시범", "우성"]],
+         note="2026.1 특별정비구역 지정 → 2026.6 사업시행자 지정. 지정 고시일 이후 매수자는 원칙적으로 조합원(분양대상자)이 될 수 없음"),
+    dict(id="saetbyeol", name="샛별마을 (선도지구)", dong="분당동", group="1차 선도지구", status="red",
+         stage="사업시행자 지정 (2026.6, 하나자산신탁)", units=2843, keys=[["샛별", "라이프"], ["샛별", "동성"], ["샛별", "우방"], ["샛별", "삼부"]],
+         note="라이프·동성·우방·삼부 + 현대빌라"),
+    dict(id="yangji", name="양지마을 (선도지구)", dong="수내동", group="1차 선도지구", status="red",
+         stage="사업시행자 지정 (2026.7.27, 대신자산신탁)", units=4392, keys=[["양지", "금호"], ["양지", "청구"], ["양지", "한양"]],
+         note="금호·청구·한양, 최고 37층 6,839세대 계획"),
+    dict(id="mokryeon", name="목련마을 (선도지구)", dong="이매동", group="1차 선도지구", status="red",
+         stage="사업시행자 지정 (2026.6, LH)", units=1107, keys=[["목련", "대원"], ["목련", "성환"], ["목련", "두원"], ["목련", "미원"]],
+         note="빌라 포함 결합구역"),
+    dict(id="sibum1", name="시범단지1 (삼성·한신·한양)", dong="서현동", group="2차 특별정비구역", status="yellow",
+         stage="2차 대상지 선정 (2026.9) → 12월 구역 지정·고시 예정", units=4200, keys=[["시범", "삼성"], ["시범", "한신"], ["시범", "한양"]],
+         note="선도지구 '더시범'(현대·우성)과 다른 구역. 사업시행자 지정 전까지는 매수 시 조합원 가능(원칙). 선도지구는 구역 지정 후 약 5~6개월 만에 사업시행자가 지정됨"),
+    dict(id="hansol2", name="한솔마을2 (LG·청구)", dong="정자동", group="2차 특별정비구역", status="yellow",
+         stage="2차 대상지 선정 (2026.9) → 12월 구역 지정·고시 예정", units=1872, keys=[["한솔", "청구"], ["한솔", "LG"], ["한솔", "엘지"]],
+         note="정자동 110번지 일원. 사업시행자 지정 전까지는 매수 시 조합원 가능(원칙)"),
+    dict(id="parktown", name="파크타운", dong="수내동", group="2차 특별정비구역", status="yellow",
+         stage="2차 대상지 선정 (2026.9) → 12월 구역 지정·고시 예정", units=3025, keys=[["파크타운"]], note="대림·롯데·서안·삼익"),
+    dict(id="pureun", name="푸른마을", dong="수내동", group="2차 특별정비구역", status="yellow",
+         stage="2차 대상지 선정 (2026.9) → 12월 구역 지정·고시 예정", units=2598, keys=[["푸른", "쌍용"], ["푸른", "벽산"], ["푸른", "신성"]], note="쌍용·벽산·신성"),
+    dict(id="imae1", name="이매촌1 (삼성·삼환)", dong="이매동", group="2차 특별정비구역", status="yellow",
+         stage="2차 대상지 선정 (2026.9) → 12월 구역 지정·고시 예정", units=1734, keys=[["이매", "삼성"], ["이매", "삼환"]], note="탄천 인접"),
+]
+RE_LAWD = {"분당": "41135", "광교(영통)": "41117"}
+
+
+def re_fetch_month(key, lawd, ym, kind="Trade"):
+    """국토교통부 실거래가 API (공공데이터포털) — 한 달치"""
+    from urllib.parse import quote
+    k = key if "%" in key else quote(key, safe="")
+    svc = "RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade" if kind == "Trade" else "RTMSDataSvcAptRent/getRTMSDataSvcAptRent"
+    url = f"https://apis.data.go.kr/1613000/{svc}?serviceKey={k}&LAWD_CD={lawd}&DEAL_YMD={ym}&numOfRows=2000&pageNo=1"
+    xml = http_get(url, retries=2)
+    if "<resultCode>" in xml and not re.search(r"<resultCode>0+</resultCode>", xml):
+        raise RuntimeError("API 오류: " + (re.search(r"<resultMsg>(.*?)</resultMsg>", xml) or [None, xml[:80]])[1])
+    out = []
+    for it in re.findall(r"<item>(.*?)</item>", xml, re.S):
+        g = lambda t: (re.search(f"<{t}>(.*?)</{t}>", it, re.S) or [None, ""])[1].strip()
+        if g("cdealType") == "O":                                   # 해제된 거래 제외
+            continue
+        try:
+            row = dict(apt=g("aptNm"), dong=g("umdNm"), area=float(g("excluUseAr") or 0), floor=g("floor"),
+                       d=f"{g('dealYear')}-{int(g('dealMonth')):02d}-{int(g('dealDay') or 1):02d}")
+            if kind == "Trade":
+                row["p"] = int(g("dealAmount").replace(",", ""))     # 만원
+            else:
+                row["dep"], row["rent"] = int((g("deposit") or "0").replace(",", "")), int((g("monthlyRent") or "0").replace(",", ""))
+            out.append(row)
+        except Exception:
+            pass
+    return out
+
+
+def re_collect(key, months=36):
+    """최근 36개월 매매·전월세 (지난 달 이전은 저장소에 보관해 다시 받지 않음)"""
+    cdir = os.path.join(HIST_DIR, "re")
+    os.makedirs(cdir, exist_ok=True)
+    now = datetime.now()
+    yms = [(now.replace(day=1) - pd.DateOffset(months=i)).strftime("%Y%m") for i in range(months)]
+    data = {"Trade": {}, "Rent": {}}
+    for region, lawd in RE_LAWD.items():
+        for kind in ("Trade", "Rent"):
+            if kind == "Rent" and region != "분당":
+                continue
+            rows = []
+            for i, ym in enumerate(yms):
+                if kind == "Rent" and i >= 13:
+                    break
+                path = os.path.join(cdir, f"{kind}_{lawd}_{ym}.json")
+                if i >= 3 and os.path.exists(path):                  # 신고 기한(30일)이 지난 달은 저장본 사용
+                    try:
+                        rows += load_json(path)
+                        continue
+                    except Exception:
+                        pass
+                try:
+                    r = re_fetch_month(key, lawd, ym, kind)
+                    save_json(path, r)
+                    rows += r
+                except Exception as ex:
+                    print(f"  실거래 {region} {kind} {ym} 실패: {str(ex)[:60]}", flush=True)
+            data[kind][region] = rows
+    return data
+
+
+def re_match(z, row):
+    if row["dong"] != z["dong"]:
+        return False
+    n = row["apt"].replace(" ", "")
+    return any(all(k in n for k in ks) for ks in z["keys"])
+
+
+def re_series(rows, lo=76, hi=90):
+    """84㎡형(전용 76~90㎡) 월별 중간값(억)과 거래 수"""
+    m = {}
+    for r in rows:
+        if lo <= r["area"] <= hi and r.get("p"):
+            m.setdefault(r["d"][:7], []).append(r["p"] / 1e4)
+    return [dict(m=k, med=round(float(np.median(v)), 2), n=len(v)) for k, v in sorted(m.items())]
+
+
+def re_build(demo=False):
+    key = os.environ.get("MOLIT_API_KEY", "").strip()
+    out = dict(zones=[], haskey=bool(key or demo), market=None, updated=datetime.now().strftime("%Y-%m-%d"))
+    trades, rents = {}, {}
+    if demo:
+        rng = np.random.default_rng(5)
+        months = [(datetime.now().replace(day=1) - pd.DateOffset(months=i)).strftime("%Y-%m") for i in range(36)][::-1]
+        def fake(z, base):
+            rows, p = [], base
+            for mth in months:
+                p *= np.exp(rng.normal(0.006, 0.02))
+                for _ in range(int(rng.integers(0, 6))):
+                    rows.append(dict(apt=z["keys"][0][0] + z["keys"][0][-1], dong=z["dong"], area=84.9, floor=str(int(rng.integers(1, 20))),
+                                     d=f"{mth}-{int(rng.integers(1, 28)):02d}", p=int(p * 1e4 * rng.uniform(.95, 1.05))))
+            return rows
+        bd = []
+        for z in RE_ZONES:
+            r = fake(z, rng.uniform(13, 19))
+            trades[z["id"]] = r
+            bd += r
+        trades["_분당"], trades["_광교"] = bd, fake(dict(dong="이의동", keys=[["광교"]]), 14)
+        rents["_분당"] = [dict(apt=x["apt"], dong=x["dong"], area=x["area"], d=x["d"], dep=int(x["p"] * 0.45), rent=0) for x in bd[::3]]
+    elif key:
+        try:
+            data = re_collect(key)
+            bd = data["Trade"].get("분당", [])
+            for z in RE_ZONES:
+                trades[z["id"]] = [r for r in bd if re_match(z, r)]
+            trades["_분당"] = bd
+            trades["_광교"] = [r for r in data["Trade"].get("광교(영통)", []) if r["dong"] in ("이의동", "하동")]
+            rents["_분당"] = data["Rent"].get("분당", [])
+            stat("분당 실거래가 (국토부)", bool(bd), f"매매 {len(bd)}건 · 전월세 {len(rents['_분당'])}건 (36개월)")
+        except Exception as ex:
+            stat("분당 실거래가 (국토부)", False, str(ex)[:80])
+    else:
+        stat("분당 실거래가 (국토부)", None, "키 미등록 (MOLIT_API_KEY)")
+    cut12 = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    cut3 = (datetime.now() - timedelta(days=92)).strftime("%Y-%m-%d")
+    for z in RE_ZONES:
+        rows = sorted(trades.get(z["id"], []), key=lambda r: r["d"])
+        ser = re_series(rows)
+        p84 = [r for r in rows if 76 <= r["area"] <= 90]
+        st = None
+        if p84:
+            last = p84[-1]
+            y1 = [r["p"] / 1e4 for r in p84 if r["d"] >= cut12]
+            r3 = [r["p"] / 1e4 for r in p84 if r["d"] >= cut3]
+            prev = [r["p"] / 1e4 for r in p84 if cut12 <= r["d"] < cut3]
+            rent = [x for x in rents.get("_분당", []) if re_match(z, x) and 76 <= x["area"] <= 90 and x.get("rent", 0) == 0 and x["d"] >= cut12]
+            st = dict(last=dict(d=last["d"], p=round(last["p"] / 1e4, 2), floor=last["floor"], area=last["area"], apt=last["apt"]),
+                      hi12=round(max(y1), 2) if y1 else None, lo12=round(min(y1), 2) if y1 else None,
+                      med3=round(float(np.median(r3)), 2) if r3 else None,
+                      chg3=(round((np.median(r3) / np.median(prev) - 1) * 100, 1) if r3 and prev else None),
+                      peak=round(max(r["p"] for r in p84) / 1e4, 2), n12=len(y1),
+                      jeonse=(round(float(np.median([x["dep"] for x in rent])) / 1e4 / float(np.median(y1)) * 100) if rent and y1 else None),
+                      apts=sorted({r["apt"] for r in rows})[:8])
+        news = [] if demo else gnews(f'분당 {z["name"].split(" (")[0]} 재건축', "ko", 30, 5)
+        out["zones"].append(dict({k: z[k] for k in ("id", "name", "dong", "group", "status", "stage", "units", "note")}, s=st, ser=ser[-36:],
+                                 trades=[dict(d=r["d"], p=round(r["p"] / 1e4, 2), a=r["area"], f=r["floor"], apt=r["apt"]) for r in rows[-10:]][::-1], news=news))
+    if trades.get("_분당"):
+        sb, sg = re_series(trades["_분당"]), re_series(trades.get("_광교", []))
+        vol = [x["n"] for x in re_series(trades["_분당"], 0, 999)]
+        v3 = sum(vol[-3:]) / 3 if len(vol) >= 3 else None
+        v12 = sum(vol[-12:]) / 12 if len(vol) >= 12 else None
+        p3 = np.mean([x["med"] for x in sb[-3:]]) if len(sb) >= 3 else None
+        p6 = np.mean([x["med"] for x in sb[-9:-3]]) if len(sb) >= 9 else None
+        sig = "정보 부족"
+        if v3 and v12 and p3 and p6:
+            up = p3 > p6 * 1.01
+            dn = p3 < p6 * 0.99
+            sig = "매수 분위기 (가격↑·거래↑)" if up and v3 >= v12 else "가격만 오름 (거래 위축)" if up else "위축 (가격↓)" if dn else "관망 (보합)"
+        out["market"] = dict(bundang=sb[-36:], gwanggyo=sg[-36:], vol=vol[-36:], sig=sig,
+                             v3=round(v3) if v3 else None, v12=round(v12) if v12 else None)
+    out["news"] = [] if demo else gnews("분당 재건축 특별정비구역", "ko", 14, 6)
+    return out
+
+
 # ───────────────────────────── 유튜브 채널 · 급등주 해부 ─────────────────────────────
 YT_CHANNEL = dict(name="한균수의 주식사용설명서", id="UCadSWH0pDXxEatvLHEHCWlg",
                   url="https://www.youtube.com/@%ED%95%9C%EA%B7%A0%EC%88%98%EC%9D%98%EC%A3%BC%EC%8B%9D%EC%82%AC%EC%9A%A9%EC%84%A4%EB%AA%85")
@@ -2948,6 +3132,12 @@ def build(demo=False, mode="file"):
     except Exception as ex:
         print(f"  섹터 대장주 실패: {ex}", flush=True)
 
+    try:
+        re_data = re_build(demo)
+    except Exception as ex:
+        print(f"  부동산 실패: {ex}", flush=True)
+        re_data = None
+
     gainers = None
     try:
         lastchg = m["chg"]
@@ -3067,7 +3257,7 @@ def build(demo=False, mode="file"):
         regime_now=regime_now, weak={k_: True for k_ in weak_strats(bt, regime_now)},
         risk=risk, outlook=outlook, macro=macro,
         bt=bt, fc=fc, status=STATUS, review=rv, tips=tips, brief=brief, gen_iso=datetime.now().strftime("%Y-%m-%dT%H:%M"),
-        _charts=charts, tabs=tabs, all=allstk, news=news, yt=yt, gainers=gainers, smap=sector_map, sstocks=sector_stocks,
+        _charts=charts, re=re_data, tabs=tabs, all=allstk, news=news, yt=yt, gainers=gainers, smap=sector_map, sstocks=sector_stocks,
         names={**{t: str(n) for t, n in getattr(namefn, "__self__", {}).items()}, **wnames}, wnews=wnews, etfs=sorted(ETF_SET & set(allstk)),
         worker=os.environ.get("AI_WORKER_URL", "").strip(),
     )
@@ -4020,6 +4210,26 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
 .ivbox{margin-top:12px;padding:12px 14px;border-radius:12px;border:2px solid var(--mid);background:rgba(183,121,31,.07)}
 .ivbox.no{border-color:var(--bad);background:rgba(194,65,12,.07)}
 .ivbox .lab{font-size:12.5px;font-weight:700;color:var(--muted)}.ivbox .val{font-size:18px;font-weight:900}.ivbox p{margin:4px 0 0;font-size:13.5px}
+
+.zlist{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:8px}
+.zcard{display:grid;gap:4px;text-align:left;font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-left:5px solid var(--line);border-radius:14px;padding:12px 14px;cursor:pointer}
+.zcard.red{border-left-color:var(--bad)}.zcard.yellow{border-left-color:var(--mid)}.zcard.green{border-left-color:var(--ok)}
+.zh{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}.zh b{font-size:15.5px}.zsig{font-size:13px;font-weight:800}.zst{font-size:12px;text-align:left}
+.zp{display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}.zp small{font-size:11.5px;color:var(--muted)}.zp b{font-size:16px}
+.zsigbox{margin:10px 0;padding:12px 14px;border-radius:12px;background:var(--sunk);border-left:5px solid var(--line);display:grid;gap:4px}
+.zsigbox.red{border-left-color:var(--bad)}.zsigbox.yellow{border-left-color:var(--mid)}.zsigbox p{margin:0;font-size:13.5px}.zsigbox span{font-size:13px;color:var(--muted)}
+.zdet h3{margin:0;padding-right:46px}
+.reck{list-style:none;margin:0;padding:0;display:grid;gap:8px}.reck label{display:flex;gap:10px;align-items:flex-start;cursor:pointer}.reck input{margin-top:3px;width:18px;height:18px}
+.reck span{display:grid}.reck small{text-align:left}
+.rcgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-bottom:10px}
+.rcgrid label{display:grid;gap:3px;font-size:12px;color:var(--muted);font-weight:700}
+.rcgrid input{font:inherit;font-size:15px;padding:7px 9px;border-radius:9px;border:1.5px solid var(--line);background:var(--sunk);color:var(--ink);width:100%}
+.resetup{border:2px dashed var(--mid)}.resetup ol{margin:6px 0;padding-left:20px;font-size:13.5px}
+.rech{display:block}
+#v-re{overflow-x:hidden}
+.zdet .ht,#v-re .ht{display:block;overflow-x:auto;max-width:100%}.zdet table,#v-re table{min-width:0}
+.rcgrid{grid-template-columns:repeat(auto-fill,minmax(min(100%,130px),1fr))}
+#v-re .revkpi{grid-template-columns:repeat(auto-fit,minmax(min(100%,120px),1fr))}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -4042,6 +4252,7 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
       <a href="#picks" data-v="picks"><i aria-hidden="true">⭐</i><span>추천</span></a>
       <a href="#mine" data-v="mine"><i aria-hidden="true">💼</i><span>내 종목</span></a>
       <a href="#market" data-v="market"><i aria-hidden="true">📈</i><span>시장</span></a>
+      <a href="#re" data-v="re"><i aria-hidden="true">🏠</i><span>부동산</span></a>
       <a href="#more" data-v="more"><i aria-hidden="true">☰</i><span>더보기</span></a>
     </nav>
     <button class="iconbtn" id="refresh" aria-label="새로고침">↻</button>
@@ -4084,6 +4295,7 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
   </section>
 
   <section class="view" id="v-yt" hidden></section>
+  <section class="view" id="v-re" hidden></section>
 
   <section class="view" id="v-more" hidden>
     <section class="scoreboard" id="score"></section>
@@ -4454,6 +4666,10 @@ const HELP={
       <h5>과거 패턴 계산</h5><p><b>일정 전 5일</b> = 일정 전날 종가 ÷ 6거래일 전 종가 − 1 · <b>일정 후 5일</b> = 일정 후 4거래일 종가 ÷ 일정 전날 종가 − 1. 관련 섹터 대표 ETF(시장 전체 일정은 코스피)로 과거 약 5년간 같은 일정을 모아 평균과 상승 비율을 냅니다. 표본이 3번 미만이면 표시하지 않습니다.</p>
       <h5>5일 전망 모델에 들어가는 값</h5><p>섹터 일정이 5거래일 안에 있는지, 시장 전체 일정이 5거래일 안에 있는지, 섹터 일정 직후인지, 실적 시즌인지 4가지를 입력으로 넣습니다.</p>
       <h5>일정 추가하기</h5><p>GitHub 저장소에 <b>events.json</b> 파일을 만들고 <code>[{"date":"2027-05-20","name":"행사명","sectors":["반도체"]}]</code> 형식으로 적으면 다음 실행부터 반영됩니다. 섹터 이름은 표의 섹터 이름과 같게 쓰고, 시장 전체 일정은 <code>"*"</code>로 씁니다. 몇 달에 한 번 Claude에게 "일정 업데이트해줘"라고 하시면 다시 검색해서 채워 드립니다.</p>`],
+  re:['🏠 분당 재건축 보는 법',()=>`<ul><li><b>입주권 신호등</b>: 투기과열지구 재건축은 <b>사업시행자 지정 고시일 이후</b> 산 사람은 원칙적으로 조합원(분양대상자)이 될 수 없습니다. 🔴 선도지구 4곳은 지정이 끝났고, 🟡 2차 5곳은 12월 구역 지정 고시 후 사업시행자 지정 전까지가 기회입니다(선도지구는 구역 지정 후 약 5~6개월 만에 지정됨).</li>
+      <li><b>예외</b>: 지정 후에도 1세대 1주택 10년 보유·5년 거주 매도인 등 예외 요건 매물은 승계 가능 — 반드시 확인.</li>
+      <li><b>시세</b>: 국토교통부 실거래가(신고 기한 30일이라 최근 한 달은 덜 채워짐), 84㎡형(전용 76~90㎡) 월별 중간값. 호가(매물가)는 무료 공개 자료가 없어 넣지 않았습니다.</li>
+      <li><b>구역 정보</b>는 성남시 발표·언론 보도를 기준으로 Claude가 정리한 것입니다(2026-10-30). 단계가 바뀌면 "부동산 구역 정보 업데이트해줘"라고 해주세요.</li></ul>`],
   import:['📸 사진으로 내 종목 등록 · 기기 옮기기',()=>`<h5>캡처 사진으로 한 번에 등록하기</h5>
       <ol><li>증권앱(키움·토스 등)과 코인앱의 <b>잔고 화면을 캡처</b>합니다. 계좌가 여러 개면 계좌마다 캡처하세요.</li>
       <li><b>Claude 앱</b>을 열고 캡처 사진들을 올린 뒤, 아래 <b>요청 문장</b>을 붙여넣고 보냅니다.</li>
@@ -4635,6 +4851,77 @@ document.addEventListener('click',e=>{
   else if(e.target.closest('[data-imp]')){openImport();}
   else if(e.target.closest('[data-copyprompt]')){navigator.clipboard&&navigator.clipboard.writeText(PHOTO_PROMPT).then(()=>{e.target.textContent='✅ 복사됨';});}
 });
+
+/* ───── 🏠 부동산 (분당 재건축) ───── */
+const RE=D.re||null;
+const ok_=v=>v!=null&&isFinite(v);
+const eok=v=>ok_(v)?(v>=1?`${(+v).toFixed(2).replace(/\.?0+$/,'')}억`:`${Math.round(v*1e4).toLocaleString()}만`):'-';
+const SIG={red:['🔴','지금 사면 원칙적으로 입주권 ✕'],yellow:['🟡','입주권 가능 · 사업시행자 지정 전까지'],green:['🟢','입주권 가능 (후보 단계)']};
+function reChart(lines,vol){
+  const all=lines.flatMap(l=>l.data.map(x=>x.med)).filter(ok_);if(!all.length)return '<p class="vl">거래 자료가 없습니다.</p>';
+  const months=[...new Set(lines.flatMap(l=>l.data.map(x=>x.m)))].sort();const W=600,H=200,pl=8,pr=46,pt=10,pb=vol?54:22;
+  const lo=Math.min(...all)*.97,hi=Math.max(...all)*1.03,X=m=>pl+months.indexOf(m)/Math.max(1,months.length-1)*(W-pl-pr),Y=v=>pt+(hi-v)/(hi-lo||1)*(H-pt-pb);
+  let g=[0,.5,1].map(t=>{const v=lo+(hi-lo)*t;return `<line x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--line)"/><text x="${W-pr+4}" y="${Y(v)+4}" font-size="11" fill="var(--muted)">${v.toFixed(1)}억</text>`;}).join('');
+  lines.forEach(l=>{const pts=l.data.filter(x=>ok_(x.med)).map(x=>`${X(x.m).toFixed(1)},${Y(x.med).toFixed(1)}`);g+=`<polyline fill="none" stroke="${l.c}" stroke-width="2.4" points="${pts.join(' ')}"/>`+l.data.map(x=>`<circle cx="${X(x.m)}" cy="${Y(x.med)}" r="2.6" fill="${l.c}"/>`).join('');});
+  if(vol){const vm=Math.max(...vol.map(v=>v.n),1);g+=vol.map(v=>{const h=v.n/vm*34;return `<rect x="${X(v.m)-3}" y="${H-18-h}" width="6" height="${h}" fill="var(--faint)" opacity=".6"/>`;}).join('');}
+  const lab=[months[0],months[Math.floor(months.length/2)],months[months.length-1]];
+  g+=lab.map(m=>`<text x="${X(m)}" y="${H-4}" font-size="11" fill="var(--muted)" text-anchor="middle">${m.slice(2).replace('-','.')}</text>`).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" class="rech">${g}</svg><div class="lvchips">${lines.map(l=>`<span style="--c:${l.c}"><i></i>${esc(l.name)}</span>`).join('')}${vol?'<span style="--c:var(--faint)"><i></i>월 거래량</span>':''}</div>`;
+}
+function zoneCard(z){const s=z.s,sg=SIG[z.status]||SIG.green;
+  return `<button class="zcard ${z.status}" data-zone="${z.id}"><span class="zh"><b>${esc(z.name)}</b><small class="vl">${esc(z.dong)} · ${f0(z.units)}세대</small></span>
+    <span class="zsig">${sg[0]} ${sg[1]}</span><span class="zst vl">${esc(z.stage)}</span>
+    ${s?`<span class="zp tn"><small>84㎡ 최근</small><b>${eok(s.last.p)}</b><small>${esc(s.last.d.slice(2))}</small>${ok_(s.chg3)?`<b class="${s.chg3>=0?'upc':'downc'}">${pctS(s.chg3,1)}</b><small>3개월</small>`:''}</span>`:''}</button>`;}
+function openZone(id){
+  const z=RE.zones.find(x=>x.id===id),s=z.s,sg=SIG[z.status];
+  const prompt=`분당 ${z.name} (${z.dong}, ${f0(z.units)}세대) 재건축 매수를 검토 중이야. 현재 단계: ${z.stage}. ${z.note}\n`+
+    (s?`84㎡ 최근 실거래 ${eok(s.last.p)}(${s.last.d}), 최근 1년 ${eok(s.lo12)}~${eok(s.hi12)}, 3개월 변화 ${ok_(s.chg3)?pctS(s.chg3,1):'-'}, 전세가율 ${s.jeonse??'-'}%.\n`:'')+
+    `최신 뉴스와 성남시 고시를 검색해서 ①사업시행자 지정 예상 시기와 지금 사면 조합원(입주권)이 되는지 ②대지지분·용적률·고도제한(서울공항) 등 사업성 ③예상 분담금 범위 ④매수 시 계약 특약과 주의점 ⑤10년 실거주 관점의 장단점을 정리해줘. 근거 기사 링크도 붙여줘.`;
+  openSheet(`<div class="zdet"><h3>${esc(z.name)}</h3><p class="vl" style="text-align:left">${esc(z.dong)} · ${f0(z.units)}세대 · ${esc(z.group)}</p>
+    <div class="zsigbox ${z.status}"><b>${sg[0]} ${sg[1]}</b><span>${esc(z.stage)}</span><p>${esc(z.note)}</p></div>
+    ${s?`<div class="revkpi tn"><div><span class="vl">84㎡ 최근 실거래</span><b>${eok(s.last.p)}</b><span class="vl">${esc(s.last.d)} · ${esc(s.last.floor)}층</span></div>
+      <div><span class="vl">최근 1년 범위</span><b>${eok(s.lo12)}~${eok(s.hi12)}</b><span class="vl">${s.n12}건</span></div>
+      <div><span class="vl">최근 3개월 중간값</span><b>${eok(s.med3)}</b><span class="vl">${ok_(s.chg3)?'이전 대비 '+pctS(s.chg3,1):''}</span></div>
+      <div><span class="vl">36개월 최고가</span><b>${eok(s.peak)}</b><span class="vl">최근가는 ${pctS((s.last.p/s.peak-1)*100,1)}</span></div>
+      <div><span class="vl">전세가율</span><b>${s.jeonse??'-'}%</b><span class="vl">갭 ${s.jeonse?eok(s.last.p*(1-s.jeonse/100)):'-'}</span></div></div>
+      <div class="lbl">📈 84㎡ 월별 실거래 중간값 · 거래량</div>${reChart([{name:z.name,c:'var(--up)',data:z.ser}],z.ser)}
+      <p class="vl" style="text-align:left">포함된 단지명: ${s.apts.map(esc).join(', ')} (국토부 실거래가의 단지명으로 묶었습니다. 빠지거나 잘못 들어간 단지가 있으면 알려주세요.)</p>
+      <div class="lbl">최근 거래</div>${T(z.trades.map(t=>[t.d.slice(2),esc(t.apt),t.a.toFixed(1)+'㎡',t.f+'층',`<b>${eok(t.p)}</b>`]),['날짜','단지','전용','층','가격'])}`
+      :(RE.haskey?'<p class="vl">아직 이 구역의 실거래 자료가 없습니다.</p>':'<p class="vl" style="text-align:left">실거래가는 공공데이터포털 키를 등록하면 나옵니다 (부동산 탭 맨 위 안내).</p>')}
+    ${z.news&&z.news.length?`<div class="lbl">📰 최근 뉴스</div><ul class="bl">${z.news.map(n=>`<li><span class="dt tn">${esc(n.d||'')}</span><a href="${esc(n.u)}" target="_blank" rel="noopener">${esc(n.t)}</a></li>`).join('')}</ul>`:''}
+    <div class="aibox aibtn" style="margin-top:12px"><p><b style="color:var(--ink)">🤖 이 구역 투자 점검</b><br>단계·시세가 입력된 채로 Claude가 열립니다.</p><a class="btn ai" href="${claudeURL(prompt,null)}" target="_blank" rel="noopener">🤖 Claude에서 점검</a></div></div>`);
+}
+const RECK=[['사업시행자 지정 고시 여부·예정 시기 확인','지정 고시일 이후 매수하면 원칙적으로 조합원(입주권) 불가'],['(지정 후라면) 매도인이 예외 요건에 해당하는지','1세대 1주택 10년 보유·5년 거주 등 — 해당 매물만 조합원 승계 가능'],['토지거래허가 기간 vs 지정 고시 일정','허가 기다리는 사이 지정 고시가 나면 탈락 위험'],['특약: 조합원 지위 승계 불가 시 계약 해제 + 계약금·중도금 전액 반환',''],['특약: 토지거래허가 불허가 시 계약 무효 + 전액 반환',''],['등기부등본 대지권 비율(대지지분) 확인','권리가액·분담금의 기준'],['다주택 여부·분양대상 요건 확인','여러 채면 분양권은 원칙적으로 1개'],['고도제한(서울공항 비행안전구역) 해당 여부','성남시 고시 확인 — 층수·세대수·사업성에 영향'],['실거주 의무(토지거래허가) 이행 가능 여부','허가 후 일정 기간 직접 거주'],['대출 한도·금리 사전 확인','규제지역 주담대 한도'],['재건축 전문 중개사·변호사 계약서 검토',''],['이주·착공 예상 시기와 그동안 거주 계획','10년 이상 실거주 관점']];
+const reck=()=>{try{return JSON.parse(localStorage.getItem('re-check')||'{}');}catch(_){return {};}};
+function reCalc(){
+  const g=id=>+(document.getElementById(id)||{}).value||0,P=g('rcP'),cash=g('rcC'),ltv=g('rcL')/100,cap=g('rcCap'),rate=g('rcR')/100,yrs=g('rcY');
+  const loan=Math.min(P*ltv,cap),tax=P*g('rcT')/100,fee=P*g('rcF')/100,need=P+tax+fee-loan,gap=cash-need,intr=loan*rate*yrs;
+  const ap=g('rcA'),bi=g('rcB')/100,np=g('rcN'),right=ap*bi,share=np-right,future=g('rcV');
+  const total=P+tax+fee+intr+Math.max(share,0),gain=future-total;
+  document.getElementById('rcOut').innerHTML=`<div class="revkpi tn"><div><span class="vl">대출 가능</span><b>${eok(loan)}</b></div><div><span class="vl">필요 현금</span><b>${eok(need)}</b></div>
+    <div><span class="vl">보유 현금과 차이</span><b class="${gap>=0?'pos':'neg'}">${gap>=0?'여유 ':'부족 '}${eok(Math.abs(gap))}</b></div><div><span class="vl">${yrs}년 이자</span><b>${eok(intr)}</b></div>
+    <div><span class="vl">예상 분담금</span><b class="${share>0?'neg':'pos'}">${share>0?eok(share):'환급 '+eok(-share)}</b><span class="vl">권리가액 ${eok(right)}</span></div>
+    <div><span class="vl">총 투입 (매수+세금+이자+분담금)</span><b>${eok(total)}</b></div><div><span class="vl">신축 예상가 대비</span><b class="${gain>=0?'pos':'neg'}">${gain>=0?'+':'−'}${eok(Math.abs(gain))}</b><span class="vl">연 ${yrs?pctS(((future/total)**(1/yrs)-1)*100,1):'-'}</span></div></div>`;
+}
+function renderRE(){
+  const box=document.getElementById('v-re');if(!RE){box.innerHTML='<div class="empty">부동산 자료를 만들지 못했습니다.</div>';return;}
+  const M=RE.market,ck=reck(),grp=g=>RE.zones.filter(z=>z.group===g);
+  box.innerHTML=`<div class="vh"><h2>🏠 분당 재건축 <button class="q" data-help="re" aria-label="설명 보기">?</button></h2></div>
+    ${RE.haskey?'':`<div class="card resetup"><b>🔑 실거래가를 보려면 무료 키가 필요합니다</b><ol><li>공공데이터포털(data.go.kr) 가입 → <b>"국토교통부_아파트 매매 실거래가 자료"</b>와 <b>"국토교통부_아파트 전월세 실거래가 자료"</b> 활용신청</li><li>마이페이지의 <b>일반 인증키(Decoding)</b> 복사</li><li>Claude에게 "부동산 키 등록해줘"와 함께 키를 보내주시면 제가 등록합니다 (또는 GitHub Secret <code>MOLIT_API_KEY</code>)</li></ol><p class="vl" style="text-align:left">키가 없어도 입주권 신호등·체크리스트·계산기·뉴스는 지금 바로 쓸 수 있습니다.</p></div>`}
+    ${M?`<div class="card"><div class="ch"><h3>🚦 분당 시장 분위기</h3><span class="chip mid">${esc(M.sig)}</span></div>
+      <p class="vl tn" style="text-align:left;margin:0 0 6px">최근 3개월 월평균 거래 ${M.v3??'-'}건 (1년 평균 ${M.v12??'-'}건) · 84㎡ 중간값 기준</p>
+      ${reChart([{name:'분당',c:'var(--up)',data:M.bundang},{name:'광교',c:'var(--down)',data:M.gwanggyo}],null)}</div>`:''}
+    ${['2차 특별정비구역','1차 선도지구'].map(g=>`<h3 class="sec">${g==='2차 특별정비구역'?'🟡 2차 특별정비구역 (12월 지정 고시 예정)':'🔴 1차 선도지구 (사업시행자 지정 완료)'}</h3><div class="zlist">${grp(g).map(zoneCard).join('')}</div>`).join('')}
+    <details class="fold" open><summary>📝 매수 전 확인 · 계약 특약 체크리스트</summary><section><ul class="reck">${RECK.map((c,i)=>`<li><label><input type="checkbox" data-reck="${i}" ${ck[i]?'checked':''}><span><b>${esc(c[0])}</b>${c[1]?`<small class="vl">${esc(c[1])}</small>`:''}</span></label></li>`).join('')}</ul>
+      <p class="vl" style="text-align:left">특약 문구는 반드시 재건축 경험이 많은 중개사·변호사와 최종 확인하세요. 체크 상태는 이 기기에 저장됩니다.</p></section></details>
+    <details class="fold"><summary>🧮 매수 자금 · 10년 실거주 계산기 (단위: 억)</summary><section><div class="rcgrid">
+      ${[['rcP','매수가',20],['rcC','보유 현금',10],['rcL','LTV %',40],['rcCap','대출 상한',4],['rcR','대출 금리 %',4],['rcT','취득세 등 %',3.3],['rcF','중개수수료 %',0.7],['rcY','보유 기간 (년)',10],['rcA','종전자산 감정가',15],['rcB','비례율 %',100],['rcN','조합원 분양가 (신축)',20],['rcV','신축 예상 시세',30]].map(([id,l,v])=>`<label>${l}<input type="number" step="any" id="${id}" value="${v}"></label>`).join('')}
+      </div><div id="rcOut"></div><p class="vl" style="text-align:left">대출 상한은 규제지역 주택담보대출 한도(집값 구간별)를 직접 확인해 넣으세요. 분담금 = 조합원 분양가 − 권리가액(감정가×비례율). 모든 숫자는 가정이며 실제와 다를 수 있습니다.</p></section></details>
+    ${RE.news&&RE.news.length?`<details class="fold"><summary>📰 분당 재건축 뉴스</summary><section><ul class="bl">${RE.news.map(n=>`<li><span class="dt tn">${esc(n.d||'')}</span><a href="${esc(n.u)}" target="_blank" rel="noopener">${esc(n.t)}</a></li>`).join('')}</ul></section></details>`:''}`;
+  box.querySelectorAll('.rcgrid input').forEach(i=>i.oninput=reCalc);reCalc();
+}
+document.addEventListener('click',e=>{const z=e.target.closest('[data-zone]');if(z){openZone(z.dataset.zone);return;}});
+document.addEventListener('change',e=>{const c=e.target.closest('[data-reck]');if(!c)return;const k=reck();k[c.dataset.reck]=c.checked;try{localStorage.setItem('re-check',JSON.stringify(k));}catch(_){}});
 /* ───── 매매 포인트 ───── */
 function planStat(k){const P_=D.bt&&D.bt.plan&&D.bt.plan[k];if(!P_)return '';
   return `<p class="pstat tn">과거 ${D.bt.start}~${D.bt.end}에 이 규칙대로 했다면: 체결 ${P_.fill}% · 거래당 평균 <b class="${P_.avg>=0?'pos':'neg'}">${pctS(P_.avg,2)}</b> · 승률 ${P_.win}% · 평균 ${P_.days}일 보유 <span class="vl">(비용 차감 · 그냥 다음 날 시가에 사서 5일 보유 ${P_.base==null?'-':pctS(P_.base,2)})</span></p>`;}
@@ -5438,7 +5725,7 @@ function track(h){
 function route(){
   let h=location.hash||'#home';if(h==='#my')h='#mine';
   track(h.startsWith('#guide')?'#guide':h);
-  const views={'#home':'v-home','#picks':'v-picks','#mine':'v-mine','#market':'v-market','#more':'v-more','#review':'reviewview','#yt':'v-yt'};
+  const views={'#home':'v-home','#picks':'v-picks','#mine':'v-mine','#market':'v-market','#more':'v-more','#review':'reviewview','#yt':'v-yt','#re':'v-re'};
   const id=h.startsWith('#guide')?'guideview':(views[h]||'v-home');
   document.querySelectorAll('.view').forEach(v=>v.hidden=v.id!==id);
   const tabKey=id==='guideview'||id==='reviewview'?'more':id==='v-yt'?'picks':id.replace('v-','');
@@ -5447,6 +5734,7 @@ function route(){
   if(id==='v-home')renderHome();
   else if(id==='v-mine')renderMine();
   else if(id==='v-yt')renderYt();
+  else if(id==='v-re')renderRE();
   else if(id==='reviewview')renderReview();
   else if(id==='guideview'){renderGuide();const t=h.length>6&&document.getElementById(h.slice(1));if(t){t.scrollIntoView();return;}}
   scrollTo(0,0);
