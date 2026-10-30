@@ -1956,6 +1956,111 @@ def re_event_premium(zones_ser, bser, event_m="2024-11"):
     return round(float(np.mean(ex)) * 100, 1) if len(ex) >= 2 else None
 
 
+# ── 전국 지역 지도 (지역 = 섹터, 대장 아파트 = 대장주) ──
+RE_REGIONS = [
+    dict(name="강남", group="서울", lawd="11680"), dict(name="서초", group="서울", lawd="11650"), dict(name="송파", group="서울", lawd="11710"),
+    dict(name="용산", group="서울", lawd="11170"), dict(name="성동", group="서울", lawd="11200"), dict(name="마포", group="서울", lawd="11440"),
+    dict(name="양천(목동)", group="서울", lawd="11470"), dict(name="영등포(여의도)", group="서울", lawd="11560"), dict(name="강동", group="서울", lawd="11740"),
+    dict(name="광진", group="서울", lawd="11215"), dict(name="동작", group="서울", lawd="11590"),
+    dict(name="판교", group="경기", lawd="41135", dongs=["삼평동", "백현동", "판교동", "운중동"]),
+    dict(name="분당", group="경기", lawd="41135", excl=["삼평동", "백현동", "판교동", "운중동"]),
+    dict(name="수지", group="경기", lawd="41465", home=True), dict(name="광교", group="경기", lawd="41117", dongs=["이의동", "하동"]),
+    dict(name="과천", group="경기", lawd="41290"), dict(name="하남", group="경기", lawd="41450"), dict(name="평촌", group="경기", lawd="41173"),
+    dict(name="송도", group="경기·인천", lawd="28185", dongs=["송도동"]),
+    dict(name="해운대", group="지방", lawd="26350"), dict(name="수영", group="지방", lawd="26500"), dict(name="대구 수성", group="지방", lawd="27260"),
+    dict(name="대전 유성", group="지방", lawd="30200"), dict(name="세종", group="지방", lawd="36110"), dict(name="광주 남구", group="지방", lawd="29155"),
+    dict(name="울산 남구", group="지방", lawd="31140"),
+]
+
+
+def re_collect_trades(key, lawds, months=24):
+    cdir = os.path.join(HIST_DIR, "re")
+    os.makedirs(cdir, exist_ok=True)
+    now = datetime.now()
+    yms = [(now.replace(day=1) - pd.DateOffset(months=i)).strftime("%Y%m") for i in range(months)]
+    out, calls, fails = {}, 0, 0
+    for lawd in lawds:
+        rows = []
+        for i, ym in enumerate(yms):
+            path = os.path.join(cdir, f"Trade_{lawd}_{ym}.json")
+            if i >= 3 and os.path.exists(path):
+                try:
+                    rows += load_json(path)
+                    continue
+                except Exception:
+                    pass
+            try:
+                r = re_fetch_month(key, lawd, ym)
+                calls += 1
+                save_json(path, r)
+                rows += r
+            except Exception:
+                fails += 1
+        out[lawd] = rows
+    print(f"  전국 실거래: API {calls}회 · 실패 {fails}회", flush=True)
+    return out
+
+
+def re_regions(key, demo=False):
+    cut12 = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    cut3 = (datetime.now() - timedelta(days=92)).strftime("%Y-%m-%d")
+    y_lo = (datetime.now() - timedelta(days=365 + 92)).strftime("%Y-%m-%d")
+    if demo:
+        rng = np.random.default_rng(7)
+        data = {}
+        months = [(datetime.now().replace(day=1) - pd.DateOffset(months=i)).strftime("%Y-%m") for i in range(24)][::-1]
+        for g in RE_REGIONS:
+            rows, base = data.setdefault(g["lawd"], []), rng.uniform(6, 30)
+            for a in range(8):
+                p = base * rng.uniform(.7, 1.3)
+                for mth in months:
+                    p *= np.exp(rng.normal(0.004, 0.02))
+                    for _ in range(int(rng.integers(0, 3))):
+                        rows.append(dict(apt=f"{g['name']}{'가나다라마바사아'[a]}아파트", dong=(g.get("dongs") or ["중앙동"])[0], area=84.9, floor="10",
+                                         d=f"{mth}-{int(rng.integers(1, 28)):02d}", p=int(p * 1e4)))
+    elif key:
+        data = re_collect_trades(key, sorted({g["lawd"] for g in RE_REGIONS}))
+    else:
+        return None
+    out = []
+    for g in RE_REGIONS:
+        rows = [r for r in data.get(g["lawd"], []) if (not g.get("dongs") or r["dong"] in g["dongs"]) and (not g.get("excl") or r["dong"] not in g["excl"])]
+        r84 = [r for r in rows if 76 <= r["area"] <= 90 and r.get("p")]
+        if not r84:
+            out.append(dict(name=g["name"], group=g["group"], home=g.get("home", False), n12=0, leaders=[]))
+            continue
+        now3 = [r["p"] / 1e4 for r in r84 if r["d"] >= cut3]
+        ago3 = [r["p"] / 1e4 for r in r84 if y_lo <= r["d"] < cut12]
+        prev3 = [r["p"] / 1e4 for r in r84 if (datetime.now() - timedelta(days=184)).strftime("%Y-%m-%d") <= r["d"] < cut3]
+        med = lambda v: float(np.median(v)) if v else None
+        reg = re_series(rows)
+        leaders = []
+        by = {}
+        for r in r84:
+            if r["d"] >= cut12:
+                by.setdefault((r["apt"], r["dong"]), []).append(r)
+        for (apt, dong), rr in by.items():
+            if len(rr) < 2:
+                continue
+            m12 = med([x["p"] / 1e4 for x in rr])
+            last = max(rr, key=lambda x: x["d"])
+            old = [x["p"] / 1e4 for x in r84 if x["apt"] == apt and x["dong"] == dong and y_lo <= x["d"] < cut12]
+            ser = re_series([x for x in rows if x["apt"] == apt and x["dong"] == dong])
+            leaders.append(dict(apt=apt, dong=dong, med12=round(m12, 2), n=len(rr), last=dict(d=last["d"], p=round(last["p"] / 1e4, 2), f=last["floor"]),
+                                yoy=(round((m12 / med(old) - 1) * 100, 1) if old else None), ser=ser[-24:]))
+        leaders = sorted(leaders, key=lambda x: -x["med12"])[:5]
+        for L in leaders:
+            try:
+                L["fc"] = re_forecast(L["ser"], reg, [x["n"] for x in re_series(rows, 0, 999)], horizons=(3, 6, 12)) if len(L["ser"]) >= 4 else None
+            except Exception:
+                L["fc"] = None
+        out.append(dict(name=g["name"], group=g["group"], home=g.get("home", False), n12=sum(1 for r in r84 if r["d"] >= cut12),
+                        med3=round(med(now3), 2) if now3 else None, yoy=(round((med(now3) / med(ago3) - 1) * 100, 1) if now3 and ago3 else None),
+                        chg3=(round((med(now3) / med(prev3) - 1) * 100, 1) if now3 and prev3 else None), ser=reg[-24:], leaders=leaders))
+    stat("전국 지역 지도 (대장 아파트)", True, f"{sum(1 for x in out if x['leaders'])}/{len(out)}개 지역")
+    return out
+
+
 def re_build(demo=False):
     key = os.environ.get("MOLIT_API_KEY", "").strip()
     out = dict(zones=[], haskey=bool(key or demo), market=None, updated=datetime.now().strftime("%Y-%m-%d"))
@@ -2043,6 +2148,10 @@ def re_build(demo=False):
                 z["fc"] = re_forecast(z["ser"], bser, vol, event_prem=(prem if z["group"] != "1차 선도지구" and prem and prem > 0 else None))
     except Exception as ex:
         print(f"  부동산 예상치 실패: {ex}", flush=True)
+    try:
+        out["regions"] = re_regions(key, demo)
+    except Exception as ex:
+        print(f"  전국 지역 지도 실패: {ex}", flush=True)
     out["news"] = [] if demo else gnews("분당 재건축 특별정비구역", "ko", 14, 6)
     return out
 
@@ -4332,6 +4441,14 @@ tr.clk{cursor:pointer} tr.clk:hover td{background:var(--sunk)}
 .zdet .ht,#v-re .ht{display:block;overflow-x:auto;max-width:100%}.zdet table,#v-re table{min-width:0}
 .rcgrid{grid-template-columns:repeat(auto-fill,minmax(min(100%,130px),1fr))}
 #v-re .revkpi{grid-template-columns:repeat(auto-fit,minmax(min(100%,120px),1fr))}
+
+.ht2.rg{display:grid;gap:1px}.ht2.rg small{font-size:11.5px;font-weight:800}.ht2.home{outline:2px solid var(--ink)}
+.prow.ldr{grid-template-columns:26px minmax(0,1fr) 62px 58px}
+@media(max-width:340px){.prow.ldr{grid-template-columns:22px minmax(0,1fr) 56px}.prow.ldr .pt:last-of-type{display:none}}
+
+.ht2.rg{display:grid;gap:1px}.ht2.rg small{font-size:11.5px;font-weight:800}.ht2.home{outline:2px solid var(--ink)}
+.prow.ldr{grid-template-columns:26px minmax(0,1fr) 62px 58px}
+@media(max-width:340px){.prow.ldr{grid-template-columns:22px minmax(0,1fr) 56px}.prow.ldr .pt:last-of-type{display:none}}
 </style>
 </head>
 <body class="__LOCKED__">
@@ -4988,6 +5105,72 @@ function fcTable(fc){
   return T(ks.map(k=>[`<b>${k}</b>`,...H.map(h=>{const v=fc.at['h'+h][k];return v?`${eok(v)}<br><small class="${v>=cur?'upc':'downc'}">${pctS((v/cur-1)*100,1)}</small>`:'-';})]),['시나리오','3개월 뒤','6개월 뒤','1년 뒤'])+
     `<p class="vl" style="text-align:left">출발점 ${eok(cur)} (최근 3개월 거래 중간값) · 분당 추세 월 ${pctS(fc.g,2)} · 이 구역 상대강도 월 ${pctS(fc.rel,2)}${fc.vadj?` · 거래량 ${fc.vadj>0?'증가 +0.2%':'감소 −0.2%'}/월 반영`:''} · 흔들림 월 ±${fc.sig}%</p>`;
 }
+/* 전국 지역 지도 → 대장 아파트 */
+function regionMapHTML(){
+  const R=RE.regions;if(!R||!R.length)return '';
+  const col=v=>{if(!ok_(v))return 'var(--sunk)';const a=(Math.min(Math.abs(v),15)/15*.55+.08).toFixed(2);return v>=0?`rgba(212,42,60,${a})`:`rgba(29,91,216,${a})`;};
+  const groups=[...new Set(R.map(r=>r.group))];
+  return `<div class="card"><div class="ch"><h3>🗺️ 지역 지도 · 대장 아파트</h3><span class="vl">84㎡ · 1년 변화</span></div>
+    ${groups.map(g=>`<div class="lbl">${esc(g)}</div><div class="heat">${R.map((r,i)=>r.group!==g?'':`<button class="ht2 rg ${r.home?'home':''}" data-region="${i}" style="background:${col(r.yoy)}"><b>${r.home?'🏠 ':''}${esc(r.name)}</b><span class="tn">${eok(r.med3)}</span><small class="tn">${ok_(r.yoy)?pctS(r.yoy,1):'-'}</small></button>`).join('')}</div>`).join('')}
+    <p class="vl" style="text-align:left;margin:6px 0 0">색: 최근 3개월 84㎡ 실거래 중간값이 1년 전 같은 시기보다 오르면 빨강, 내리면 파랑. 칸을 누르면 대장 아파트 5곳.</p></div>`;
+}
+function openRegion(i){
+  const r=RE.regions[i];
+  openSheet(`<div class="zdet"><h3>${r.home?'🏠 ':''}${esc(r.name)} 대장 아파트</h3>
+    <div class="revkpi tn"><div><span class="vl">84㎡ 최근 3개월 중간값</span><b>${eok(r.med3)}</b></div><div><span class="vl">1년 전 대비</span><b class="${(r.yoy||0)>=0?'upc':'downc'}">${ok_(r.yoy)?pctS(r.yoy,1):'-'}</b></div>
+      <div><span class="vl">직전 3개월 대비</span><b class="${(r.chg3||0)>=0?'upc':'downc'}">${ok_(r.chg3)?pctS(r.chg3,1):'-'}</b></div><div><span class="vl">최근 1년 84㎡ 거래</span><b>${f0(r.n12)}건</b></div></div>
+    ${r.ser&&r.ser.length?`<div class="lbl">📈 지역 84㎡ 월별 중간값</div>${reChart([{name:r.name,c:'var(--up)',data:r.ser}],r.ser)}`:''}
+    <div class="lbl">👑 대장 아파트 (최근 1년 84㎡ 중간값 순)</div>
+    ${r.leaders.length?`<div class="plist">${r.leaders.map((L,j)=>`<button class="prow ldr" data-apt="${i}:${j}"><span class="rk tn">${j+1}</span>
+      <span class="pn"><b>${esc(L.apt)}</b><small class="tn">${esc(L.dong)} · 최근 ${eok(L.last.p)} (${esc(L.last.d.slice(2))}) · ${L.n}건</small></span>
+      <span class="pt tn"><small>1년 중간</small><b>${eok(L.med12)}</b></span><span class="pt tn"><small>1년 변화</small><b class="${(L.yoy||0)>=0?'upc':'downc'}">${ok_(L.yoy)?pctS(L.yoy,1):'-'}</b></span></button>`).join('')}</div>`:'<p class="vl">최근 1년 84㎡ 거래가 부족합니다.</p>'}
+    <p class="vl" style="text-align:left">대장 아파트는 최근 1년 84㎡(전용 76~90㎡) 거래가 2건 이상인 단지 중 가격 중간값이 높은 순입니다.</p></div>`);
+}
+function openApt(i,j){
+  const r=RE.regions[i],L=r.leaders[j];
+  const prompt=`${r.name} ${L.dong} ${L.apt} 84㎡ 매수를 검토 중이야. 최근 실거래 ${eok(L.last.p)}(${L.last.d}), 최근 1년 중간값 ${eok(L.med12)}, 1년 변화 ${ok_(L.yoy)?pctS(L.yoy,1):'-'}.\n최신 뉴스·실거래·호가를 검색해서 ①최근 가격 흐름과 호가 수준 ②재건축·리모델링·교통·학군 등 가격 요인 ③${r.name} 다른 대장 단지들과 비교한 위치 ④매수 시 주의점을 정리해줘. 근거 링크도 붙여줘.`;
+  openSheet(`<div class="zdet"><h3>${esc(L.apt)}</h3><p class="vl" style="text-align:left">${esc(r.name)} · ${esc(L.dong)}</p>
+    <div class="revkpi tn"><div><span class="vl">84㎡ 최근 실거래</span><b>${eok(L.last.p)}</b><span class="vl">${esc(L.last.d)} · ${esc(L.last.f)}층</span></div>
+      <div><span class="vl">1년 중간값</span><b>${eok(L.med12)}</b><span class="vl">${L.n}건</span></div><div><span class="vl">1년 변화</span><b class="${(L.yoy||0)>=0?'upc':'downc'}">${ok_(L.yoy)?pctS(L.yoy,1):'-'}</b></div></div>
+    <div class="lbl">📈 84㎡ 월별 실거래 · 거래량 · 예상</div>${reChart([{name:L.apt,c:'var(--up)',data:L.ser}],L.ser,L.fc)}
+    <div class="lbl">🔮 예상 시세 <button class="q" data-help="refc" aria-label="설명 보기">?</button></div>${fcTable(L.fc)}
+    <div class="aibox aibtn" style="margin-top:12px"><p><b style="color:var(--ink)">🤖 이 아파트 점검</b><br>시세가 입력된 채로 Claude가 열립니다.</p><a class="btn ai" href="${claudeURL(prompt,null)}" target="_blank" rel="noopener">🤖 Claude에서 점검</a></div></div>`);
+}
+document.addEventListener('click',e=>{const g=e.target.closest('[data-region]');if(g){openRegion(+g.dataset.region);return;}
+  const a=e.target.closest('[data-apt]');if(a){const [i,j]=a.dataset.apt.split(':').map(Number);openApt(i,j);}});
+/* 전국 지역 지도 → 대장 아파트 */
+function regionMapHTML(){
+  const R=RE.regions;if(!R||!R.length)return '';
+  const col=v=>{if(!ok_(v))return 'var(--sunk)';const a=(Math.min(Math.abs(v),15)/15*.55+.08).toFixed(2);return v>=0?`rgba(212,42,60,${a})`:`rgba(29,91,216,${a})`;};
+  const groups=[...new Set(R.map(r=>r.group))];
+  return `<div class="card"><div class="ch"><h3>🗺️ 지역 지도 · 대장 아파트</h3><span class="vl">84㎡ · 1년 변화</span></div>
+    ${groups.map(g=>`<div class="lbl">${esc(g)}</div><div class="heat">${R.map((r,i)=>r.group!==g?'':`<button class="ht2 rg ${r.home?'home':''}" data-region="${i}" style="background:${col(r.yoy)}"><b>${r.home?'🏠 ':''}${esc(r.name)}</b><span class="tn">${eok(r.med3)}</span><small class="tn">${ok_(r.yoy)?pctS(r.yoy,1):'-'}</small></button>`).join('')}</div>`).join('')}
+    <p class="vl" style="text-align:left;margin:6px 0 0">색: 최근 3개월 84㎡ 실거래 중간값이 1년 전 같은 시기보다 오르면 빨강, 내리면 파랑. 칸을 누르면 대장 아파트 5곳.</p></div>`;
+}
+function openRegion(i){
+  const r=RE.regions[i];
+  openSheet(`<div class="zdet"><h3>${r.home?'🏠 ':''}${esc(r.name)} 대장 아파트</h3>
+    <div class="revkpi tn"><div><span class="vl">84㎡ 최근 3개월 중간값</span><b>${eok(r.med3)}</b></div><div><span class="vl">1년 전 대비</span><b class="${(r.yoy||0)>=0?'upc':'downc'}">${ok_(r.yoy)?pctS(r.yoy,1):'-'}</b></div>
+      <div><span class="vl">직전 3개월 대비</span><b class="${(r.chg3||0)>=0?'upc':'downc'}">${ok_(r.chg3)?pctS(r.chg3,1):'-'}</b></div><div><span class="vl">최근 1년 84㎡ 거래</span><b>${f0(r.n12)}건</b></div></div>
+    ${r.ser&&r.ser.length?`<div class="lbl">📈 지역 84㎡ 월별 중간값</div>${reChart([{name:r.name,c:'var(--up)',data:r.ser}],r.ser)}`:''}
+    <div class="lbl">👑 대장 아파트 (최근 1년 84㎡ 중간값 순)</div>
+    ${r.leaders.length?`<div class="plist">${r.leaders.map((L,j)=>`<button class="prow ldr" data-apt="${i}:${j}"><span class="rk tn">${j+1}</span>
+      <span class="pn"><b>${esc(L.apt)}</b><small class="tn">${esc(L.dong)} · 최근 ${eok(L.last.p)} (${esc(L.last.d.slice(2))}) · ${L.n}건</small></span>
+      <span class="pt tn"><small>1년 중간</small><b>${eok(L.med12)}</b></span><span class="pt tn"><small>1년 변화</small><b class="${(L.yoy||0)>=0?'upc':'downc'}">${ok_(L.yoy)?pctS(L.yoy,1):'-'}</b></span></button>`).join('')}</div>`:'<p class="vl">최근 1년 84㎡ 거래가 부족합니다.</p>'}
+    <p class="vl" style="text-align:left">대장 아파트는 최근 1년 84㎡(전용 76~90㎡) 거래가 2건 이상인 단지 중 가격 중간값이 높은 순입니다.</p></div>`);
+}
+function openApt(i,j){
+  const r=RE.regions[i],L=r.leaders[j];
+  const prompt=`${r.name} ${L.dong} ${L.apt} 84㎡ 매수를 검토 중이야. 최근 실거래 ${eok(L.last.p)}(${L.last.d}), 최근 1년 중간값 ${eok(L.med12)}, 1년 변화 ${ok_(L.yoy)?pctS(L.yoy,1):'-'}.\n최신 뉴스·실거래·호가를 검색해서 ①최근 가격 흐름과 호가 수준 ②재건축·리모델링·교통·학군 등 가격 요인 ③${r.name} 다른 대장 단지들과 비교한 위치 ④매수 시 주의점을 정리해줘. 근거 링크도 붙여줘.`;
+  openSheet(`<div class="zdet"><h3>${esc(L.apt)}</h3><p class="vl" style="text-align:left">${esc(r.name)} · ${esc(L.dong)}</p>
+    <div class="revkpi tn"><div><span class="vl">84㎡ 최근 실거래</span><b>${eok(L.last.p)}</b><span class="vl">${esc(L.last.d)} · ${esc(L.last.f)}층</span></div>
+      <div><span class="vl">1년 중간값</span><b>${eok(L.med12)}</b><span class="vl">${L.n}건</span></div><div><span class="vl">1년 변화</span><b class="${(L.yoy||0)>=0?'upc':'downc'}">${ok_(L.yoy)?pctS(L.yoy,1):'-'}</b></div></div>
+    <div class="lbl">📈 84㎡ 월별 실거래 · 거래량 · 예상</div>${reChart([{name:L.apt,c:'var(--up)',data:L.ser}],L.ser,L.fc)}
+    <div class="lbl">🔮 예상 시세 <button class="q" data-help="refc" aria-label="설명 보기">?</button></div>${fcTable(L.fc)}
+    <div class="aibox aibtn" style="margin-top:12px"><p><b style="color:var(--ink)">🤖 이 아파트 점검</b><br>시세가 입력된 채로 Claude가 열립니다.</p><a class="btn ai" href="${claudeURL(prompt,null)}" target="_blank" rel="noopener">🤖 Claude에서 점검</a></div></div>`);
+}
+document.addEventListener('click',e=>{const g=e.target.closest('[data-region]');if(g){openRegion(+g.dataset.region);return;}
+  const a=e.target.closest('[data-apt]');if(a){const [i,j]=a.dataset.apt.split(':').map(Number);openApt(i,j);}});
 function zoneCard(z){const s=z.s,sg=SIG[z.status]||SIG.green;
   return `<button class="zcard ${z.status}" data-zone="${z.id}"><span class="zh"><b>${esc(z.name)}</b><small class="vl">${esc(z.dong)} · ${f0(z.units)}세대</small></span>
     <span class="zsig">${sg[0]} ${sg[1]}</span><span class="zst vl">${esc(z.stage)}</span>
@@ -5029,6 +5212,8 @@ function renderRE(){
   const M=RE.market,ck=reck(),grp=g=>RE.zones.filter(z=>z.group===g);
   box.innerHTML=`<div class="vh"><h2>🏠 분당 재건축 <button class="q" data-help="re" aria-label="설명 보기">?</button></h2></div>
     ${RE.haskey?'':`<div class="card resetup"><b>🔑 실거래가를 보려면 무료 키가 필요합니다</b><ol><li>공공데이터포털(data.go.kr) 가입 → <b>"국토교통부_아파트 매매 실거래가 자료"</b>와 <b>"국토교통부_아파트 전월세 실거래가 자료"</b> 활용신청</li><li>마이페이지의 <b>일반 인증키(Decoding)</b> 복사</li><li>Claude에게 "부동산 키 등록해줘"와 함께 키를 보내주시면 제가 등록합니다 (또는 GitHub Secret <code>MOLIT_API_KEY</code>)</li></ol><p class="vl" style="text-align:left">키가 없어도 입주권 신호등·체크리스트·계산기·뉴스는 지금 바로 쓸 수 있습니다.</p></div>`}
+    ${regionMapHTML()}
+    ${regionMapHTML()}
     ${M?`<div class="card"><div class="ch"><h3>🚦 분당 시장 분위기</h3><span class="chip mid">${esc(M.sig)}</span></div>
       <p class="vl tn" style="text-align:left;margin:0 0 6px">최근 3개월 월평균 거래 ${M.v3??'-'}건 (1년 평균 ${M.v12??'-'}건) · 84㎡ 중간값 기준</p>
       ${reChart([{name:'분당',c:'var(--up)',data:M.bundang},{name:'광교',c:'var(--down)',data:M.gwanggyo}],null,M.fc)}
