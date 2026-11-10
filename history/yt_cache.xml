@@ -1,15 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
- <link rel="self" href="http://www.youtube.com/feeds/videos.xml?playlist_id=UUadSWH0pDXxEatvLHEHCWlg"/>
- <id>yt:playlist:UUadSWH0pDXxEatvLHEHCWlg</id>
- <yt:playlistId>UUadSWH0pDXxEatvLHEHCWlg</yt:playlistId>
- <yt:channelId>UCadSWH0pDXxEatvLHEHCWlg</yt:channelId>
- <title>Uploads from 한균수의 주식사용설명서</title>
+ <link rel="self" href="http://www.youtube.com/feeds/videos.xml?channel_id=UCadSWH0pDXxEatvLHEHCWlg"/>
+ <id>yt:channel:adSWH0pDXxEatvLHEHCWlg</id>
+ <yt:channelId>adSWH0pDXxEatvLHEHCWlg</yt:channelId>
+ <title>한균수의 주식사용설명서</title>
+ <link rel="alternate" href="https://www.youtube.com/channel/UCadSWH0pDXxEatvLHEHCWlg"/>
  <author>
   <name>한균수의 주식사용설명서</name>
   <uri>https://www.youtube.com/channel/UCadSWH0pDXxEatvLHEHCWlg</uri>
  </author>
- <published>2020-02-23T08:00:00+00:00</published>
+ <published>2019-02-11T00:52:27+00:00</published>
  <entry>
   <id>yt:video:IsyUREA1qmI</id>
   <yt:videoId>IsyUREA1qmI</yt:videoId>
@@ -38,7 +38,7 @@
 이 책은 상단 링크에서 구매하실 수 있습니다.</media:description>
    <media:community>
     <media:starRating count="724" average="5.00" min="1" max="5"/>
-    <media:statistics views="23270"/>
+    <media:statistics views="23329"/>
    </media:community>
   </media:group>
  </entry>
@@ -67,7 +67,7 @@
 #프로티나 #바이오주 #삼성바이오로직스 #셀트리온 #한균수의주식사용설명서 #Shorts</media:description>
    <media:community>
     <media:starRating count="16" average="5.00" min="1" max="5"/>
-    <media:statistics views="2453"/>
+    <media:statistics views="2463"/>
    </media:community>
   </media:group>
  </entry>
@@ -128,7 +128,7 @@
 이 책은 상단 링크에서 구매하실 수 있습니다.</media:description>
    <media:community>
     <media:starRating count="807" average="5.00" min="1" max="5"/>
-    <media:statistics views="35918"/>
+    <media:statistics views="35920"/>
    </media:community>
   </media:group>
  </entry>
@@ -158,7 +158,7 @@
 #엘앤에프 #LG에너지솔루션 #LFP #ESS #주식 #Shorts</media:description>
    <media:community>
     <media:starRating count="26" average="5.00" min="1" max="5"/>
-    <media:statistics views="3097"/>
+    <media:statistics views="3096"/>
    </media:community>
   </media:group>
  </entry>
@@ -219,7 +219,7 @@
 이 책은 상단 링크에서 구매하실 수 있습니다.</media:description>
    <media:community>
     <media:starRating count="787" average="5.00" min="1" max="5"/>
-    <media:statistics views="27060"/>
+    <media:statistics views="27064"/>
    </media:community>
   </media:group>
  </entry>
@@ -252,7 +252,7 @@
 #한화오션 #한화그룹 #조선주 #미국군함 #한균수의주식사용설명서 #Shorts</media:description>
    <media:community>
     <media:starRating count="20" average="5.00" min="1" max="5"/>
-    <media:statistics views="2386"/>
+    <media:statistics views="2387"/>
    </media:community>
   </media:group>
  </entry>
@@ -283,7 +283,7 @@
 #삼성전자 #SK하이닉스 #키옥시아 #반도체 #한균수의주식사용설명서 #Shorts</media:description>
    <media:community>
     <media:starRating count="16" average="5.00" min="1" max="5"/>
-    <media:statistics views="2909"/>
+    <media:statistics views="2908"/>
    </media:community>
   </media:group>
  </entry>
@@ -314,7 +314,7 @@
 이 책은 상단 링크에서 구매하실 수 있습니다.</media:description>
    <media:community>
     <media:starRating count="742" average="5.00" min="1" max="5"/>
-    <media:statistics views="26737"/>
+    <media:statistics views="26742"/>
    </media:community>
   </media:group>
  </entry>
@@ -428,7 +428,7 @@ LG화학의 LG에너지솔루션 지분 2.5조원 처분 결정과 4,000억원 �
 이 책은 상단 링크에서 구매하실 수 있습니다.</media:description>
    <media:community>
     <media:starRating count="784" average="5.00" min="1" max="5"/>
-    <media:statistics views="32466"/>
+    <media:statistics views="32465"/>
    </media:community>
   </media:group>
  </entry>
